@@ -1,0 +1,1 @@
+# marketing-mail-generator
