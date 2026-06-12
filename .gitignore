@@ -9,6 +9,7 @@ venv/
 # Environment
 .env
 .env.local
+backend/.env
 frontend/.env.local
 
 # Build outputs
