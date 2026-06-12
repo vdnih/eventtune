@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{userId} {
+      allow read: if request.auth.uid == userId;
+      allow write: if false;
+    }
+
+    match /projects/{projectId} {
+      allow read: if request.auth != null
+        && resource.data.ownerId == request.auth.uid;
+      allow write: if false;
+
+      match /contacts/{contactId} {
+        allow read: if request.auth != null
+          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+        allow write: if false;
+      }
+
+      match /emails/{emailId} {
+        allow read: if request.auth != null
+          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+        allow write: if false;
+      }
+    }
+
+    match /generation_jobs/{jobId} {
+      allow read: if request.auth != null
+        && resource.data.ownerId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /templates/{templateId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+  }
+}

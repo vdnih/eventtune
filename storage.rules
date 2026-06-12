@@ -1,0 +1,10 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /uploads/{userId}/{projectId}/{filename} {
+      allow read: if false;
+      allow write: if request.auth.uid == userId
+        && request.resource.size < 10 * 1024 * 1024;
+    }
+  }
+}

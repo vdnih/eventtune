@@ -1,0 +1,49 @@
+{
+  "firestore": {
+    "database": "(default)",
+    "location": "asia-northeast1",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "hosting": {
+    "source": "frontend",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "frameworksBackend": {
+      "region": "asia-northeast1"
+    }
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "storage": {
+      "port": 9199
+    },
+    "hosting": {
+      "port": 5000
+    },
+    "ui": {
+      "enabled": true,
+      "port": 4000
+    }
+  },
+  "auth": {
+    "providers": {
+      "emailPassword": false,
+      "googleSignIn": {
+        "oAuthBrandDisplayName": "Marketing Mail Generator",
+        "supportEmail": "rozaki320@gmail.com"
+      }
+    }
+  }
+}
