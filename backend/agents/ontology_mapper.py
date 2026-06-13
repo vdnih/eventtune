@@ -56,6 +56,27 @@ def _new_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """None・空文字・変換不能値は default に倒す。dict.get のデフォルトは
+    キー欠落時しか効かず、値が None（AI抽出の null）だと素の float() が落ちるため。"""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    """None・空文字・変換不能値は default に倒す。_to_float と同趣旨。"""
+    if value is None or value == "":
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 # 各ビルダーの戻り値: (生成エンティティ | None, 加工根拠 | None, スキップ記録 | None)
 BuildResult = tuple[Any | None, EntityTransformation | None, SkippedRecord | None]
 # map_* の戻り値: (エンティティ群, 加工根拠群, スキップ記録群)
@@ -261,7 +282,7 @@ class OntologyMapper:
         raw_status = raw.get("status", "")
         event_type = event_type_map.get(raw_type, EventType.TRADE_SHOW)
         status = status_map.get(raw_status, EventStatus.COMPLETED)
-        budget = float(raw.get("total_budget", 0))
+        budget = _to_float(raw.get("total_budget"))
 
         event = Event(
             event_id=event_id or raw.get("event_id") or _new_id("event_"),
@@ -273,7 +294,7 @@ class OntologyMapper:
             event_date_end=raw.get("event_date_end", raw.get("event_date", "")),
             booth_number=raw.get("booth_number") or None,
             total_budget=budget,
-            target_contact_count=int(raw.get("target_contact_count", 0)),
+            target_contact_count=_to_int(raw.get("target_contact_count")),
             description=raw.get("description", ""),
             created_at=now,
             updated_at=now,
@@ -308,20 +329,20 @@ class OntologyMapper:
         kpi = EventKPI(
             kpi_id=_new_id("kpi_"),
             event_id=event_id,
-            total_visitors_to_booth=int(raw.get("total_visitors_to_booth", 0)),
-            total_contacts_collected=int(raw.get("total_contacts_collected", 0)),
+            total_visitors_to_booth=_to_int(raw.get("total_visitors_to_booth")),
+            total_contacts_collected=_to_int(raw.get("total_contacts_collected")),
             contacts_by_engagement=EngagementCounts(
-                appointment_booked=int(by_engagement.get("appointment_booked", 0)),
-                high_intent=int(by_engagement.get("high_intent", 0)),
-                nurturing=int(by_engagement.get("nurturing", 0)),
+                appointment_booked=_to_int(by_engagement.get("appointment_booked")),
+                high_intent=_to_int(by_engagement.get("high_intent")),
+                nurturing=_to_int(by_engagement.get("nurturing")),
             ),
-            appointments_booked=int(raw.get("appointments_booked", 0)),
-            demo_sessions_held=int(raw.get("demo_sessions_held", 0)),
-            follow_email_open_rate=float(raw.get("follow_email_open_rate", 0.0)),
-            follow_email_reply_rate=float(raw.get("follow_email_reply_rate", 0.0)),
-            pipeline_value_jpy=float(raw.get("pipeline_value_jpy", 0)),
-            closed_deals_3m=int(raw.get("closed_deals_3m", 0)),
-            closed_revenue_3m_jpy=float(raw.get("closed_revenue_3m_jpy", 0)),
+            appointments_booked=_to_int(raw.get("appointments_booked")),
+            demo_sessions_held=_to_int(raw.get("demo_sessions_held")),
+            follow_email_open_rate=_to_float(raw.get("follow_email_open_rate")),
+            follow_email_reply_rate=_to_float(raw.get("follow_email_reply_rate")),
+            pipeline_value_jpy=_to_float(raw.get("pipeline_value_jpy")),
+            closed_deals_3m=_to_int(raw.get("closed_deals_3m")),
+            closed_revenue_3m_jpy=_to_float(raw.get("closed_revenue_3m_jpy")),
             created_at=_now_iso(),
         )
         decisions = [
@@ -397,18 +418,18 @@ class OntologyMapper:
             scores.append(
                 SatisfactionScore(
                     category=cat,
-                    avg_score=float(s.get("avg_score", 0)),
-                    response_count=int(s.get("response_count", 0)),
+                    avg_score=_to_float(s.get("avg_score")),
+                    response_count=_to_int(s.get("response_count")),
                 )
             )
         survey = SurveyResponse(
             survey_id=_new_id("survey_"),
             event_id=event_id,
-            total_responses=int(raw.get("total_responses", 0)),
-            nps_score=float(raw.get("nps_score", 0)),
-            nps_promoters=int(raw.get("nps_promoters", 0)),
-            nps_passives=int(raw.get("nps_passives", 0)),
-            nps_detractors=int(raw.get("nps_detractors", 0)),
+            total_responses=_to_int(raw.get("total_responses")),
+            nps_score=_to_float(raw.get("nps_score")),
+            nps_promoters=_to_int(raw.get("nps_promoters")),
+            nps_passives=_to_int(raw.get("nps_passives")),
+            nps_detractors=_to_int(raw.get("nps_detractors")),
             satisfaction_scores=scores,
             verbatim_positives=raw.get("verbatim_positives") or [],
             verbatim_negatives=raw.get("verbatim_negatives") or [],

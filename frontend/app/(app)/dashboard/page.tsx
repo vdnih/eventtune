@@ -129,7 +129,7 @@ function SourcesPanel({
 }: {
   events: EventSummary[];
   loadingEvents: boolean;
-  onUpload: (file: File) => void;
+  onUpload: (files: File[]) => void;
   uploading: boolean;
   onRefresh: () => void;
 }) {
@@ -153,11 +153,12 @@ function SourcesPanel({
         <input
           ref={inputRef}
           type="file"
+          multiple
           accept=".csv,.xlsx,.xls,.txt,.pdf"
           className="hidden"
           onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onUpload(f);
+            const files = Array.from(e.target.files ?? []);
+            if (files.length) onUpload(files);
             e.target.value = "";
           }}
         />
@@ -171,7 +172,7 @@ function SourcesPanel({
           ) : (
             <Upload className="w-3.5 h-3.5 shrink-0" />
           )}
-          {uploading ? "アップロード中..." : "ファイルを追加"}
+          {uploading ? "アップロード中..." : "ファイルを追加（複数可）"}
         </button>
       </div>
 
@@ -266,18 +267,17 @@ export default function DashboardPage() {
 
   // ── ファイルアップロード ──────────────────────────────────────────────────
 
-  async function handleUpload(file: File) {
+  async function handleUpload(files: File[]) {
     setUploading(true);
-    addAssistantMessage(
-      `「${file.name}」を取り込んでいます...`,
-      [],
-      undefined,
-      true
-    );
+    const label =
+      files.length === 1
+        ? `「${files[0].name}」`
+        : `${files.length}件のファイル`;
+    addAssistantMessage(`${label}を取り込んでいます...`, [], undefined, true);
 
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      files.forEach((f) => formData.append("files", f));
       const res = await authFetch("/api/integration/batches", {
         method: "POST",
         body: formData,
@@ -287,19 +287,28 @@ export default function DashboardPage() {
         throw new Error(body.detail ?? `エラー ${res.status}`);
       }
       const { batch_id } = await res.json();
-      pollBatch(batch_id, file.name);
+      pollBatch(batch_id, label);
     } catch (e) {
       replaceLastAssistantMessage(`取り込みに失敗しました: ${(e as Error).message}`);
       setUploading(false);
     }
   }
 
-  function pollBatch(batchId: string, filename: string) {
+  function pollBatch(batchId: string, label: string) {
     const timer = setInterval(async () => {
       try {
         const res = await authFetch(`/api/integration/batches/${batchId}`);
         if (!res.ok) return;
         const data = await res.json();
+
+        // ファイルごとの進捗を ✓/✗/処理中 で表示
+        const fileLines = (data.files ?? [])
+          .map((f: { filename: string; status: string }) => {
+            const icon =
+              f.status === "done" ? "✓" : f.status === "error" ? "✗" : "⏳";
+            return `${icon} ${f.filename}`;
+          })
+          .join("\n");
 
         if (data.status === "done") {
           clearInterval(timer);
@@ -309,7 +318,9 @@ export default function DashboardPage() {
             .filter(([, v]) => (v as number) > 0)
             .map(([k, v]) => `${k}: ${v}件`);
           replaceLastAssistantMessage(
-            `**「${filename}」の取り込みが完了しました。**\n\n` +
+            `**${label}の取り込みが完了しました。**\n\n` +
+              (fileLines ? `${fileLines}\n\n` : "") +
+              (data.partial ? "⚠️ 一部のファイルで取り込みに失敗しました。\n\n" : "") +
               (parts.length ? `取り込み結果: ${parts.join(" / ")}\n\n` : "") +
               "「振り返りをして」「メールを作成して」など、何でもお聞かせください。"
           );
@@ -317,7 +328,10 @@ export default function DashboardPage() {
         } else if (data.status === "error") {
           clearInterval(timer);
           setUploading(false);
-          replaceLastAssistantMessage(`取り込みエラー: ${data.error ?? "不明なエラー"}`);
+          replaceLastAssistantMessage(
+            `取り込みエラー: ${data.error ?? "不明なエラー"}` +
+              (fileLines ? `\n\n${fileLines}` : "")
+          );
         }
       } catch {
         // keep polling

@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -450,3 +451,125 @@ def _summarize_transformations(
         product_breakdown=product_breakdown,
         skipped_count=len(skipped),
     )
+
+
+# ── バッチ処理（複数ファイルの横断統合）─────────────────────────────────────────
+
+@dataclass
+class BatchFileResult:
+    """バッチ内の1ファイルの処理結果。"""
+
+    filename: str
+    status: str  # "done" | "error"
+    lineage_id: str | None = None
+    created_entities: dict[str, int] = field(default_factory=dict)
+    error: str | None = None
+    role: str = ""  # "event_defining" | "dependent_doc" | "tabular"
+    generated_event_id: str | None = None  # このファイルが生成した Event の id（横断伝播用）
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "filename": self.filename,
+            "status": self.status,
+            "lineage_id": self.lineage_id,
+            "created_entities": self.created_entities,
+            "error": self.error,
+            "role": self.role,
+        }
+
+
+def _resolve_event_id(explicit: str | None, batch_resolved: str | None) -> str | None:
+    """バッチ内で使う event_id を優先順位に従って決定する（決定論的）。
+
+    優先順位:
+      1. UI で明示選択された event_id（既存イベントへの追加取り込み）
+      2. バッチ内ドキュメントから生成された Event の event_id（overview.txt 由来）
+      3. None → 既存フォールバック（Contact は events/unknown/... に入る）
+    """
+    return explicit or batch_resolved or None
+
+
+def _is_event_defining_name(filename: str) -> bool:
+    """ファイル名から Event を定義しうるドキュメントかを推定する（決定論ヒューリスティック）。
+
+    overview / 概要 を含む非表形式ファイルを先に処理することで、
+    survey 等の依存ドキュメントが処理される前に event_id を確定させる。
+    """
+    lower = filename.lower()
+    return "overview" in lower or "概要" in filename
+
+
+async def process_batch(
+    files: list[tuple[str, bytes]],
+    event_id: str | None,
+    batch_id: str,
+    db: Any,  # firebase_admin.firestore.Client
+) -> tuple[list[BatchFileResult], str | None]:
+    """複数ファイルを1バッチとして横断的に処理する。
+
+    同一イベントに属するファイル群（例: leads.csv + overview.txt + survey.txt）を
+    まとめて取り込み、overview.txt から確定する event_id を leads/survey に
+    横断伝播させる。処理順と event_id 伝播は AI を使わず決定論的に行う（原則4）。
+
+    Returns:
+        (per-file 結果リスト, バッチで確定した resolved_event_id)
+    """
+    # 表形式 / 非表形式に分け、非表形式は Event 定義候補（overview/概要）を先頭へ寄せる
+    non_tabular = [f for f in files if not _is_tabular(f[0])]
+    tabular = [f for f in files if _is_tabular(f[0])]
+    non_tabular.sort(key=lambda f: 0 if _is_event_defining_name(f[0]) else 1)
+
+    results: list[BatchFileResult] = []
+    batch_event_id: str | None = None
+
+    # ─ パス1: 非表形式（Event を生成しうる）を先に処理 ─────────────────────────
+    for filename, content in non_tabular:
+        current_event_id = _resolve_event_id(event_id, batch_event_id)
+        result = await _process_one(filename, content, current_event_id, batch_id, db)
+        # 生成エンティティに Event が含まれ、まだ未確定なら採用
+        if result.status == "done" and batch_event_id is None and event_id is None:
+            if result.generated_event_id:
+                batch_event_id = result.generated_event_id
+        result.role = "event_defining" if _is_event_defining_name(filename) else "dependent_doc"
+        results.append(result)
+
+    resolved = _resolve_event_id(event_id, batch_event_id)
+
+    # ─ パス2: 表形式（resolved event_id を伝播）─────────────────────────────────
+    for filename, content in tabular:
+        result = await _process_one(filename, content, resolved, batch_id, db)
+        result.role = "tabular"
+        results.append(result)
+
+    return results, resolved
+
+
+async def _process_one(
+    filename: str,
+    content: bytes,
+    event_id: str | None,
+    batch_id: str,
+    db: Any,
+) -> BatchFileResult:
+    """1ファイルを process_file で処理し、部分失敗を吸収して結果を返す。"""
+    try:
+        entities, lineage = await process_file(filename, content, event_id, batch_id, db)
+        counts: dict[str, int] = {}
+        for entity in entities:
+            counts[type(entity).__name__] = counts.get(type(entity).__name__, 0) + 1
+        # 生成された Event の id を横断伝播のために控える
+        ev = next((e for e in entities if isinstance(e, Event)), None)
+        return BatchFileResult(
+            filename=filename,
+            status="done",
+            lineage_id=lineage.lineage_id,
+            created_entities=counts,
+            generated_event_id=ev.event_id if ev is not None else None,
+        )
+    except Exception as e:
+        logger.exception("process_one failed: filename=%s error=%s", filename, e)
+        return BatchFileResult(
+            filename=filename,
+            status="error",
+            error=str(e)[:500],
+        )

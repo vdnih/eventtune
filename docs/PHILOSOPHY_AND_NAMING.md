@@ -95,6 +95,28 @@ CSV・Excel・PowerPoint・PDF・テキスト、形式は問わない。
   「なぜそう分類したか」が説明可能であるべき処理は、AI のブラックボックスに委ねず
   決定論的な Python（`OntologyMapper`）に明文化する。これは原則4の直接の帰結である。
 
+#### 複数ファイルの横断処理 — ファイル間の紐付けも決定論で引く
+
+1イベントは複数ファイルの集合で届く（例: `leads.csv` ＋ `overview.txt` ＋ `survey.txt`）。
+これらを1バッチでまとめてアップロードし、ファイルをまたいで `event_id` を伝播させる
+（`process_batch`）。`leads.csv` 自体はイベント名を持たないが、`overview.txt` から確定する
+`event_id` のもとに Contact を紐付け、`survey.txt` の KPI/SurveyResponse も同じイベントに束ねる。
+
+> **設計判断: 「どのファイルがどのイベントに属するか」の解決に AI を使わない。** 必要なのは
+> (1) ファイルの処理順決定、(2) 確定した `event_id` の伝播 の2点で、どちらも**明示的な業務判断**。
+> 原則4に従い決定論的 Python に置く。具体的には `process_batch` が非表形式（Event を生む
+> `overview.txt` 等）を先に処理して `event_id` を確定し、表形式（`leads.csv`）へ伝播させる。
+> `overview`/`概要` を名前に含むファイルを先頭へ寄せる安定ソートで、`survey.txt` が処理される前に
+> イベントが確定するよう順序を保証する。event_id の優先順位（明示選択 > ドキュメント由来 > フォールバック）は
+> `_resolve_event_id` の1箇所に集約する。AI に横断判断をさせると説明不能になるため意図的に避ける。
+>
+> 部分失敗は per-file の try/except で吸収し、1ファイルの失敗が他ファイルの取り込みを止めない。
+> `overview.txt` が失敗した場合は `event_id` 未確定となり Contact は `events/unknown/...` に落ちる
+> （データロスはせず、現状互換の劣化動作にとどめる）。バッチ横断の伝播結果は
+> `GET /api/integration/batches/{id}/report` の `cross_file_summary` で確認できる。
+>
+> Contact の名寄せ（複数ファイルにまたがる同一人物の統合）は別の判断であり、ここには含めない。
+
 #### 実装上の注意 — 構造化出力とスキーマの定め方
 
 Gemini の構造化出力（`response_schema` / controlled generation）は、**プロパティが定義されていない
@@ -259,7 +281,8 @@ Event（主催・管理）               ContentAsset（推薦・案内）
 
 **DataIntegrationAgent の構成**: 「エージェント」は概念単位であり、実体は関数群。
 
-- エントリ: `process_file`（パスA/Bを振り分け、ステージ2を実行）
+- バッチ入口: `process_batch`（複数ファイルを横断処理し、ファイル間で `event_id` を伝播）
+- ファイル入口: `process_file`（1ファイルを処理。パスA/Bを振り分け、ステージ2を実行）
 - パスA（表形式 CSV/Excel）: `run_schema_mapper` 関数 — カラムマッピングをAIで生成
 - パスB（非構造化 Text）: `run_document_extractor` 関数 — エンティティをAIで抽出
 - ステージ2（決定論的変換）: `OntologyMapper` **クラス**（`agents/ontology_mapper.py`）
@@ -288,9 +311,9 @@ Event（主催・管理）               ContentAsset（推薦・案内）
 
 | エンドポイント | メソッド | 説明 |
 |---|---|---|
-| `/api/integration/batches` | POST | ファイルアップロード → バッチ開始 |
-| `/api/integration/batches/{id}` | GET | バッチ状態の取得 |
-| `/api/integration/batches/{id}/report` | GET | 加工処理レポート（ステージ1のAI出力・ステージ2の判定根拠・サマリ） |
+| `/api/integration/batches` | POST | 複数ファイルアップロード → バッチ開始（`files` で複数受け取り） |
+| `/api/integration/batches/{id}` | GET | バッチ状態の取得（ファイルごとの `files` 進捗・`resolved_event_id`・`partial` を含む） |
+| `/api/integration/batches/{id}/report` | GET | 加工処理レポート（ファイルごとの `reports` ＋ 横断伝播の `cross_file_summary`） |
 | `/api/integration/batches/{id}/contacts` | GET | バッチ内コンタクト一覧 |
 
 #### マーケティング（`/api/marketing` — `MarketingAgent`）
@@ -329,7 +352,7 @@ Event（主催・管理）               ContentAsset（推薦・案内）
 | **包含根拠** (Inclusion Rationale) | `reason_for_inclusion` | AI判断の説明文。すべてのエージェント出力に必須。`Optional` 不可 |
 | **加工判定根拠** (Transform Reason) | `TransformDecision.reason` | ステージ2の各変換の根拠。`Optional` 不可（原則4） |
 | **コミュニケーション戦略** (Communication Strategy) | `_SYSTEM_PROMPT` 内のブロック選択ルール | `EngagementLevel` に基づくブロック構成ルール |
-| **バッチ** (Batch) | `batch_id` | 1回のデータ統合セッション（= 1ファイルアップロード） |
+| **バッチ** (Batch) | `batch_id` | 1回のデータ統合セッション。**複数ファイルを束ねた1アップロード**（同一イベントに属するファイル群を横断処理する単位） |
 | **ラン** (Run) | `run_id` | 1回のメール生成実行。`compose_emails` ツールが作成し `/execute` で起動 |
 | **チャットセッション** (Chat Session) | `session_id` | `MarketingAgent` との対話セッション。ADK の `InMemorySessionService` で管理 |
 | **コンテンツカタログ** (Content Catalog) | Firestore `content_assets` コレクション | 推薦可能なコンテンツ資産。`get_content_catalog` ツールが取得（DB化済み） |
