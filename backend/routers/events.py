@@ -104,6 +104,22 @@ async def update_event(
     return {**doc.to_dict(), **body}
 
 
+@router.delete("/{event_id}", status_code=204)
+async def delete_event(event_id: str, user: dict = Depends(get_current_user)):
+    """イベント本体と配下の全サブコレクション（kpi/survey/costs/reports/
+    batches/contacts）を再帰削除する。
+
+    integration_batches / data_lineage は event_id 参照のメタデータとして残る
+    （削除済みイベントを指すダングリングは許容）。
+    """
+    db = firestore.client()
+    ref = db.collection("events").document(event_id)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Event not found")
+    db.recursive_delete(ref)
+    return None
+
+
 # ── KPI ──────────────────────────────────────────────────────────────────────
 
 @router.get("/{event_id}/kpi")
