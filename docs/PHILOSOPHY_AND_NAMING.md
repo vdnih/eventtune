@@ -117,6 +117,27 @@ CSV・Excel・PowerPoint・PDF・テキスト、形式は問わない。
 >
 > Contact の名寄せ（複数ファイルにまたがる同一人物の統合）は別の判断であり、ここには含めない。
 
+#### Firestore のバッチ階層 — 中間ドキュメントは必ず実体化する
+
+Contact は `events/{event_id}/batches/{batch_id}/contacts/{contact_id}` に保存する。
+ここで陥りやすい罠が **Firestore の「幽霊ドキュメント（ghost / phantom ancestor）」** である。
+リーフ（contacts ドキュメント）だけを `set` すると、中間の `batches/{batch_id}` ドキュメントは
+**実体を持たない祖先パス**になる。Firestore のコレクションクエリ（`collection(...).get()`）は
+**実体のあるドキュメントしか返さない**ため、`collection(".../batches").get()` でバッチを列挙できず、
+コンタクトを1件も取得できない（`get_event_contacts` が無言で `[]` を返し、エージェントが
+「リスト取得不能＝エラー」と誤認する事象が実際に起きた）。
+
+> **設計判断: バッチ階層では中間ドキュメントを取り込み時に明示的に `set` する。** `process_file` は
+> Contact を書き込んだ `event_id` について `events/{eid}/batches/{batch_id}` を併せて実体化する。
+> 列挙側（`get_event_contacts` / `_find_contact`）は、過去に作られた幽霊バッチにも対応できるよう
+> `collection(...).get()` ではなく **`list_documents()`**（祖先パスのみのドキュメント参照も返す）で
+> バッチを走査する。両者は別レイヤの保険であり、片方だけでは既存データ or 将来データのどちらかが漏れる。
+>
+> なお Contact の所属イベントの真実の源は **`Contact.source_event_id`**（原則: 「いつ・どのイベントで」を
+> 常に保持）であり、保存パスの `event_id` はこれと一致させる。将来コンタクトをイベント横断で引く場合は
+> バッチ階層の走査ではなく `source_event_id` への collection group query に寄せる選択肢もある
+> （その場合はインデックス追加が必要）。
+
 #### 実装上の注意 — 構造化出力とスキーマの定め方
 
 Gemini の構造化出力（`response_schema` / controlled generation）は、**プロパティが定義されていない

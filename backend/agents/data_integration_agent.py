@@ -395,12 +395,25 @@ async def process_file(
 
     # Firestore に書き込み
     created_ids: dict[str, list[str]] = {}
+    # Contact が入った events/{eid}/batches/{bid} の親ドキュメントを実体化するため、
+    # コンタクトが書き込まれた event_id を記録する。
+    contact_event_ids: set[str] = set()
     for entity in entities:
         collection, doc_id = _entity_to_firestore_path(entity, event_id, batch_id)
         if collection and doc_id:
             db.document(collection + "/" + doc_id).set(entity.model_dump(), merge=True)
             key = type(entity).__name__
             created_ids.setdefault(key, []).append(doc_id)
+            if isinstance(entity, Contact):
+                contact_event_ids.add(entity.source_event_id or event_id or "unknown")
+
+    # batches/{batch_id} ドキュメントを明示的に作成する。
+    # これを書かないと中間ドキュメントが「幽霊（サブコレクションのみの祖先）」となり、
+    # コレクションクエリ collection(".../batches").get() でバッチを列挙できなくなる。
+    for eid in contact_event_ids:
+        db.document(f"events/{eid}/batches/{batch_id}").set(
+            {"batch_id": batch_id, "event_id": eid}, merge=True
+        )
 
     logger.info("process_file done: created=%s", {k: len(v) for k, v in created_ids.items()})
 

@@ -111,7 +111,10 @@ def get_event_contacts(event_id: str, engagement_level: str = "") -> str:
     engagement_level を指定するとフィルタリングできる（例: "アポ獲得済み"）。
     """
     db = _db()
-    batches = db.collection(f"events/{event_id}/batches").get()
+    # NOTE: batches/{bid} ドキュメントは取り込み時に実体化されない（contacts のみ書き込む）
+    # ため、コレクションクエリ .get() では祖先パスの幽霊ドキュメントを拾えない。
+    # 幽霊ドキュメントも含めて列挙する .list_documents() を使う。
+    batches = db.collection(f"events/{event_id}/batches").list_documents()
     contacts = []
     for batch in batches:
         coll = db.collection(f"events/{event_id}/batches/{batch.id}/contacts").get()
@@ -474,7 +477,9 @@ def _find_contact(db: Any, contact_id: str) -> dict | None:
     """全イベントのバッチからコンタクトを検索する。"""
     events = db.collection("events").get()
     for ev in events:
-        batches = db.collection(f"events/{ev.id}/batches").get()
+        # batches/{bid} は実体化されない幽霊ドキュメントのため list_documents() で列挙する
+        # （get_event_contacts と同じ理由）。
+        batches = db.collection(f"events/{ev.id}/batches").list_documents()
         for batch in batches:
             doc = db.document(
                 f"events/{ev.id}/batches/{batch.id}/contacts/{contact_id}"
