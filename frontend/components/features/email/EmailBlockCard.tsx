@@ -7,17 +7,23 @@ import { cn } from "@/lib/utils";
 interface EmailBlock {
   block_type: string;
   reason_for_inclusion: string;
-  associated_content_ids: string[];
+  associated_asset_ids?: string[];
+  associated_content_ids?: string[];   // 旧フィールド名との互換
   block_text: string;
 }
 
 interface Email {
-  lead_id: string;
+  email_id?: string;
+  lead_id?: string;         // 旧フィールド名との互換
+  contact_id?: string;
   subject: string;
   blocks: EmailBlock[];
   lead_name?: string;
   lead_company?: string;
   lead_segment?: string;
+  contact_name?: string;
+  contact_company?: string;
+  engagement_level?: string;
 }
 
 interface Props {
@@ -35,8 +41,11 @@ export function EmailBlockCard({ email, index }: Props) {
   const [expanded, setExpanded] = useState(index === 0);
   const [showReasons, setShowReasons] = useState(false);
 
+  const displayName = email.lead_name ?? email.contact_name ?? "";
+  const displayCompany = email.lead_company ?? email.contact_company ?? "";
+  const displaySegment = email.lead_segment ?? email.engagement_level ?? "";
   const segmentColor =
-    SEGMENT_COLORS[email.lead_segment ?? ""] ?? "bg-gray-100 text-gray-600";
+    SEGMENT_COLORS[displaySegment] ?? "bg-gray-100 text-gray-600";
 
   return (
     <div className="border border-gray-200 rounded-xl overflow-hidden bg-white shadow-sm">
@@ -48,17 +57,17 @@ export function EmailBlockCard({ email, index }: Props) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs font-medium text-gray-400">#{index + 1}</span>
-            {email.lead_name && (
+            {displayName && (
               <span className="font-semibold text-gray-800 text-sm">
-                {email.lead_name}
+                {displayName}
               </span>
             )}
-            {email.lead_company && (
-              <span className="text-gray-500 text-sm">{email.lead_company}</span>
+            {displayCompany && (
+              <span className="text-gray-500 text-sm">{displayCompany}</span>
             )}
-            {email.lead_segment && (
+            {displaySegment && (
               <span className={cn("text-xs px-2 py-0.5 rounded-full font-medium", segmentColor)}>
-                {email.lead_segment}
+                {displaySegment}
               </span>
             )}
           </div>
@@ -101,19 +110,22 @@ export function EmailBlockCard({ email, index }: Props) {
                 {block.block_text}
               </p>
 
-              {block.associated_content_ids.length > 0 && (
-                <div className="flex items-center gap-1 flex-wrap">
-                  <Link className="w-3 h-3 text-gray-400" />
-                  {block.associated_content_ids.map((id) => (
-                    <span
-                      key={id}
-                      className="text-xs bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded font-mono"
-                    >
-                      {id}
-                    </span>
-                  ))}
-                </div>
-              )}
+              {(() => {
+                const ids = block.associated_asset_ids ?? block.associated_content_ids ?? [];
+                return ids.length > 0 ? (
+                  <div className="flex items-center gap-1 flex-wrap">
+                    <Link className="w-3 h-3 text-gray-400" />
+                    {ids.map((id) => (
+                      <span
+                        key={id}
+                        className="text-xs bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded font-mono"
+                      >
+                        {id}
+                      </span>
+                    ))}
+                  </div>
+                ) : null;
+              })()}
             </div>
           ))}
         </div>

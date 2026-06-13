@@ -30,11 +30,11 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="min-h-screen">
-      <header className="bg-white border-b border-gray-200">
-        <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
+    <div className="h-screen flex flex-col overflow-hidden">
+      <header className="shrink-0 bg-white border-b border-gray-200">
+        <div className="px-4 h-14 flex items-center justify-between">
           <span className="text-lg font-bold text-brand-600">
-            メールジェネレーター
+            イベントマーケティング
           </span>
           <button
             onClick={() => auth.signOut().then(() => router.replace("/login"))}
@@ -44,7 +44,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
           </button>
         </div>
       </header>
-      <main className="max-w-6xl mx-auto px-4 py-8">{children}</main>
+      <main className="flex-1 overflow-hidden">{children}</main>
     </div>
   );
 }

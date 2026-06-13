@@ -6,13 +6,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
-from routers import execute, generate, ingest
+from routers import events, integration, marketing
 
 settings = get_settings()
 
 firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id})
 
-app = FastAPI(title="Marketing Mail Generator API", version="1.0.0")
+app = FastAPI(title="Event Marketing Platform API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,9 +22,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(generate.router)
-app.include_router(ingest.router)
-app.include_router(execute.router)
+app.include_router(integration.router)
+app.include_router(marketing.router)
+app.include_router(events.router)
 
 
 @app.get("/health")

@@ -1,0 +1,77 @@
+■ コンテンツカタログ — MarketingAgent が推薦に使用するコンテンツ資産一覧
+更新日: 2026年06月01日 / 担当: マーケティング部
+
+【資料・ホワイトペーパー】
+
+asset_id: wp_skillmap_intro
+コンテンツ種別: 資料・ホワイトペーパー
+タイトル: プロダクトA スキルマップDX 導入ガイドブック
+説明: スキルマップのデジタル化から多能工育成まで、プロダクトAの機能と導入ステップを解説した入門資料。製造業HR担当者向け。
+URL: https://example.com/resources/wp_skillmap_intro
+
+asset_id: wp_succession_plan
+コンテンツ種別: 資料・ホワイトペーパー
+タイトル: 技能伝承アーカイブ 活用事例集 〜ベテラン退職前にすべきこと〜
+説明: 高齢化による技能伝承課題に向けた動画・ドキュメント管理の実践方法をまとめたホワイトペーパー。製造業向け。
+URL: https://example.com/resources/wp_succession_plan
+
+asset_id: wp_workforce_optimization
+コンテンツ種別: 資料・ホワイトペーパー
+タイトル: プロダクトB 要員配置シミュレーター 機能紹介資料
+説明: AIを活用した要員配置の自動最適化機能について解説。シフト作成工数の削減とコスト最適化の事例を掲載。
+URL: https://example.com/resources/wp_workforce_optimization
+
+asset_id: wp_qualification_mgmt
+コンテンツ種別: 資料・ホワイトペーパー
+タイトル: 資格・安全講習管理 完全ガイド 〜法令対応から現場運用まで〜
+説明: 危険物取扱者・電気主任技術者など各種資格の期限管理・更新アラート機能の詳細解説。化学・食品・製造業向け。
+URL: https://example.com/resources/wp_qualification_mgmt
+
+【導入事例】
+
+asset_id: case_automotive_tier1
+コンテンツ種別: 導入事例
+タイトル: 自動車部品メーカーA社様 プロダクトAB導入事例 — IATF認証対応とスキル可視化を同時実現
+説明: 従業員250名の自動車Tier1サプライヤーがIATF16949認証対応を機にプロダクトABを導入。スキル可視化と要員配置最適化で生産性15%向上。
+URL: https://example.com/cases/case_automotive_tier1
+
+asset_id: case_food_haccp
+コンテンツ種別: 導入事例
+タイトル: 食品製造B社様 HACCP義務化対応事例 — 衛生教育記録の完全デジタル化
+説明: HACCP義務化を契機にプロダクトAを導入した食品製造業の事例。衛生教育記録のデジタル化により監査準備工数を70%削減。
+URL: https://example.com/cases/case_food_haccp
+
+asset_id: case_shipbuilding
+コンテンツ種別: 導入事例
+タイトル: 造船会社C社様 特殊技能者管理事例 — 溶接士・塗装技術者の配置最適化
+説明: 造船業特有の特殊技能（溶接・塗装・非破壊検査等）を持つ技能者の管理と配置最適化を実現した導入事例。
+URL: https://example.com/cases/case_shipbuilding
+
+asset_id: case_chemical
+コンテンツ種別: 導入事例
+タイトル: 化学工業D社様 危険物管理事例 — 法令遵守と安全管理の一元化
+説明: 化学工場における危険物取扱者・高圧ガス取扱者などの資格管理をプロダクトAで一元化。法令違反リスクをゼロに。
+URL: https://example.com/cases/case_chemical
+
+【開催予定セミナー・イベント】
+
+asset_id: seminar_skillmap_2026_07
+コンテンツ種別: 未来のセミナー（募集中）
+タイトル: 【無料ウェビナー】スキルマップDX入門セミナー 〜Excelからの脱却と多能工育成の実践〜
+説明: プロダクトAの基本機能と導入事例を90分で紹介するウェビナー。製造業の人事・製造部門担当者向け。参加無料。毎月開催。
+URL: https://example.com/events/seminar_skillmap_2026_07
+開催予定日: 2026年07月15日（火）14:00〜15:30
+
+asset_id: seminar_workforce_2026_08
+コンテンツ種別: 未来のセミナー（募集中）
+タイトル: 【無料ウェビナー】AI要員配置の最前線 〜シフト作成工数を80%削減した事例紹介〜
+説明: プロダクトBの要員配置シミュレーター機能を中心に、AI最適化の仕組みと導入効果を紹介するウェビナー。
+URL: https://example.com/events/seminar_workforce_2026_08
+開催予定日: 2026年08月06日（水）14:00〜15:30
+
+asset_id: event_manufacturing_dx_2026_10
+コンテンツ種別: 未来のイベント（募集中）
+タイトル: スマート工場EXPO 2026秋（出展予定）
+説明: 2026年10月開催予定のスマート工場EXPOに出展予定。プロダクトA・B両製品の最新バージョンを展示予定。
+URL: https://example.com/events/expo_2026_autumn
+開催予定日: 2026年10月13日（火）〜15日（木）

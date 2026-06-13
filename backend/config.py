@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     google_cloud_project: str
-    vertex_ai_location: str = "us-central1"
+    vertex_ai_location: str = "global"
     firebase_project_id: str
     frontend_origin: str = "http://localhost:3000"
 
