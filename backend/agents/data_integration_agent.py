@@ -336,6 +336,24 @@ def _read_text(content: bytes) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+# ── 既存イベント照合 ───────────────────────────────────────────────────────────
+
+def _find_existing_event_by_name(db: Any, name: str) -> str | None:
+    """同名の既存イベントを検索し、その event_id を返す（重複防止・決定論的）。
+
+    overview.txt 由来のイベント名で完全一致検索する。名前が空なら誤マッチ防止に
+    None を返す。一致が複数あっても先頭を採用する（取り込みのたびに新規採番されて
+    重複する問題への対処）。
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    docs = db.collection("events").where("name", "==", name).limit(1).get()
+    for d in docs:
+        return d.to_dict().get("event_id") or d.id
+    return None
+
+
 # ── Firestore パス解決 ─────────────────────────────────────────────────────────
 
 def _entity_to_firestore_path(
@@ -424,7 +442,8 @@ async def process_file(
         raw_extraction_dict = extraction.model_dump()
         logger.info("document_extractor result: detected=%s", extraction.detected_entity_types)
         entities, transformations, skipped = _mapper.map_extraction(
-            extraction, event_id=event_id, batch_id=batch_id
+            extraction, event_id=event_id, batch_id=batch_id,
+            event_id_resolver=lambda name: _find_existing_event_by_name(db, name),
         )
 
     # Firestore に書き込み

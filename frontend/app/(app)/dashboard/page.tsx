@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { auth } from "@/lib/firebase";
 import { EmailBlockCard } from "@/components/features/email/EmailBlockCard";
-import { Loader2, Send, Upload, Wrench, Calendar, RefreshCw, Plus, X, Check, FileText } from "lucide-react";
+import { Loader2, Send, Upload, Wrench, Calendar, RefreshCw, Plus, X, Check, FileText, Trash2 } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -314,6 +314,8 @@ function SourcesPanel({
   uploading,
   onFileSelect,
   onCreateEvent,
+  onDelete,
+  deletingId,
 }: {
   events: EventSummary[];
   loadingEvents: boolean;
@@ -325,6 +327,8 @@ function SourcesPanel({
   uploading: boolean;
   onFileSelect: (files: File[]) => void;
   onCreateEvent: (name: string, date: string, type: string) => Promise<void>;
+  onDelete: (eventId: string) => void;
+  deletingId: string | null;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [searchText, setSearchText] = useState("");
@@ -448,16 +452,33 @@ function SourcesPanel({
           </p>
         )}
         {filteredEvents.map((ev) => (
-          <button
+          <div
             key={ev.event_id}
+            role="button"
+            tabIndex={0}
             onClick={() => onSelectEvent(ev.event_id)}
-            className={`w-full text-left rounded-lg border px-3 py-2 transition ${
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelectEvent(ev.event_id); }}
+            className={`group w-full text-left rounded-lg border px-3 py-2 transition cursor-pointer ${
               selectedEventId === ev.event_id
                 ? "border-indigo-300 bg-indigo-50"
                 : "border-gray-100 bg-white hover:border-gray-200 hover:bg-gray-50"
             }`}
           >
-            <p className="text-xs font-medium text-gray-800 leading-tight truncate">{ev.name}</p>
+            <div className="flex items-start gap-1">
+              <p className="flex-1 text-xs font-medium text-gray-800 leading-tight truncate">{ev.name}</p>
+              <button
+                onClick={(e) => { e.stopPropagation(); onDelete(ev.event_id); }}
+                disabled={deletingId === ev.event_id}
+                className="shrink-0 p-0.5 rounded text-gray-300 hover:text-red-500 hover:bg-red-50 opacity-0 group-hover:opacity-100 transition disabled:opacity-50"
+                title="イベントを削除"
+              >
+                {deletingId === ev.event_id ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </div>
             <div className="flex items-center gap-1 mt-0.5">
               <Calendar className="w-3 h-3 text-gray-300 shrink-0" />
               <span className="text-[11px] text-gray-400">{ev.event_date}</span>
@@ -476,7 +497,7 @@ function SourcesPanel({
             {ev.event_type && (
               <span className="text-[10px] text-gray-400 mt-0.5 block">{ev.event_type}</span>
             )}
-          </button>
+          </div>
         ))}
 
         {/* Create event */}
@@ -551,6 +572,7 @@ export default function DashboardPage() {
   const [suggestions, setSuggestions] = useState<FileSuggestion[] | null>(null);
   const [overrides, setOverrides] = useState<Record<string, string | null>>({});
   const [suggestLoading, setSuggestLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const sessionId = useRef<string>(crypto.randomUUID());
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -601,6 +623,34 @@ export default function DashboardPage() {
   useEffect(() => {
     fetchEvents();
   }, [fetchEvents]);
+
+  // ── イベント削除 ──────────────────────────────────────────────────────────
+
+  const handleDeleteEvent = useCallback(
+    async (eventId: string) => {
+      const ev = events.find((e) => e.event_id === eventId);
+      const name = ev?.name ?? eventId;
+      if (!window.confirm(`イベント「${name}」と紐づくデータ（コンタクト・KPI・費用・アンケート）をすべて削除します。元に戻せません。よろしいですか？`)) {
+        return;
+      }
+      setDeletingId(eventId);
+      try {
+        const res = await authFetch(`/api/events/${eventId}`, { method: "DELETE" });
+        if (!res.ok && res.status !== 204) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.detail ?? `エラー ${res.status}`);
+        }
+        // 削除したイベントが選択中なら選択を解除する
+        setSelectedEventId((prev) => (prev === eventId ? null : prev));
+        await fetchEvents();
+      } catch (e) {
+        window.alert(`削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [events, fetchEvents],
+  );
 
   // ── ファイルアップロード（2ステップ: 提案 → 確認 → 取り込み）──────────────
 
@@ -1015,6 +1065,8 @@ export default function DashboardPage() {
         uploading={uploading}
         onFileSelect={handleFileSelect}
         onCreateEvent={handleCreateEvent}
+        onDelete={handleDeleteEvent}
+        deletingId={deletingId}
       />
 
       {/* 右パネル: チャット */}
