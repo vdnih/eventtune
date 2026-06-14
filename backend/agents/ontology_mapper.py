@@ -241,8 +241,8 @@ class OntologyMapper:
                 skipped.append(skip)
             return entity
 
-        if extraction.event:
-            event = _collect(self._build_event(extraction.event, event_id=event_id))
+        for event_data in extraction.events:
+            event = _collect(self._build_event(event_data, event_id=event_id))
             if event is not None and resolved_event_id is None:
                 resolved_event_id = event.event_id
 
@@ -291,7 +291,7 @@ class OntologyMapper:
             status=status,
             venue=raw.get("venue", ""),
             event_date=raw.get("event_date", ""),
-            event_date_end=raw.get("event_date_end", raw.get("event_date", "")),
+            event_date_end=raw.get("event_date_end") or raw.get("event_date", ""),
             booth_number=raw.get("booth_number") or None,
             total_budget=budget,
             target_contact_count=_to_int(raw.get("target_contact_count")),
