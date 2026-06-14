@@ -100,13 +100,16 @@ cost_items (CostItem エンティティ):
 - contacts 判断基準: 氏名・会社名・部署などの人物情報が含まれている
 - cost_items 判断基準: 金額・費用項目などの経費情報が含まれている
 - __ プレフィックスのフィールドは OntologyMapper でさらに変換される特殊フィールド
+- 「イベント名」「展示会名」「event_name」など、行ごとに異なるイベントを識別するカラムがあれば
+  event_routing_column にそのカラム名を設定する（なければ null）
 
 【出力形式】
 次の形の JSON オブジェクトのみを返してください（説明文やコードフェンスは不要）:
 {
   "entity_type": "contacts" または "cost_items",
   "column_map": { "CSVカラム名": "オントロジーフィールド名", ... },
-  "unmapped_columns": [ "マッピングできなかったCSVカラム名", ... ]
+  "unmapped_columns": [ "マッピングできなかったCSVカラム名", ... ],
+  "event_routing_column": "カラム名 or null"
 }
 """
 
@@ -153,10 +156,12 @@ async def run_schema_mapper(
     # キー・値とも str に正規化（防御的）
     column_map = {str(k): str(v) for k, v in raw_map.items() if v}
     unmapped = parsed.get("unmapped_columns") or []
+    event_routing_column = parsed.get("event_routing_column") or None
     return ColumnMappingResult(
         entity_type=str(parsed.get("entity_type", "")),
         column_map=column_map,
         unmapped_columns=[str(c) for c in unmapped],
+        event_routing_column=str(event_routing_column) if event_routing_column else None,
     )
 
 
@@ -236,7 +241,7 @@ class _ContentAssetExtraction(BaseModel):
 
 class _DocumentExtractionResponse(BaseModel):
     detected_entity_types: list[str] = []
-    event: Optional[_EventExtraction] = None
+    events: list[_EventExtraction] = []
     event_kpi: Optional[_EventKPIExtraction] = None
     cost_items: Optional[list[_CostItemExtraction]] = None
     survey_response: Optional[_SurveyResponseExtraction] = None
@@ -247,10 +252,11 @@ _DOCUMENT_EXTRACTOR_PROMPT = """\
 あなたはイベントマーケティングデータの統合専門家です。
 以下のドキュメントを読み、含まれる情報をオントロジーのエンティティに変換してください。
 1つのドキュメントから複数のエンティティが抽出されることがあります。
+イベントは複数記載されている場合もあります（例: 年間イベント計画書）。その場合はすべて抽出してください。
 
 【オントロジーのエンティティとフィールド】
 
-Event:
+Event（複数可）:
   name, event_type（展示会/セミナー/プライベートイベント）, status（計画中/開催中/終了）,
   venue, event_date（YYYY-MM-DD）, event_date_end（YYYY-MM-DD）, booth_number,
   total_budget（数値のみ、円記号・カンマ除去）, target_contact_count（数値）,
@@ -301,7 +307,7 @@ async def run_document_extractor(text: str) -> DocumentExtractionResult:
     # 以降の OntologyMapper / DataLineage は従来通り dict を受ける。
     return DocumentExtractionResult(
         detected_entity_types=parsed.detected_entity_types,
-        event=parsed.event.model_dump() if parsed.event else None,
+        events=[e.model_dump() for e in parsed.events] if parsed.events else [],
         event_kpi=parsed.event_kpi.model_dump() if parsed.event_kpi else None,
         cost_items=[c.model_dump() for c in parsed.cost_items] if parsed.cost_items else None,
         survey_response=parsed.survey_response.model_dump() if parsed.survey_response else None,
@@ -379,10 +385,38 @@ async def process_file(
         # ─ パス A: CSV / Excel ───────────────────────────────────────────
         headers, rows = _read_tabular(filename, content)
         column_mapping = await run_schema_mapper(headers, rows)
-        logger.info("schema_mapper result: entity_type=%s columns=%d", column_mapping.entity_type, len(column_mapping.column_map))
-        entities, transformations, skipped = _mapper.map_rows(
-            column_mapping, rows, event_id=event_id, batch_id=batch_id
-        )
+        logger.info("schema_mapper result: entity_type=%s columns=%d routing_col=%s",
+                    column_mapping.entity_type, len(column_mapping.column_map), column_mapping.event_routing_column)
+
+        routing_col = column_mapping.event_routing_column
+        if routing_col and column_mapping.entity_type == "contacts":
+            # イベントルーティング列がある場合: 列の値でグループ化し各グループを別イベントとして処理
+            groups: dict[str, list[dict]] = {}
+            for row in rows:
+                key = str(row.get(routing_col, "")).strip()
+                groups.setdefault(key, []).append(row)
+
+            all_entities: list[Any] = []
+            all_transformations: list[Any] = []
+            all_skipped: list[Any] = []
+            for event_name, group_rows in groups.items():
+                # イベント名でFirestoreを検索して event_id を解決
+                group_event_id = event_id  # 明示指定がある場合はそれを優先
+                if not group_event_id and event_name:
+                    snap = db.collection("events").where("name", "==", event_name).limit(1).get()
+                    if snap:
+                        group_event_id = snap[0].id
+                e_list, t_list, s_list = _mapper.map_rows(
+                    column_mapping, group_rows, event_id=group_event_id, batch_id=batch_id
+                )
+                all_entities.extend(e_list)
+                all_transformations.extend(t_list)
+                all_skipped.extend(s_list)
+            entities, transformations, skipped = all_entities, all_transformations, all_skipped
+        else:
+            entities, transformations, skipped = _mapper.map_rows(
+                column_mapping, rows, event_id=event_id, batch_id=batch_id
+            )
     else:
         # ─ パス B: テキスト / その他 ─────────────────────────────────────
         text = _read_text(content)
@@ -477,8 +511,7 @@ class BatchFileResult:
     lineage_id: str | None = None
     created_entities: dict[str, int] = field(default_factory=dict)
     error: str | None = None
-    role: str = ""  # "event_defining" | "dependent_doc" | "tabular"
-    generated_event_id: str | None = None  # このファイルが生成した Event の id（横断伝播用）
+    generated_event_ids: list[str] = field(default_factory=list)  # このファイルが生成した Event の id リスト
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -487,12 +520,11 @@ class BatchFileResult:
             "lineage_id": self.lineage_id,
             "created_entities": self.created_entities,
             "error": self.error,
-            "role": self.role,
         }
 
 
 def _resolve_event_id(explicit: str | None, batch_resolved: str | None) -> str | None:
-    """バッチ内で使う event_id を優先順位に従って決定する（決定論的）。
+    """(互換維持のため残存。新コードでは使用しない)
 
     優先順位:
       1. UI で明示選択された event_id（既存イベントへの追加取り込み）
@@ -514,47 +546,23 @@ def _is_event_defining_name(filename: str) -> bool:
 
 async def process_batch(
     files: list[tuple[str, bytes]],
-    event_id: str | None,
     batch_id: str,
     db: Any,  # firebase_admin.firestore.Client
-) -> tuple[list[BatchFileResult], str | None]:
-    """複数ファイルを1バッチとして横断的に処理する。
+    file_event_map: dict[str, str | None] | None = None,
+) -> list[BatchFileResult]:
+    """複数ファイルを並列に処理する。
 
-    同一イベントに属するファイル群（例: leads.csv + overview.txt + survey.txt）を
-    まとめて取り込み、overview.txt から確定する event_id を leads/survey に
-    横断伝播させる。処理順と event_id 伝播は AI を使わず決定論的に行う（原則4）。
-
-    Returns:
-        (per-file 結果リスト, バッチで確定した resolved_event_id)
+    file_event_map でファイルごとの event_id を明示指定する。
+    指定がない（または None 値の）ファイルは、ファイル内容から AI がイベントを生成/解決する。
     """
-    # 表形式 / 非表形式に分け、非表形式は Event 定義候補（overview/概要）を先頭へ寄せる
-    non_tabular = [f for f in files if not _is_tabular(f[0])]
-    tabular = [f for f in files if _is_tabular(f[0])]
-    non_tabular.sort(key=lambda f: 0 if _is_event_defining_name(f[0]) else 1)
+    import asyncio
 
-    results: list[BatchFileResult] = []
-    batch_event_id: str | None = None
+    async def _process(filename: str, content: bytes) -> BatchFileResult:
+        event_id = (file_event_map or {}).get(filename)
+        return await _process_one(filename, content, event_id, batch_id, db)
 
-    # ─ パス1: 非表形式（Event を生成しうる）を先に処理 ─────────────────────────
-    for filename, content in non_tabular:
-        current_event_id = _resolve_event_id(event_id, batch_event_id)
-        result = await _process_one(filename, content, current_event_id, batch_id, db)
-        # 生成エンティティに Event が含まれ、まだ未確定なら採用
-        if result.status == "done" and batch_event_id is None and event_id is None:
-            if result.generated_event_id:
-                batch_event_id = result.generated_event_id
-        result.role = "event_defining" if _is_event_defining_name(filename) else "dependent_doc"
-        results.append(result)
-
-    resolved = _resolve_event_id(event_id, batch_event_id)
-
-    # ─ パス2: 表形式（resolved event_id を伝播）─────────────────────────────────
-    for filename, content in tabular:
-        result = await _process_one(filename, content, resolved, batch_id, db)
-        result.role = "tabular"
-        results.append(result)
-
-    return results, resolved
+    results = await asyncio.gather(*[_process(fn, content) for fn, content in files])
+    return list(results)
 
 
 async def _process_one(
@@ -570,14 +578,13 @@ async def _process_one(
         counts: dict[str, int] = {}
         for entity in entities:
             counts[type(entity).__name__] = counts.get(type(entity).__name__, 0) + 1
-        # 生成された Event の id を横断伝播のために控える
-        ev = next((e for e in entities if isinstance(e, Event)), None)
+        generated_event_ids = [e.event_id for e in entities if isinstance(e, Event)]
         return BatchFileResult(
             filename=filename,
             status="done",
             lineage_id=lineage.lineage_id,
             created_entities=counts,
-            generated_event_id=ev.event_id if ev is not None else None,
+            generated_event_ids=generated_event_ids,
         )
     except Exception as e:
         logger.exception("process_one failed: filename=%s error=%s", filename, e)

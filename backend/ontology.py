@@ -203,12 +203,13 @@ class ColumnMappingResult(BaseModel):
     column_map: dict[str, str]            # "会社名" → "company_name"
                                           # "__" プレフィックスは Python ロジックで変換
     unmapped_columns: List[str] = []
+    event_routing_column: Optional[str] = None  # 行ごとに異なるイベントへルーティングする列名
 
 
 class DocumentExtractionResult(BaseModel):
     """DocumentExtractor（パスB）の出力: 非構造化ドキュメントから抽出したエンティティ群"""
     detected_entity_types: List[str]      # ["event", "event_kpi", "cost_items", ...]
-    event: Optional[dict] = None
+    events: List[dict] = []               # 0件 or 複数件のイベント（1ドキュメント複数イベント対応）
     event_kpi: Optional[dict] = None
     cost_items: Optional[List[dict]] = None
     survey_response: Optional[dict] = None
