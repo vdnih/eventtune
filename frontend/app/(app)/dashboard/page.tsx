@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { auth } from "@/lib/firebase";
 import { EmailBlockCard } from "@/components/features/email/EmailBlockCard";
-import { Loader2, Send, Upload, Wrench, Calendar, RefreshCw, Plus, X, Check, FileText, Trash2 } from "lucide-react";
+import EventDataPanel from "@/components/features/explorer/EventDataPanel";
+import { Loader2, Send, Upload, Wrench, Calendar, RefreshCw, Plus, X, Check, FileText, Trash2, MessageSquare } from "lucide-react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -320,7 +321,7 @@ function SourcesPanel({
   events: EventSummary[];
   loadingEvents: boolean;
   selectedEventId: string | null;
-  onSelectEvent: (id: string) => void;
+  onSelectEvent: (id: string | null) => void;
   onRefresh: () => void;
   pendingFiles: File[] | null;
   suggestLoading: boolean;
@@ -441,8 +442,11 @@ function SourcesPanel({
         </div>
       </div>
 
-      {/* Event list */}
-      <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-1">
+      {/* Event list（空白部分クリックで選択解除） */}
+      <div
+        className="flex-1 overflow-y-auto px-3 pb-3 space-y-1"
+        onClick={(e) => { if (e.target === e.currentTarget) onSelectEvent(null); }}
+      >
         {loadingEvents && events.length === 0 && (
           <p className="text-xs text-gray-400 px-1 mt-1">読み込み中...</p>
         )}
@@ -456,8 +460,8 @@ function SourcesPanel({
             key={ev.event_id}
             role="button"
             tabIndex={0}
-            onClick={() => onSelectEvent(ev.event_id)}
-            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelectEvent(ev.event_id); }}
+            onClick={() => onSelectEvent(selectedEventId === ev.event_id ? null : ev.event_id)}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") onSelectEvent(selectedEventId === ev.event_id ? null : ev.event_id); }}
             className={`group w-full text-left rounded-lg border px-3 py-2 transition cursor-pointer ${
               selectedEventId === ev.event_id
                 ? "border-indigo-300 bg-indigo-50"
@@ -587,6 +591,10 @@ export default function DashboardPage() {
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // 右ペイン上下分割: 下部チャット領域の高さ（px）。境界ドラッグで調整。
+  const [chatHeight, setChatHeight] = useState(360);
+  const dragRef = useRef<{ startY: number; startH: number } | null>(null);
+
   // emails polling
   const pollingRefs = useRef<Record<string, ReturnType<typeof setInterval>>>({});
 
@@ -610,8 +618,9 @@ export default function DashboardPage() {
         const data = await res.json();
         const evts: EventSummary[] = data.events ?? [];
         setEvents(evts);
-        // 未選択の場合は最新イベントを自動選択
-        setSelectedEventId((prev) => prev ?? evts[0]?.event_id ?? null);
+        // 初期状態は未選択（全イベント横断サマリ＋全体チャット）。
+        // 選択中イベントが削除されていた場合のみ選択を解除する。
+        setSelectedEventId((prev) => (prev && evts.some((e) => e.event_id === prev) ? prev : null));
       }
     } catch {
       // ignore
@@ -834,6 +843,7 @@ export default function DashboardPage() {
         body: JSON.stringify({
           message: text,
           session_id: sessionId.current,
+          event_id: selectedEventId,
         }),
       });
 
@@ -1034,7 +1044,35 @@ export default function DashboardPage() {
     });
   }
 
+  // ── 右ペイン上下分割のリサイズ ────────────────────────────────────────────
+
+  function handleResizeStart(e: React.PointerEvent) {
+    e.preventDefault();
+    dragRef.current = { startY: e.clientY, startH: chatHeight };
+    const onMove = (ev: PointerEvent) => {
+      if (!dragRef.current) return;
+      const delta = dragRef.current.startY - ev.clientY;
+      const next = Math.min(
+        Math.max(dragRef.current.startH + delta, 180),
+        window.innerHeight - 220,
+      );
+      setChatHeight(next);
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  }
+
   // ── レンダリング ─────────────────────────────────────────────────────────
+
+  const selectedEvent = events.find((e) => e.event_id === selectedEventId);
+  const chatContextLabel = selectedEvent
+    ? `${selectedEvent.name}について`
+    : "全イベントについて";
 
   return (
     <div className="flex h-[calc(100vh-3.5rem)] overflow-hidden">
@@ -1069,8 +1107,25 @@ export default function DashboardPage() {
         deletingId={deletingId}
       />
 
-      {/* 右パネル: チャット */}
+      {/* 右パネル: 上=データ確認 / 下=常駐チャット */}
       <div className="flex-1 flex flex-col overflow-hidden bg-white">
+        {/* 上: イベントデータパネル（未選択時は全イベント横断サマリ） */}
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <EventDataPanel selectedEventId={selectedEventId} />
+        </div>
+
+        {/* 上下分割のリサイズハンドル */}
+        <div
+          onPointerDown={handleResizeStart}
+          className="shrink-0 h-1.5 cursor-row-resize bg-gray-100 hover:bg-brand-300 transition border-t border-b border-gray-200"
+          title="ドラッグで高さを調整"
+        />
+
+        {/* 下: 常駐チャット */}
+        <div
+          className="shrink-0 flex flex-col overflow-hidden bg-white"
+          style={{ height: chatHeight }}
+        >
         {/* メッセージ履歴 */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
           {messages.map((msg) => (
@@ -1144,7 +1199,17 @@ export default function DashboardPage() {
         </div>
 
         {/* 入力エリア */}
-        <div className="shrink-0 border-t border-gray-100 px-6 py-4">
+        <div className="shrink-0 border-t border-gray-100 px-6 py-3">
+          {/* チャット文脈インジケータ: 選択中イベント or 全体 */}
+          <div className="flex items-center gap-1.5 mb-2 text-xs text-gray-500">
+            <MessageSquare className="w-3.5 h-3.5 text-brand-500 shrink-0" />
+            <span>
+              <span className="font-semibold text-gray-700">{chatContextLabel}</span>
+              <span className="text-gray-400">
+                {selectedEvent ? " 質問しています" : " 質問しています（左でイベントを選ぶと対象を絞り込めます）"}
+              </span>
+            </span>
+          </div>
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -1172,6 +1237,7 @@ export default function DashboardPage() {
               )}
             </button>
           </form>
+        </div>
         </div>
       </div>
     </div>

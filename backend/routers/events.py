@@ -51,6 +51,58 @@ async def list_events(user: dict = Depends(get_current_user)):
     return {"events": events, "count": len(events)}
 
 
+@router.get("/summary")
+async def events_summary(user: dict = Depends(get_current_user)):
+    """全イベントの横断サマリを返す。イベント未選択時の右ペイン表示に使用。
+
+    各イベントごとに KPI（来場・名刺）と費用合計を集計し、全体の合計値も付与する。
+    """
+    db = firestore.client()
+    event_docs = db.collection("events").get()
+    events_data = [d.to_dict() for d in event_docs]
+    events_data.sort(key=lambda e: e.get("event_date", ""), reverse=True)
+
+    rows = []
+    total_cost = 0.0
+    total_visitors = 0
+    total_contacts = 0
+    for ev in events_data:
+        event_id = ev.get("event_id")
+
+        kpi_docs = db.collection(f"events/{event_id}/kpi").get()
+        kpi = kpi_docs[0].to_dict() if kpi_docs else None
+        visitors = (kpi or {}).get("total_visitors_to_booth", 0)
+        contacts = (kpi or {}).get("total_contacts_collected", 0)
+
+        cost_docs = db.collection(f"events/{event_id}/costs").get()
+        cost_total = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
+
+        total_cost += cost_total
+        total_visitors += visitors
+        total_contacts += contacts
+
+        rows.append({
+            "event_id": event_id,
+            "name": ev.get("name"),
+            "event_date": ev.get("event_date"),
+            "status": ev.get("status"),
+            "event_type": ev.get("event_type"),
+            "total_visitors_to_booth": visitors,
+            "total_contacts_collected": contacts,
+            "cost_total_jpy": cost_total,
+        })
+
+    return {
+        "events": rows,
+        "totals": {
+            "event_count": len(rows),
+            "total_cost_jpy": total_cost,
+            "total_visitors": total_visitors,
+            "total_contacts": total_contacts,
+        },
+    }
+
+
 @router.post("", status_code=201)
 async def create_event(
     body: CreateEventRequest,

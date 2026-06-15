@@ -28,6 +28,7 @@ router = APIRouter(prefix="/api/marketing", tags=["marketing"])
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    event_id: str | None = None
 
 
 @router.post("/chat")
@@ -50,6 +51,7 @@ async def chat(
                 message=body.message,
                 session_id=session_id,
                 user_id=user_id,
+                event_id=body.event_id,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
