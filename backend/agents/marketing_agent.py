@@ -310,6 +310,7 @@ async def chat_stream(
     message: str,
     session_id: str,
     user_id: str = "default_user",
+    event_id: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     MarketingAgent とのチャットを SSE 用のイベント辞書としてストリーミングする。
@@ -334,9 +335,28 @@ async def chat_stream(
             app_name=_APP_NAME, user_id=user_id, session_id=session_id
         )
 
+    # 選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
+    # これによりエージェントは list_events での推測を省き、対象イベントの
+    # get_event_* 系ツールへ直接 event_id を渡せる。未選択時は従来どおり全体が対象。
+    message_text = message
+    if event_id:
+        event_name = event_id
+        try:
+            doc = _db().collection("events").document(event_id).get()
+            if doc.exists:
+                event_name = doc.to_dict().get("name", event_id)
+        except Exception:
+            logger.warning("failed to load event context: event_id=%s", event_id)
+        message_text = (
+            f"[コンテキスト] ユーザーは現在「{event_name}」(event_id={event_id})を選択中です。"
+            "特定イベントへの問い合わせは、明示が無い限りこのイベントを対象として "
+            f"get_event_* 系ツールに event_id={event_id} を渡してください。\n\n"
+            f"ユーザーの質問: {message}"
+        )
+
     user_content = types.Content(
         role="user",
-        parts=[types.Part(text=message)],
+        parts=[types.Part(text=message_text)],
     )
 
     try:

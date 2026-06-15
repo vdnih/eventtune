@@ -50,16 +50,6 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
               >
                 エージェント
               </Link>
-              <Link
-                href="/explorer"
-                className={`inline-flex items-center px-1 border-b-2 text-sm font-medium transition ${
-                  pathname.startsWith("/explorer")
-                    ? "border-brand-600 text-gray-900"
-                    : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
-                }`}
-              >
-                データエクスプローラー
-              </Link>
             </nav>
           </div>
           <button
