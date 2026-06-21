@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { auth } from "@/lib/firebase";
+import { authFetch } from "@/lib/api";
+import { useSpace } from "@/lib/space-context";
 import {
   Calendar,
   DollarSign,
@@ -18,23 +19,6 @@ import {
   HelpCircle,
   Database,
 } from "lucide-react";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-
-async function getToken(): Promise<string> {
-  return (await auth.currentUser?.getIdToken()) ?? "";
-}
-
-async function authFetch(path: string, init?: RequestInit): Promise<Response> {
-  const token = await getToken();
-  return fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(init?.headers ?? {}),
-    },
-  });
-}
 
 const formatCurrency = (amount: number) =>
   new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY" }).format(amount);
@@ -218,11 +202,17 @@ interface SummaryTotals {
 }
 
 function AllEventsSummary() {
+  const { activeSpace } = useSpace();
   const [rows, setRows] = useState<EventSummaryRow[]>([]);
   const [totals, setTotals] = useState<SummaryTotals | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // アクティブスペース未確定のうちは X-Space-Id を付与できず 422 になるため叩かない
+    if (!activeSpace) {
+      setLoading(false);
+      return;
+    }
     let active = true;
     (async () => {
       setLoading(true);
@@ -242,7 +232,7 @@ function AllEventsSummary() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [activeSpace]);
 
   if (loading) {
     return (

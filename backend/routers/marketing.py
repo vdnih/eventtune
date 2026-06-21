@@ -13,10 +13,10 @@ import pandas as pd
 import io
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from firebase_admin import firestore
 from pydantic import BaseModel
 
-from dependencies import get_current_user
+from dependencies import get_space_context
+from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class ChatRequest(BaseModel):
 @router.post("/chat")
 async def chat(
     body: ChatRequest,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """
     MarketingAgent とのチャット。Server-Sent Events でストリーミングする。
@@ -42,7 +42,6 @@ async def chat(
     """
     from agents.marketing_agent import chat_stream
 
-    user_id = user.get("uid", "default_user")
     session_id = body.session_id or f"session_{uuid.uuid4().hex[:12]}"
 
     async def event_generator():
@@ -50,7 +49,7 @@ async def chat(
             async for event in chat_stream(
                 message=body.message,
                 session_id=session_id,
-                user_id=user_id,
+                space=space,
                 event_id=body.event_id,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -72,14 +71,14 @@ async def chat(
 
 # ── メール生成ラン ─────────────────────────────────────────────────────────
 
-async def _execute_run(run_id: str) -> None:
+async def _execute_run(space: SpaceContext, run_id: str) -> None:
     from agents.marketing_agent import _execute_email_run
     try:
-        await _execute_email_run(run_id)
+        await _execute_email_run(space, run_id)
     except Exception as e:
         logger.exception("email run failed: run_id=%s", run_id)
         try:
-            firestore.client().collection("marketing_runs").document(run_id).update({
+            space.col("marketing_runs").document(run_id).update({
                 "status": "error",
                 "error": str(e)[:500],
             })
@@ -91,13 +90,13 @@ async def _execute_run(run_id: str) -> None:
 async def execute_run(
     run_id: str,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """
     compose_emails ツールが作成した run_id のメール生成を実際に実行する。
     MarketingAgent が compose_emails を呼んだ後、フロントエンドがこのエンドポイントを呼ぶ。
     """
-    doc = firestore.client().collection("marketing_runs").document(run_id).get()
+    doc = space.col("marketing_runs").document(run_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Run not found")
 
@@ -105,17 +104,17 @@ async def execute_run(
     if data.get("status") not in ("queued", "error"):
         raise HTTPException(status_code=400, detail=f"Run status is '{data.get('status')}', cannot re-execute")
 
-    background_tasks.add_task(_execute_run, run_id)
+    background_tasks.add_task(_execute_run, space, run_id)
     return {"run_id": run_id, "status": "processing"}
 
 
 @router.get("/runs/{run_id}")
 async def get_run_status(
     run_id: str,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """メール生成ランの進捗を返す。"""
-    doc = firestore.client().collection("marketing_runs").document(run_id).get()
+    doc = space.col("marketing_runs").document(run_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Run not found")
     data = doc.to_dict()
@@ -133,22 +132,20 @@ async def get_run_status(
 @router.get("/runs/{run_id}/results")
 async def get_run_results(
     run_id: str,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """生成されたメール一覧を返す。"""
-    db = firestore.client()
-    emails = [s.to_dict() for s in db.collection(f"marketing_runs/{run_id}/emails").get()]
+    emails = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/emails").get()]
     return {"emails": emails, "count": len(emails)}
 
 
 @router.get("/runs/{run_id}/export")
 async def export_run_results(
     run_id: str,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """生成されたメールを CSV でエクスポートする。"""
-    db = firestore.client()
-    emails = [s.to_dict() for s in db.collection(f"marketing_runs/{run_id}/emails").get()]
+    emails = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/emails").get()]
     if not emails:
         raise HTTPException(status_code=404, detail="メールがまだ生成されていません")
 

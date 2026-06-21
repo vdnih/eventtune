@@ -1,7 +1,54 @@
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
+
+
+# ── Space（テナント）/ メンバー / 利用状況 ─────────────────────────────────────
+# マルチテナント分離の単位。1マーケティングチーム = 1スペースを想定し、スペース内で
+# 複数ユーザーが共同作業する。データは spaces/{space_id}/... 配下に分離される。
+# 詳細は docs/PHILOSOPHY_AND_NAMING.md「Context-Bound Data Access」「Space-ID Trust Boundary」。
+
+class Role(str, Enum):
+    OWNER  = "owner"    # 全権限 + スペース削除 + (将来)課金
+    MEMBER = "member"   # 通常操作（イベント/データ/メール生成）
+
+
+class Plan(str, Enum):
+    FREE    = "free"
+    PRO     = "pro"
+    PREMIUM = "premium"
+
+
+class Space(BaseModel):
+    space_id: str
+    name: str
+    plan: Plan = Plan.FREE
+    owner_uid: str            # 作成者（検証済み uid）。表示・監査用
+    description: str = ""
+    created_at: str
+    updated_at: str
+
+
+class SpaceMember(BaseModel):
+    user_id: str              # Firebase uid（= members ドキュメントID）
+    email: str
+    role: Role = Role.MEMBER
+    space_id: str
+    space_name: str           # 一覧表示用の非正規化
+    joined_at: str
+
+
+class UsagePeriod(BaseModel):
+    """月次のリソース消費の生実績。課金概念（クレジット）は plans.compute_credits で
+    レート換算して導出するため、ここには生実績のみを保持する（機能単位メトリクスは持たない）。
+
+    - llm:     モデル種別ごとの入出力トークン   {model: {"input_tokens": int, "output_tokens": int}}
+    - compute: リソース種別ごとの実行時間(ms)   {resource_type: {"ms": int}}
+    """
+    period: str               # "YYYY-MM"
+    llm: Dict[str, Dict[str, int]] = {}
+    compute: Dict[str, Dict[str, int]] = {}
 
 
 # ── Contact ──────────────────────────────────────────────────────────────────

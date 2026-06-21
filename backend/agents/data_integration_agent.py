@@ -23,6 +23,8 @@ from google.genai import types
 from pydantic import BaseModel
 
 from agents.ontology_mapper import OntologyMapper
+from metering import record_llm_response
+from space import SpaceContext
 from ontology import (
     ColumnMappingResult,
     Contact,
@@ -135,7 +137,8 @@ def _parse_json_response(text: str) -> dict:
 
 
 async def run_schema_mapper(
-    headers: list[str], sample_rows: list[dict]
+    headers: list[str], sample_rows: list[dict],
+    space: Optional[SpaceContext] = None,
 ) -> ColumnMappingResult:
     sample_text = json.dumps(sample_rows[:5], ensure_ascii=False, indent=2)
     prompt = (
@@ -151,6 +154,8 @@ async def run_schema_mapper(
             response_mime_type="application/json",
         ),
     )
+    if space is not None:
+        record_llm_response(space, _MODEL, response)
     parsed = _parse_json_response(response.text)
     raw_map = parsed.get("column_map") or {}
     # キー・値とも str に正規化（防御的）
@@ -292,7 +297,9 @@ ContentAsset（複数可）:
 """
 
 
-async def run_document_extractor(text: str) -> DocumentExtractionResult:
+async def run_document_extractor(
+    text: str, space: Optional[SpaceContext] = None
+) -> DocumentExtractionResult:
     prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}\n\n【ドキュメント】\n{text}"
     response = await _get_client().aio.models.generate_content(
         model=_MODEL,
@@ -302,6 +309,8 @@ async def run_document_extractor(text: str) -> DocumentExtractionResult:
             response_schema=_DocumentExtractionResponse,
         ),
     )
+    if space is not None:
+        record_llm_response(space, _MODEL, response)
     parsed = _DocumentExtractionResponse.model_validate_json(response.text)
     # 具体スキーマ → dict 境界（DocumentExtractionResult）へ詰め直す。
     # 以降の OntologyMapper / DataLineage は従来通り dict を受ける。
@@ -383,7 +392,8 @@ async def process_file(
     content: bytes,
     event_id: str | None,
     batch_id: str,
-    db: Any,  # firebase_admin.firestore.Client
+    db: Any,  # space.ScopedClient（スペース前置済み）
+    space: Optional[SpaceContext] = None,
 ) -> tuple[list[Any], DataLineage]:
     """
     1ファイルを処理してオントロジーエンティティを生成し、Firestore に保存する。
@@ -402,7 +412,7 @@ async def process_file(
     if _is_tabular(filename):
         # ─ パス A: CSV / Excel ───────────────────────────────────────────
         headers, rows = _read_tabular(filename, content)
-        column_mapping = await run_schema_mapper(headers, rows)
+        column_mapping = await run_schema_mapper(headers, rows, space=space)
         logger.info("schema_mapper result: entity_type=%s columns=%d routing_col=%s",
                     column_mapping.entity_type, len(column_mapping.column_map), column_mapping.event_routing_column)
 
@@ -438,7 +448,7 @@ async def process_file(
     else:
         # ─ パス B: テキスト / その他 ─────────────────────────────────────
         text = _read_text(content)
-        extraction = await run_document_extractor(text)
+        extraction = await run_document_extractor(text, space=space)
         raw_extraction_dict = extraction.model_dump()
         logger.info("document_extractor result: detected=%s", extraction.detected_entity_types)
         entities, transformations, skipped = _mapper.map_extraction(
@@ -566,19 +576,21 @@ def _is_event_defining_name(filename: str) -> bool:
 async def process_batch(
     files: list[tuple[str, bytes]],
     batch_id: str,
-    db: Any,  # firebase_admin.firestore.Client
+    db: Any,  # space.ScopedClient（スペース前置済み）
     file_event_map: dict[str, str | None] | None = None,
+    space: Optional[SpaceContext] = None,
 ) -> list[BatchFileResult]:
     """複数ファイルを並列に処理する。
 
     file_event_map でファイルごとの event_id を明示指定する。
     指定がない（または None 値の）ファイルは、ファイル内容から AI がイベントを生成/解決する。
+    space は LLMトークン計測のために使う（None なら計測しない）。
     """
     import asyncio
 
     async def _process(filename: str, content: bytes) -> BatchFileResult:
         event_id = (file_event_map or {}).get(filename)
-        return await _process_one(filename, content, event_id, batch_id, db)
+        return await _process_one(filename, content, event_id, batch_id, db, space=space)
 
     results = await asyncio.gather(*[_process(fn, content) for fn, content in files])
     return list(results)
@@ -590,10 +602,11 @@ async def _process_one(
     event_id: str | None,
     batch_id: str,
     db: Any,
+    space: Optional[SpaceContext] = None,
 ) -> BatchFileResult:
     """1ファイルを process_file で処理し、部分失敗を吸収して結果を返す。"""
     try:
-        entities, lineage = await process_file(filename, content, event_id, batch_id, db)
+        entities, lineage = await process_file(filename, content, event_id, batch_id, db, space=space)
         counts: dict[str, int] = {}
         for entity in entities:
             counts[type(entity).__name__] = counts.get(type(entity).__name__, 0) + 1
