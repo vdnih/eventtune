@@ -17,6 +17,7 @@ frontend/.env.local
 out/
 dist/
 build/
+*.tsbuildinfo
 
 # Firebase
 .firebase/
