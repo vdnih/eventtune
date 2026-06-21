@@ -45,7 +45,44 @@ logger = logging.getLogger(__name__)
 
 _MODEL = "gemini-3.1-flash-lite"
 
+
+def _normalize_buckets(buckets: Any) -> list[str] | dict:
+    """define_segment の buckets 引数を「非空文字列のリスト」に正規化する。
+
+    LLM は buckets を（axes_json と同様に）JSON配列**文字列**で渡してくることがある。
+    その場合に素朴な list(...) を適用すると文字列が1文字ずつに分解され、各文字が
+    バケットになってしまう（→ generate_patterns が大量に細分化される）。これを防ぐため:
+      - str が来たら JSON としてパースする
+      - 要素は非空文字列のみ採用する
+      - 1文字ずつ分解された痕跡（要素が極端に短い）を検知したらエラーを返す
+
+    成功時は list[str]、失敗時はエラー dict（{"error": ...}）を返す。
+    """
+    if isinstance(buckets, str):
+        try:
+            buckets = json.loads(buckets)
+        except Exception as e:
+            return {"error": f"buckets の解析に失敗（JSON配列文字列で渡してください）: {e}"}
+
+    if not isinstance(buckets, (list, tuple)):
+        return {"error": f"buckets は配列（または JSON 配列文字列）で渡してください: {type(buckets).__name__}"}
+
+    cleaned = [b.strip() for b in buckets if isinstance(b, str) and b.strip()]
+    if not cleaned:
+        return {"error": "buckets が空です。運用単位のセグメント値を配列で渡してください"}
+
+    # 退化検知: 文字列を list() で分解した痕跡（要素の大半が1文字）を弾く
+    if len(cleaned) >= 4 and all(len(b) <= 1 for b in cleaned):
+        return {
+            "error": "buckets が1文字ずつに分解されています。"
+            'JSON配列文字列（例 \'["高課題×高意欲","低課題×低意欲"]\'）として渡してください'
+        }
+
+    return cleaned
+
 # ── システムプロンプト ────────────────────────────────────────────────────────
+# 背景思想: docs/MARKETING_PHILOSOPHY.md（Static Core & Dynamic Context）。
+# 下記【ブランドの一貫性】ブロックは同ドキュメント第4節のガードレールを実装したもの。
 
 _SYSTEM_PROMPT = """\
 あなたはイベントマーケティングAIプラットフォームのマーケティングエージェントです。
@@ -99,6 +136,19 @@ ROI計算が必要な場合の公式:
 呼ばないこと。とくに run_assembly（全件確定）はユーザーの明示承認なしに実行してはならない。
 ユーザーが軌道修正（軸の変更・対象の絞り込み・文面トーンの変更など）を求めたら、該当ステップを
 やり直してから次へ進むこと。
+
+【ブランドの一貫性 — Static Core & Dynamic Context】
+個別カスタマイズで「変えてよいもの」と「絶対に変えないもの」を区別すること。
+- 動的な文脈（変えてよい）: 相手の悩み・状況（CEP）への語りかけ方、見せ方。ここは相手に合わせて自在に最適化する。
+- 不変のコア（変えない）: 自社が提供する機能・価値、専門用語の定義、トーン＆マナー（ブランド資産）。
+
+文面に関わるとき（generate_patterns 等）は次のガードレールを守ること:
+  ① 捏造禁止: 提示する機能・解決策・効果は get_content_catalog で得たコンテンツ資産（ContentAsset）と
+     自社プロダクトに実在するものに限定する。存在しない機能・誇張・本来と異なる用途を創作しない
+     （相手の課題への過剰な迎合を禁ずる。解決策は必ずマスターに帰結させる）。
+  ② 1機能フォーカス（押し売り禁止）: 個別アプローチでは、相手の課題に直結する「1つの機能」に絞って訴求する。
+     一度に複数機能やプラットフォーム全体像を詰め込まない。
+  ③ ブランド資産の維持: 文脈を個別最適化しても、トーン＆マナー・用語・言い回しはセグメント横断で一貫させる。
 """
 
 
@@ -245,7 +295,8 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             purpose: 施策の目的（パターン生成に渡る）
             axes_json: 軸定義のJSON文字列。例 '[{"name":"課題感","values":["高","中","低"]},
                        {"name":"購買意欲","values":["高","低"]}]'
-            buckets: 運用単位のセグメント値（直積セル等）。例 ["高課題×高意欲","高課題×低意欲",...]
+            buckets: 運用単位のセグメント値（直積セル等）の **配列**。例 ["高課題×高意欲","高課題×低意欲"]。
+                     JSON配列文字列（例 '["高課題×高意欲","高課題×低意欲"]'）で渡しても受理する。
             criteria: 各バケットへの割り当て基準（自然言語）
 
         Returns:
@@ -257,19 +308,23 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         except Exception as e:
             return json.dumps({"error": f"axes_json の解析に失敗: {e}"})
 
+        bucket_list = _normalize_buckets(buckets)
+        if isinstance(bucket_list, dict):  # エラー辞書
+            return json.dumps(bucket_list, ensure_ascii=False)
+
         segment_id = f"seg_{uuid.uuid4().hex[:12]}"
         segment = Segment(
             segment_id=segment_id,
             name=name,
             purpose=purpose,
             axes=axes,
-            buckets=list(buckets),
+            buckets=bucket_list,
             criteria=criteria,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         db.collection("segments").document(segment_id).set(segment.model_dump())
         return json.dumps(
-            {"segment_id": segment_id, "name": name, "buckets": list(buckets)},
+            {"segment_id": segment_id, "name": name, "buckets": bucket_list},
             ensure_ascii=False,
         )
 
@@ -525,7 +580,11 @@ def _generate_one_pattern(
     context: str,
     assets: list[dict],
 ) -> dict:
-    """1バケットぶんのコンテンツパターンを生成して dict で返す。"""
+    """1バケットぶんのコンテンツパターンを生成して dict で返す。
+
+    必須ルールには docs/MARKETING_PHILOSOPHY.md（Static Core & Dynamic Context）第4節の
+    ガードレール（捏造禁止／1機能×1CEP／ブランド資産の維持）をプロンプトとして埋め込む。
+    """
     assets_text = json.dumps(assets, ensure_ascii=False, indent=2) if assets else "（なし）"
     system_prompt = f"""\
 あなたはプロのマーケターです。施策「{segment.name}」のために、あるセグメントへ送る
@@ -551,6 +610,13 @@ def _generate_one_pattern(
 - 件名は20〜40文字程度、具体的で開封したくなるもの。
 - 本文はビジネス敬語（〜です・ます調）。1ブロック100〜200文字程度。
 - associated_asset_ids: 参照したコンテンツ資産の asset_id を設定する。
+
+【ブランドの一貫性（必ず守る）】
+- 1機能フォーカス: このメールでは相手の課題に直結する「1つの機能（解決策）」のみを提示し、
+  複数機能やプラットフォーム全体像を詰め込まない。
+- 捏造禁止: 提示する機能・効果は上記【参照するコンテンツ資産】に実在するものに限定する。
+  資産に無い機能・誇張・本来と異なる用途を創作しない（解決策はマスターに帰結させる）。
+- ブランド資産の維持: トーン＆マナー・用語・言い回しはセグメント横断で一貫させる。
 """
     client = genai.Client()
     response = client.models.generate_content(
