@@ -1087,6 +1087,7 @@ export default function DashboardPage() {
       let buffer = "";
       let accText = "";
       let toolCalls: ToolCallEvent[] = [];
+      let toolRunId: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1121,6 +1122,21 @@ export default function DashboardPage() {
                 m.id === asstMsgId ? { ...m, toolCalls, loading: true } : m
               )
             );
+          } else if (event.type === "tool_result") {
+            // run_assembly の戻り値から run_id を確実に取得（本文の正規表現に頼らない）
+            const result = (event.result ?? {}) as Record<string, unknown>;
+            const inner = (result.result ?? result) as Record<string, unknown>;
+            let parsed: Record<string, unknown> = inner;
+            if (typeof inner === "string") {
+              try {
+                parsed = JSON.parse(inner);
+              } catch {
+                parsed = {};
+              }
+            }
+            if (event.tool_name === "run_assembly" && typeof parsed.run_id === "string") {
+              toolRunId = parsed.run_id as string;
+            }
           } else if (event.type === "text") {
             accText += event.text as string;
             setMessages((prev) =>
@@ -1131,7 +1147,7 @@ export default function DashboardPage() {
               )
             );
           } else if (event.type === "done") {
-            const detectedRunId = extractRunId(accText);
+            const detectedRunId = toolRunId ?? extractRunId(accText);
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === asstMsgId
@@ -1182,16 +1198,8 @@ export default function DashboardPage() {
   function startRunPolling(msgId: string, runId: string) {
     if (pollingRefs.current[runId]) return;
 
-    // fire-and-forget: trigger actual email generation via BackgroundTask
-    // 400 means already running/done — safe to ignore
-    authFetch(`/api/marketing/runs/${runId}/execute`, { method: "POST" })
-      .then((res) => {
-        if (!res.ok && res.status !== 400) {
-          console.warn(`execute endpoint returned ${res.status} for run ${runId}`);
-        }
-      })
-      .catch((e) => console.warn("failed to call execute endpoint:", e));
-
+    // run_assembly は決定論的に同期で組み立て済み（status=done）。実行トリガは不要で、
+    // 状態確認 → 結果ロードのみ行う（万一の遅延に備えてポーリングは残す）。
     const timer = setInterval(async () => {
       try {
         const res = await authFetch(`/api/marketing/runs/${runId}`);

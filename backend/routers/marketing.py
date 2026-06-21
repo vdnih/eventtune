@@ -4,14 +4,13 @@ Marketing Router — /api/marketing
 MarketingAgent とのチャット（SSE）と、メール生成ランの管理を担う。
 """
 
-import asyncio
 import json
 import logging
 import uuid
 
 import pandas as pd
 import io
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -70,42 +69,8 @@ async def chat(
 
 
 # ── メール生成ラン ─────────────────────────────────────────────────────────
-
-async def _execute_run(space: SpaceContext, run_id: str) -> None:
-    from agents.marketing_agent import _execute_email_run
-    try:
-        await _execute_email_run(space, run_id)
-    except Exception as e:
-        logger.exception("email run failed: run_id=%s", run_id)
-        try:
-            space.col("marketing_runs").document(run_id).update({
-                "status": "error",
-                "error": str(e)[:500],
-            })
-        except Exception:
-            pass
-
-
-@router.post("/runs/{run_id}/execute", status_code=202)
-async def execute_run(
-    run_id: str,
-    background_tasks: BackgroundTasks,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """
-    compose_emails ツールが作成した run_id のメール生成を実際に実行する。
-    MarketingAgent が compose_emails を呼んだ後、フロントエンドがこのエンドポイントを呼ぶ。
-    """
-    doc = space.col("marketing_runs").document(run_id).get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    data = doc.to_dict()
-    if data.get("status") not in ("queued", "error"):
-        raise HTTPException(status_code=400, detail=f"Run status is '{data.get('status')}', cannot re-execute")
-
-    background_tasks.add_task(_execute_run, space, run_id)
-    return {"run_id": run_id, "status": "processing"}
+# 組み立ては MarketingAgent の run_assembly ツールが決定論的に行い、run は作成時点で
+# 完了済み（status=done）。フロントは状態取得・結果取得・CSVエクスポートのみ行う。
 
 
 @router.get("/runs/{run_id}")

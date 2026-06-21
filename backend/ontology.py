@@ -222,6 +222,37 @@ class ContentAsset(BaseModel):
     linked_event_id: Optional[str] = None
 
 
+# ── Segment（施策向けセグメント軸） ───────────────────────────────────────────
+# 個別カスタマイズの第1段階。施策ごとに「どんな軸で顧客を切り分けるか」を定義し、
+# 各コンタクトをバケットへ分類する。分類は決定論Python（＋必要時のみ軽量AI）で行い、
+# 各割り当てに reason を残す（Auditable AI）。詳細は docs/PHILOSOPHY_AND_NAMING.md。
+
+class SegmentAxis(BaseModel):
+    """セグメントの1軸。複数軸を組み合わせると直積セルがバケットになる。"""
+    name: str                       # 例「課題感」「購買意欲」
+    values: List[str]               # 例 ["高", "中", "低"]
+
+
+class Segment(BaseModel):
+    segment_id: str
+    name: str                       # 例「2026春フォローアップ」
+    purpose: str                    # 施策の目的（パターン生成プロンプトに渡す）
+    axes: List[SegmentAxis]         # 1軸以上。複数軸なら直積セルが実バケット
+    buckets: List[str]              # 運用単位のセグメント値 例「高課題×高意欲」
+    criteria: str                   # 各バケットへの割り当て基準（自然言語/ルール記述）
+    created_at: str
+
+
+class SegmentAssignment(BaseModel):
+    """1コンタクトの、あるセグメントにおける所属バケットと根拠。"""
+    contact_id: str
+    segment_id: str
+    bucket: str
+    # Auditable AI: なぜこのバケットへ割り当てたか。Optional 不可
+    reason: str
+    source_signals: dict[str, str] = {}
+
+
 # ── ComposedEmail ─────────────────────────────────────────────────────────────
 
 class EmailBlock(BaseModel):
