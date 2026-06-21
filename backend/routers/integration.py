@@ -46,6 +46,12 @@ def _now_iso() -> str:
 
 # ── suggest-event ─────────────────────────────────────────────────────────────
 
+class _ProposedEvent(BaseModel):
+    name: str = ""
+    event_date: str | None = None
+    event_type: str | None = None
+
+
 class _FileSuggestion(BaseModel):
     filename: str
     event_id: str | None = None
@@ -54,6 +60,8 @@ class _FileSuggestion(BaseModel):
     confidence: float = 0.0
     is_new_event: bool = False
     is_multi_event: bool = False
+    # 新規（1件）/複数（N件）の場合に提示する仮タイトル候補。既存一致時は空。
+    proposed_events: list[_ProposedEvent] = []
 
 
 class _SuggestResponse(BaseModel):
@@ -108,8 +116,14 @@ async def suggest_event(
 - confidence: 一致の確信度 0.0〜1.0
 - is_new_event: true = 新しいイベントとして取り込むべき（既存イベントに対応しない）
 - is_multi_event: true = このファイルには複数のイベントのデータが含まれる可能性がある
+- proposed_events: 新規作成すべきイベントの仮タイトル候補リスト。各要素は {{name, event_date, event_type}}。
+    - is_new_event が true（単一の新規イベント）→ proposed_events は **1件**。ファイル内容から推定した自然で具体的なイベント名を name に入れる。
+    - is_multi_event が true（複数イベントに分割）→ proposed_events は **分割される件数ぶん（複数件）**。各イベントの名前・日付・種別を入れる。
+    - 既存イベントに一致する場合 → proposed_events は **空リスト**。
+  name は具体的に（例「2025春 ○○展示会」）。event_date は YYYY-MM-DD、不明なら null。
+  event_type は「展示会」「セミナー」「プライベートイベント」のいずれか、不明なら null。
 
-既存イベントが1件もない場合はすべて is_new_event: true にしてください。
+既存イベントが1件もない場合はすべて is_new_event: true にし、proposed_events に推定名を1件入れてください。
 """
 
     with metered(space):
@@ -128,11 +142,29 @@ async def suggest_event(
 
 # ── バッチ処理 ─────────────────────────────────────────────────────────────────
 
+def _normalize_event_map(raw: dict) -> dict[str, list[str]]:
+    """file_event_map を {filename: [event_id, ...]} 形式に正規化する。
+
+    後方互換: 値が str なら [str]、null/空なら [] （AI が生成）、list なら空要素を除去。
+    """
+    normalized: dict[str, list[str]] = {}
+    for filename, value in raw.items():
+        if value is None or value == "":
+            normalized[filename] = []
+        elif isinstance(value, str):
+            normalized[filename] = [value]
+        elif isinstance(value, list):
+            normalized[filename] = [v for v in value if v]
+        else:
+            normalized[filename] = []
+    return normalized
+
+
 async def _run_integration(
     space: SpaceContext,
     batch_id: str,
     files: list[tuple[str, bytes]],
-    file_event_map: dict[str, str | None],
+    file_event_map: dict[str, list[str]],
 ) -> None:
     from agents.data_integration_agent import process_batch
 
@@ -157,7 +189,8 @@ async def _run_integration(
         all_event_ids: list[str] = []
         for r in results:
             all_event_ids.extend(r.generated_event_ids)
-        all_event_ids.extend(v for v in file_event_map.values() if v)
+        for ids in file_event_map.values():
+            all_event_ids.extend(ids)
         event_ids = list(dict.fromkeys(all_event_ids))  # 順序保持で重複除去
 
         scoped.collection("integration_batches").document(batch_id).update({
@@ -210,36 +243,45 @@ async def start_integration(
 ):
     """複数ファイルをアップロードしデータ統合バッチを開始する。
 
-    file_event_map は JSON文字列で {"filename": "event_id_or_null", ...} 形式。
-    null 値のファイルはコンテンツから AI がイベントを生成/解決する。
+    file_event_map は JSON文字列で {"<index>": event_id | [event_id, ...] | null, ...} 形式。
+    キーはアップロード順のインデックス（同名ファイルでも衝突しない）。
+    値が空/null のファイルはコンテンツから AI がイベントを生成/解決する。
+    複数 event_id を渡すと、そのファイルのデータを複数の既存イベントへ振り分ける。
     """
+    raw_map: dict = {}
+    if file_event_map:
+        try:
+            raw_map = json.loads(file_event_map)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="file_event_map が不正な JSON です")
+    norm_map = _normalize_event_map(raw_map)
+
+    # 空ファイルをスキップしつつ、元インデックスの割り当てを詰め直したインデックスへ再マップする
+    # （process_batch は loaded の並び順インデックスで参照するため整合させる）。
     loaded: list[tuple[str, bytes]] = []
-    for f in files:
+    parsed_map: dict[str, list[str]] = {}
+    for orig_idx, f in enumerate(files):
         content = await f.read()
         if not content:
             continue
+        new_idx = len(loaded)
         loaded.append((f.filename or "upload", content))
+        parsed_map[str(new_idx)] = norm_map.get(str(orig_idx), [])
 
     if not loaded:
         raise HTTPException(status_code=400, detail="有効なファイルがありません")
 
-    parsed_map: dict[str, str | None] = {}
-    if file_event_map:
-        try:
-            parsed_map = json.loads(file_event_map)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="file_event_map が不正な JSON です")
-
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     filenames = [name for name, _ in loaded]
+    all_event_ids = list(dict.fromkeys(eid for ids in parsed_map.values() for eid in ids))
 
     space.col("integration_batches").document(batch_id).set({
         "batch_id": batch_id,
         "filenames": filenames,
         "files": [{"filename": name, "status": "queued"} for name in filenames],
         "file_event_map": parsed_map,
-        "event_ids": [v for v in parsed_map.values() if v],
-        "event_id": next((v for v in parsed_map.values() if v), None),
+        "event_ids": all_event_ids,
+        "event_id": all_event_ids[0] if all_event_ids else None,
         "status": "queued",
         "created_at": _now_iso(),
     })

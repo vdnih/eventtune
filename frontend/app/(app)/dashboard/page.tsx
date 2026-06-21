@@ -52,6 +52,12 @@ interface EventSummary {
   status: string;
 }
 
+interface ProposedEvent {
+  name: string;
+  event_date: string | null;
+  event_type: string | null;
+}
+
 interface FileSuggestion {
   filename: string;
   event_id: string | null;
@@ -60,6 +66,96 @@ interface FileSuggestion {
   confidence: number;
   is_new_event: boolean;
   is_multi_event: boolean;
+  proposed_events: ProposedEvent[];
+}
+
+// 確認モーダル内で共有する「作成予定の新規イベント（ドラフト）」。
+// 複数ファイルが同じドラフト id を参照することで1つの新規イベントを共有できる。
+interface DraftEvent {
+  id: string; // "draft_xxx"（確定後に実 event_id へ置換）
+  name: string;
+  event_date: string | null;
+  event_type: string | null;
+}
+
+// ファイルごとの割り当て先 id リスト。各 id はドラフト id か既存 event_id。
+// 1件=単一イベント、複数件=複数イベントへ分割。空=AIに委ねる。
+// キーはアップロード順のインデックス（文字列）。同名ファイルでも衝突しない。
+type FilePlans = Record<string, string[]>;
+
+// アップロードファイルのメタデータと先頭プレビュー（同名ファイルの判別・内容確認用）。
+interface FileMeta {
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+  preview: string; // テキスト系のみ先頭を格納（空文字 = プレビュー非対応）
+}
+
+const TEXT_PREVIEW_RE = /\.(csv|tsv|txt|json|md|xml|html?|log|ya?ml)$/i;
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function readFileMeta(file: File): Promise<FileMeta> {
+  let preview = "";
+  if (TEXT_PREVIEW_RE.test(file.name) || file.type.startsWith("text")) {
+    try {
+      preview = await file.slice(0, 4096).text();
+    } catch {
+      preview = "";
+    }
+  }
+  return { name: file.name, size: file.size, type: file.type, lastModified: file.lastModified, preview };
+}
+
+function newDraftId(): string {
+  return `draft_${crypto.randomUUID().slice(0, 8)}`;
+}
+
+// suggestions から共有ドラフト一覧とファイル別割り当てを構築する。
+// 同名のドラフトは1つに集約し、AIが同じ新規イベントと判定した複数ファイルを束ねる。
+function buildInitialState(suggestions: FileSuggestion[]): {
+  draftEvents: DraftEvent[];
+  plans: FilePlans;
+} {
+  const draftEvents: DraftEvent[] = [];
+  const draftByName = new Map<string, string>();
+  const plans: FilePlans = {};
+
+  function ensureDraft(p: ProposedEvent): string {
+    const name = (p.name ?? "").trim();
+    if (name) {
+      const existing = draftByName.get(name);
+      if (existing) return existing;
+    }
+    const id = newDraftId();
+    draftEvents.push({
+      id,
+      name,
+      event_date: p.event_date ?? null,
+      event_type: p.event_type ?? null,
+    });
+    if (name) draftByName.set(name, id);
+    return id;
+  }
+
+  suggestions.forEach((s, i) => {
+    const key = String(i);
+    if (!s.is_new_event && !s.is_multi_event && s.event_id) {
+      plans[key] = [s.event_id];
+      return;
+    }
+    const proposals: ProposedEvent[] =
+      s.proposed_events && s.proposed_events.length > 0
+        ? s.proposed_events
+        : [{ name: s.event_name ?? "", event_date: s.event_date, event_type: null }];
+    plans[key] = proposals.map((p) => ensureDraft(p));
+  });
+  return { draftEvents, plans };
 }
 
 // ── テキスト整形 ─────────────────────────────────────────────────────────────
@@ -119,50 +215,79 @@ function ToolCallIndicator({ toolCalls }: { toolCalls: ToolCallEvent[] }) {
 function UploadConfirmModal({
   events,
   suggestions,
-  overrides,
+  fileMetas,
+  draftEvents,
+  plans,
   uploading,
-  onOverrideChange,
+  onEditDraftName,
+  onAddDraft,
+  onRemoveDraft,
+  onSetFileTargets,
   onConfirmUpload,
   onCancelUpload,
 }: {
   events: EventSummary[];
   suggestions: FileSuggestion[];
-  overrides: Record<string, string | null>;
+  fileMetas: FileMeta[];
+  draftEvents: DraftEvent[];
+  plans: FilePlans;
   uploading: boolean;
-  onOverrideChange: (filename: string, eventId: string | null) => void;
+  onEditDraftName: (draftId: string, name: string) => void;
+  onAddDraft: () => string; // 追加したドラフト id を返す
+  onRemoveDraft: (draftId: string) => void;
+  onSetFileTargets: (key: string, targetIds: string[]) => void;
   onConfirmUpload: () => void;
   onCancelUpload: () => void;
 }) {
-  const [bulkEventId, setBulkEventId] = useState("");
-
-  function getEffectiveEventId(s: FileSuggestion): string | null {
-    if (overrides[s.filename] !== undefined) return overrides[s.filename];
-    if (s.is_new_event || s.is_multi_event) return null;
-    return s.event_id;
+  // プレビュー展開中のファイル（インデックスキー）
+  const [openPreviews, setOpenPreviews] = useState<Set<string>>(new Set());
+  function togglePreview(key: string) {
+    setOpenPreviews((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
   }
 
-  function getSuggestionDisplay(s: FileSuggestion): { label: string; badgeClass: string; badgeText: string } {
-    const eff = getEffectiveEventId(s);
-    if (overrides[s.filename] !== undefined && eff !== null) {
-      const ev = events.find((e) => e.event_id === eff);
-      return {
-        label: ev ? `${ev.name} (${ev.event_date})` : eff,
-        badgeClass: "bg-indigo-50 text-indigo-600 border border-indigo-200",
-        badgeText: "変更済",
-      };
+  const draftName = (id: string) => draftEvents.find((d) => d.id === id)?.name?.trim() || "（名称未設定）";
+  const eventName = (id: string) => {
+    const ev = events.find((e) => e.event_id === id);
+    return ev ? `${ev.name} (${ev.event_date})` : id;
+  };
+  const isDraft = (id: string) => id.startsWith("draft_");
+  const labelFor = (id: string) => (isDraft(id) ? `🆕 ${draftName(id)}` : eventName(id));
+
+  function targetsOf(key: string): string[] {
+    return plans[key] ?? [];
+  }
+  function addTarget(key: string, id: string) {
+    const cur = targetsOf(key);
+    if (cur.includes(id)) return;
+    onSetFileTargets(key, [...cur, id]);
+  }
+  function removeTarget(key: string, id: string) {
+    onSetFileTargets(key, targetsOf(key).filter((t) => t !== id));
+  }
+  // ドロップダウンの選択を処理（既存/ドラフト追加、または新規ドラフト作成）
+  function onAssignSelect(key: string, value: string) {
+    if (!value) return;
+    if (value === "__new__") {
+      const id = onAddDraft();
+      addTarget(key, id);
+      return;
     }
-    if (s.is_multi_event) return { label: "複数イベント含む（AI自動振り分け）", badgeClass: "bg-amber-50 text-amber-600 border border-amber-200", badgeText: "⚠️ 複数" };
-    if (s.is_new_event || !s.event_name) return { label: "新規イベントとして作成", badgeClass: "bg-green-50 text-green-600 border border-green-200", badgeText: "🆕 新規" };
-    return {
-      label: `${s.event_name}${s.event_date ? ` (${s.event_date})` : ""}`,
-      badgeClass: "bg-blue-50 text-blue-600 border border-blue-200",
-      badgeText: `${Math.round(s.confidence * 100)}% 一致`,
-    };
+    addTarget(key, value);
   }
 
-  function applyBulkOverride() {
-    const eid = bulkEventId === "" ? null : bulkEventId;
-    suggestions.forEach((s) => onOverrideChange(s.filename, eid));
+  function badgeFor(key: string): { badgeClass: string; badgeText: string } {
+    const targets = targetsOf(key);
+    if (targets.length === 0)
+      return { badgeClass: "bg-gray-100 text-gray-500 border border-gray-200", badgeText: "未割り当て" };
+    if (targets.length > 1)
+      return { badgeClass: "bg-amber-50 text-amber-600 border border-amber-200", badgeText: `⚠️ ${targets.length}件に分割` };
+    return isDraft(targets[0])
+      ? { badgeClass: "bg-green-50 text-green-600 border border-green-200", badgeText: "🆕 新規" }
+      : { badgeClass: "bg-blue-50 text-blue-600 border border-blue-200", badgeText: "既存に紐づけ" };
   }
 
   return (
@@ -173,7 +298,7 @@ function UploadConfirmModal({
           <div>
             <h2 className="text-base font-semibold text-gray-900">アップロード確認</h2>
             <p className="text-xs text-gray-500 mt-0.5">
-              AIが各ファイルのイベントを判定しました。内容を確認し、必要に応じて変更してください。
+              新規イベントの仮タイトルを編集し、各ファイルをどのイベントに紐づけるか選んでください。
             </p>
           </div>
           <button
@@ -185,62 +310,135 @@ function UploadConfirmModal({
           </button>
         </div>
 
-        {/* Bulk apply */}
-        <div className="px-6 py-3 bg-gray-50 border-b border-gray-100 flex items-center gap-3">
-          <span className="text-xs text-gray-500 shrink-0">全ファイルに一括適用:</span>
-          <select
-            value={bulkEventId}
-            onChange={(e) => setBulkEventId(e.target.value)}
-            className="flex-1 text-xs rounded-lg border border-gray-200 px-2.5 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-300"
-          >
-            <option value="">🆕 新規イベントとして作成</option>
-            {events.map((ev) => (
-              <option key={ev.event_id} value={ev.event_id}>
-                {ev.name} ({ev.event_date})
-              </option>
-            ))}
-          </select>
+        {/* 共有ドラフト新規イベント */}
+        <div className="px-6 py-3 bg-gray-50 border-b border-gray-100 space-y-1.5">
+          <p className="text-xs font-medium text-gray-600">新規イベント（仮）</p>
+          {draftEvents.length === 0 && (
+            <p className="text-[11px] text-gray-400">新規イベントはありません。各ファイルで「新規イベントを作成」を選ぶと追加されます。</p>
+          )}
+          {draftEvents.map((d) => (
+            <div key={d.id} className="flex items-center gap-2">
+              <span className="text-[11px] shrink-0">🆕</span>
+              <input
+                type="text"
+                value={d.name}
+                placeholder="イベント名（仮）"
+                onChange={(e) => onEditDraftName(d.id, e.target.value)}
+                className="flex-1 text-xs rounded-lg border border-gray-200 px-2.5 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-300"
+              />
+              {d.event_date && <span className="text-[11px] text-gray-400 shrink-0">{d.event_date}</span>}
+              <button
+                onClick={() => onRemoveDraft(d.id)}
+                className="p-1 rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition shrink-0"
+                title="この新規イベントを削除"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
           <button
-            onClick={applyBulkOverride}
-            className="text-xs px-3 py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-700 transition shrink-0"
+            onClick={() => onAddDraft()}
+            className="flex items-center gap-1 text-[11px] text-indigo-600 hover:text-indigo-700 transition pt-0.5"
           >
-            適用
+            <Plus className="w-3 h-3" /> 新規イベントを追加
           </button>
         </div>
 
         {/* File list */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
-          {suggestions.map((s) => {
-            const { label, badgeClass, badgeText } = getSuggestionDisplay(s);
-            const currentVal = getEffectiveEventId(s) ?? "";
+          {suggestions.map((s, i) => {
+            const key = String(i);
+            const meta = fileMetas[i];
+            const name = meta?.name ?? s.filename;
+            const targets = targetsOf(key);
+            const { badgeClass, badgeText } = badgeFor(key);
+            const previewOpen = openPreviews.has(key);
+            const modified = meta ? new Date(meta.lastModified).toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "short" }) : null;
             return (
-              <div key={s.filename} className="flex items-start gap-4 p-4 bg-gray-50 rounded-xl border border-gray-100">
-                <FileText className="w-4 h-4 text-gray-400 mt-0.5 shrink-0" />
-                <div className="flex-1 min-w-0 space-y-2">
-                  <p className="text-sm font-medium text-gray-800 truncate" title={s.filename}>
-                    {s.filename}
-                  </p>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium shrink-0 ${badgeClass}`}>
-                      {badgeText}
-                    </span>
-                    <span className="text-xs text-gray-500 truncate" title={label}>{label}</span>
+              <div key={key} className="p-4 bg-gray-50 rounded-xl border border-gray-100 space-y-2.5">
+                <div className="flex items-start gap-3">
+                  <span className="text-[11px] font-mono text-gray-400 mt-0.5 shrink-0 w-7">#{i + 1}</span>
+                  <FileText className="w-4 h-4 text-gray-400 mt-0.5 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-800 truncate" title={name}>
+                      {name}
+                    </p>
+                    {meta && (
+                      <p className="text-[11px] text-gray-400 mt-0.5 truncate">
+                        {formatBytes(meta.size)}
+                        {meta.type ? ` · ${meta.type}` : ""}
+                        {modified ? ` · 更新 ${modified}` : ""}
+                      </p>
+                    )}
                   </div>
+                  <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium shrink-0 ${badgeClass}`}>
+                    {badgeText}
+                  </span>
                 </div>
-                <div className="shrink-0 w-56">
-                  <select
-                    value={currentVal}
-                    onChange={(e) =>
-                      onOverrideChange(s.filename, e.target.value === "" ? null : e.target.value)
-                    }
-                    className="w-full text-xs rounded-lg border border-gray-200 px-2.5 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-300"
+
+                {/* プレビュー */}
+                <div className="pl-7">
+                  <button
+                    onClick={() => togglePreview(key)}
+                    className="text-[11px] text-indigo-600 hover:text-indigo-700 transition"
                   >
-                    <option value="">🆕 新規イベントとして作成</option>
-                    {events.map((ev) => (
-                      <option key={ev.event_id} value={ev.event_id}>
-                        {ev.name} ({ev.event_date})
-                      </option>
-                    ))}
+                    {previewOpen ? "▲ プレビューを閉じる" : "▼ 中身をプレビュー"}
+                  </button>
+                  {previewOpen && (
+                    <pre className="mt-1.5 max-h-40 overflow-auto rounded-lg bg-gray-900 text-gray-100 text-[11px] leading-relaxed font-mono p-3 whitespace-pre-wrap break-all">
+                      {meta?.preview
+                        ? meta.preview.slice(0, 2000)
+                        : "このファイル形式はテキストプレビューに対応していません。"}
+                    </pre>
+                  )}
+                </div>
+
+                {/* 割り当て先チップ */}
+                <div className="pl-7 flex flex-wrap items-center gap-1.5">
+                  {targets.map((id) => (
+                    <span
+                      key={id}
+                      className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-lg bg-white border border-gray-200 text-gray-700"
+                    >
+                      <span className="truncate max-w-[200px]" title={labelFor(id)}>{labelFor(id)}</span>
+                      <button
+                        onClick={() => removeTarget(key, id)}
+                        className="text-gray-400 hover:text-red-500 transition"
+                        title="割り当てを外す"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </span>
+                  ))}
+                  <select
+                    value=""
+                    onChange={(e) => onAssignSelect(key, e.target.value)}
+                    className="text-[11px] rounded-lg border border-dashed border-gray-300 px-2 py-1 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-indigo-300"
+                  >
+                    <option value="">＋ イベントを割り当て…</option>
+                    <option value="__new__">🆕 新規イベントを作成</option>
+                    {draftEvents.length > 0 && (
+                      <optgroup label="新規イベント（仮）">
+                        {draftEvents
+                          .filter((d) => !targets.includes(d.id))
+                          .map((d) => (
+                            <option key={d.id} value={d.id}>
+                              🆕 {d.name.trim() || "（名称未設定）"}
+                            </option>
+                          ))}
+                      </optgroup>
+                    )}
+                    {events.length > 0 && (
+                      <optgroup label="既存イベント">
+                        {events
+                          .filter((ev) => !targets.includes(ev.event_id))
+                          .map((ev) => (
+                            <option key={ev.event_id} value={ev.event_id}>
+                              {ev.name} ({ev.event_date})
+                            </option>
+                          ))}
+                      </optgroup>
+                    )}
                   </select>
                 </div>
               </div>
@@ -559,7 +757,9 @@ export default function DashboardPage() {
   const [uploading, setUploading] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null);
   const [suggestions, setSuggestions] = useState<FileSuggestion[] | null>(null);
-  const [overrides, setOverrides] = useState<Record<string, string | null>>({});
+  const [plans, setPlans] = useState<FilePlans>({});
+  const [draftEvents, setDraftEvents] = useState<DraftEvent[]>([]);
+  const [fileMetas, setFileMetas] = useState<FileMeta[]>([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
@@ -657,6 +857,8 @@ export default function DashboardPage() {
   async function handleFileSelect(files: File[]) {
     setPendingFiles(files);
     setSuggestLoading(true);
+    // メタデータと先頭プレビューをクライアント側で並列に読み取る（同名ファイルの判別用）
+    setFileMetas(await Promise.all(files.map(readFileMeta)));
     try {
       const formData = new FormData();
       files.forEach((f) => formData.append("files", f));
@@ -666,22 +868,30 @@ export default function DashboardPage() {
       });
       if (!res.ok) throw new Error(`エラー ${res.status}`);
       const data = await res.json();
-      setSuggestions(data.suggestions ?? []);
-      setOverrides({});
+      const list: FileSuggestion[] = (data.suggestions ?? []).map((s: FileSuggestion) => ({
+        ...s,
+        proposed_events: s.proposed_events ?? [],
+      }));
+      setSuggestions(list);
+      const init = buildInitialState(list);
+      setDraftEvents(init.draftEvents);
+      setPlans(init.plans);
     } catch {
       // suggest 失敗時はすべて新規イベントとして取り込む
-      setSuggestions(
-        files.map((f) => ({
-          filename: f.name,
-          event_id: null,
-          event_name: null,
-          event_date: null,
-          confidence: 0,
-          is_new_event: true,
-          is_multi_event: false,
-        }))
-      );
-      setOverrides({});
+      const fallback: FileSuggestion[] = files.map((f) => ({
+        filename: f.name,
+        event_id: null,
+        event_name: null,
+        event_date: null,
+        confidence: 0,
+        is_new_event: true,
+        is_multi_event: false,
+        proposed_events: [],
+      }));
+      setSuggestions(fallback);
+      const init = buildInitialState(fallback);
+      setDraftEvents(init.draftEvents);
+      setPlans(init.plans);
     } finally {
       setSuggestLoading(false);
     }
@@ -698,17 +908,31 @@ export default function DashboardPage() {
     addAssistantMessage(`${label}を取り込んでいます...`, [], undefined, true);
 
     try {
-      const fileEventMap: Record<string, string | null> = {};
-      for (const s of suggestions) {
-        const override = overrides[s.filename];
-        if (override !== undefined) {
-          fileEventMap[s.filename] = override;
-        } else if (s.is_new_event || s.is_multi_event) {
-          fileEventMap[s.filename] = null;
-        } else {
-          fileEventMap[s.filename] = s.event_id;
-        }
+      // 参照されているドラフト新規イベントを、ユーザー確定の仮タイトルで先行作成する。
+      // ドラフト id は複数ファイルで共有されるため、ここで1度だけ作成すれば
+      // 同じ新規イベントに複数ファイルが束ねられる（命名も確定する）。
+      const today = new Date().toISOString().slice(0, 10);
+      const referenced = new Set(Object.values(plans).flat().filter((id) => id.startsWith("draft_")));
+      const draftToReal = new Map<string, string>();
+      for (const d of draftEvents) {
+        if (!referenced.has(d.id)) continue;
+        const name = d.name.trim() || `新規イベント ${today}`;
+        const date = d.event_date || today;
+        const type = d.event_type || "展示会";
+        draftToReal.set(d.id, await createEvent(name, date, type));
       }
+
+      // ファイルの並び順インデックスをキーにする（同名ファイルでも衝突しない）。
+      const fileEventMap: Record<string, string[]> = {};
+      pendingFiles.forEach((_, i) => {
+        const targets = plans[String(i)] ?? [];
+        const ids: string[] = [];
+        for (const id of targets) {
+          const resolved = id.startsWith("draft_") ? draftToReal.get(id) : id;
+          if (resolved && !ids.includes(resolved)) ids.push(resolved);
+        }
+        fileEventMap[String(i)] = ids;
+      });
 
       const formData = new FormData();
       pendingFiles.forEach((f) => formData.append("files", f));
@@ -726,7 +950,10 @@ export default function DashboardPage() {
 
       setPendingFiles(null);
       setSuggestions(null);
-      setOverrides({});
+      setPlans({});
+      setDraftEvents([]);
+      setFileMetas([]);
+      await fetchEvents();
       pollBatch(batch_id, label);
     } catch (e) {
       replaceLastAssistantMessage(`取り込みに失敗しました: ${(e as Error).message}`);
@@ -737,10 +964,13 @@ export default function DashboardPage() {
   function handleCancelUpload() {
     setPendingFiles(null);
     setSuggestions(null);
-    setOverrides({});
+    setPlans({});
+    setDraftEvents([]);
+    setFileMetas([]);
   }
 
-  async function handleCreateEvent(name: string, date: string, type: string) {
+  // イベントを1件作成し、生成された event_id を返す（一覧更新・選択は呼び出し側の責務）。
+  async function createEvent(name: string, date: string, type: string): Promise<string> {
     const res = await authFetch("/api/events", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -753,8 +983,13 @@ export default function DashboardPage() {
     });
     if (!res.ok) throw new Error(`イベント作成エラー ${res.status}`);
     const newEvent = await res.json();
+    return newEvent.event_id;
+  }
+
+  async function handleCreateEvent(name: string, date: string, type: string) {
+    const eventId = await createEvent(name, date, type);
     await fetchEvents();
-    setSelectedEventId(newEvent.event_id);
+    setSelectedEventId(eventId);
   }
 
   function pollBatch(batchId: string, label: string) {
@@ -1069,10 +1304,28 @@ export default function DashboardPage() {
         <UploadConfirmModal
           events={events}
           suggestions={suggestions}
-          overrides={overrides}
+          fileMetas={fileMetas}
+          draftEvents={draftEvents}
+          plans={plans}
           uploading={uploading}
-          onOverrideChange={(filename, eventId) =>
-            setOverrides((prev) => ({ ...prev, [filename]: eventId }))
+          onEditDraftName={(draftId, name) =>
+            setDraftEvents((prev) => prev.map((d) => (d.id === draftId ? { ...d, name } : d)))
+          }
+          onAddDraft={() => {
+            const id = newDraftId();
+            setDraftEvents((prev) => [...prev, { id, name: "", event_date: null, event_type: null }]);
+            return id;
+          }}
+          onRemoveDraft={(draftId) => {
+            setDraftEvents((prev) => prev.filter((d) => d.id !== draftId));
+            setPlans((prev) =>
+              Object.fromEntries(
+                Object.entries(prev).map(([fn, ids]) => [fn, ids.filter((id) => id !== draftId)])
+              )
+            );
+          }}
+          onSetFileTargets={(filename, targetIds) =>
+            setPlans((prev) => ({ ...prev, [filename]: targetIds }))
           }
           onConfirmUpload={handleConfirmUpload}
           onCancelUpload={handleCancelUpload}

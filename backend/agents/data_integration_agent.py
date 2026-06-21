@@ -298,9 +298,20 @@ ContentAsset（複数可）:
 
 
 async def run_document_extractor(
-    text: str, space: Optional[SpaceContext] = None
+    text: str,
+    space: Optional[SpaceContext] = None,
+    candidate_event_names: list[str] | None = None,
 ) -> DocumentExtractionResult:
-    prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}\n\n【ドキュメント】\n{text}"
+    prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}"
+    if candidate_event_names:
+        names_json = json.dumps(candidate_event_names, ensure_ascii=False)
+        prompt += (
+            "\n\n【イベント名の制約】\n"
+            f"このドキュメントのデータは次のイベントに属します: {names_json}\n"
+            "抽出する各 Event の name は、必ず上記リストのいずれかと完全一致させてください。"
+            "新しいイベント名を作らず、各データを最も適切なイベント名に割り当ててください。"
+        )
+    prompt += f"\n\n【ドキュメント】\n{text}"
     response = await _get_client().aio.models.generate_content(
         model=_MODEL,
         contents=prompt,
@@ -390,7 +401,7 @@ def _entity_to_firestore_path(
 async def process_file(
     filename: str,
     content: bytes,
-    event_id: str | None,
+    event_ids: list[str],
     batch_id: str,
     db: Any,  # space.ScopedClient（スペース前置済み）
     space: Optional[SpaceContext] = None,
@@ -398,10 +409,31 @@ async def process_file(
     """
     1ファイルを処理してオントロジーエンティティを生成し、Firestore に保存する。
 
+    event_ids:
+        - []      → AI がファイル内容からイベントを生成/解決する（従来の新規挙動）
+        - [id]    → そのイベントへ紐づける（従来の既存紐づけ挙動）
+        - [id, …] → 複数の既存（先行作成済み）イベントへデータを振り分ける。
+                    候補イベント名を抽出AIに与え、名前ベース照合で各イベントへ統合する。
+
     Returns:
         (entities, lineage): 生成されたエンティティのリストと DataLineage レコード
     """
-    logger.info("process_file: filename=%s batch_id=%s event_id=%s", filename, batch_id, event_id)
+    # 単一指定のときだけ event_id を固定。複数/未指定は None にして
+    # 名前ベース照合（候補イベント）または AI 生成に委ねる。
+    event_id: str | None = event_ids[0] if len(event_ids) == 1 else None
+    # 紐づけ先イベント名を抽出AIに与え、抽出 Event 名を確定イベント名と一致させる
+    # （merge 書き込みでユーザー確定名が AI 命名に上書きされるのを防ぐ）。
+    candidate_event_names: list[str] = []
+    for eid in event_ids:
+        snap = db.document(f"events/{eid}").get()
+        if snap.exists:
+            name = (snap.to_dict() or {}).get("name", "")
+            if name:
+                candidate_event_names.append(name)
+    logger.info(
+        "process_file: filename=%s batch_id=%s event_id=%s candidates=%s",
+        filename, batch_id, event_id, candidate_event_names,
+    )
 
     entities: list[Any] = []
     transformations: list[Any] = []
@@ -448,7 +480,9 @@ async def process_file(
     else:
         # ─ パス B: テキスト / その他 ─────────────────────────────────────
         text = _read_text(content)
-        extraction = await run_document_extractor(text, space=space)
+        extraction = await run_document_extractor(
+            text, space=space, candidate_event_names=candidate_event_names or None
+        )
         raw_extraction_dict = extraction.model_dump()
         logger.info("document_extractor result: detected=%s", extraction.detected_entity_types)
         entities, transformations, skipped = _mapper.map_extraction(
@@ -573,40 +607,55 @@ def _is_event_defining_name(filename: str) -> bool:
     return "overview" in lower or "概要" in filename
 
 
+def _coerce_event_ids(value: Any) -> list[str]:
+    """file_event_map の値（str | list | None）を event_id のリストへ正規化する。"""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if v]
+    return []
+
+
 async def process_batch(
     files: list[tuple[str, bytes]],
     batch_id: str,
     db: Any,  # space.ScopedClient（スペース前置済み）
-    file_event_map: dict[str, str | None] | None = None,
+    file_event_map: dict[str, Any] | None = None,
     space: Optional[SpaceContext] = None,
 ) -> list[BatchFileResult]:
     """複数ファイルを並列に処理する。
 
-    file_event_map でファイルごとの event_id を明示指定する。
-    指定がない（または None 値の）ファイルは、ファイル内容から AI がイベントを生成/解決する。
+    file_event_map のキーはファイルの並び順インデックス（文字列）。同名ファイルでも
+    衝突しない。値は event_id 文字列・event_id リスト・None のいずれか。空/None の
+    ファイルはファイル内容から AI がイベントを生成/解決する。複数指定時はそれらの
+    既存イベントへデータを振り分ける。
     space は LLMトークン計測のために使う（None なら計測しない）。
     """
     import asyncio
 
-    async def _process(filename: str, content: bytes) -> BatchFileResult:
-        event_id = (file_event_map or {}).get(filename)
-        return await _process_one(filename, content, event_id, batch_id, db, space=space)
+    async def _process(idx: int, filename: str, content: bytes) -> BatchFileResult:
+        event_ids = _coerce_event_ids((file_event_map or {}).get(str(idx)))
+        return await _process_one(filename, content, event_ids, batch_id, db, space=space)
 
-    results = await asyncio.gather(*[_process(fn, content) for fn, content in files])
+    results = await asyncio.gather(
+        *[_process(i, fn, content) for i, (fn, content) in enumerate(files)]
+    )
     return list(results)
 
 
 async def _process_one(
     filename: str,
     content: bytes,
-    event_id: str | None,
+    event_ids: list[str],
     batch_id: str,
     db: Any,
     space: Optional[SpaceContext] = None,
 ) -> BatchFileResult:
     """1ファイルを process_file で処理し、部分失敗を吸収して結果を返す。"""
     try:
-        entities, lineage = await process_file(filename, content, event_id, batch_id, db, space=space)
+        entities, lineage = await process_file(filename, content, event_ids, batch_id, db, space=space)
         counts: dict[str, int] = {}
         for entity in entities:
             counts[type(entity).__name__] = counts.get(type(entity).__name__, 0) + 1
