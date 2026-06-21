@@ -2,38 +2,26 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    match /users/{userId} {
-      allow read: if request.auth.uid == userId;
-      allow write: if false;
+    // マルチテナント分離（Space-ID Trust Boundary の多層防御）
+    //
+    // 実際の読み書きはバックエンド（Admin SDK + 検証済み uid × membership）経由で行われ、
+    // ここのルールはクライアントSDKが直接アクセスした場合の防御として機能する。
+    // 認可の真実はスペース配下の members ドキュメントの存在。書込は常に Admin SDK のみ。
+
+    function isMember(spaceId) {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/spaces/$(spaceId)/members/$(request.auth.uid));
     }
 
-    match /projects/{projectId} {
-      allow read: if request.auth != null
-        && resource.data.ownerId == request.auth.uid;
+    match /spaces/{spaceId} {
+      // スペース本体・配下の全データ（events / members / usage / ...）はメンバーのみ read 可
+      allow read: if isMember(spaceId);
       allow write: if false;
 
-      match /contacts/{contactId} {
-        allow read: if request.auth != null
-          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+      match /{document=**} {
+        allow read: if isMember(spaceId);
         allow write: if false;
       }
-
-      match /emails/{emailId} {
-        allow read: if request.auth != null
-          && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
-        allow write: if false;
-      }
-    }
-
-    match /generation_jobs/{jobId} {
-      allow read: if request.auth != null
-        && resource.data.ownerId == request.auth.uid;
-      allow write: if false;
-    }
-
-    match /templates/{templateId} {
-      allow read: if request.auth != null;
-      allow write: if false;
     }
   }
 }

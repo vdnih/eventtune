@@ -17,12 +17,13 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
-from firebase_admin import firestore
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
-from dependencies import get_current_user
+from dependencies import get_space_context
+from metering import metered, record_llm_response
+from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ class _SuggestResponse(BaseModel):
 @router.post("/suggest-event")
 async def suggest_event(
     files: list[UploadFile] = File(...),
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """ファイルを受け取り、AIが既存イベントとの照合結果を返す（データは保存しない）。"""
     # ファイルプレビューを構築（テキスト系は先頭500文字、バイナリはファイル名のみ）
@@ -77,8 +78,7 @@ async def suggest_event(
         file_previews.append({"filename": filename, "preview": preview})
 
     # 既存イベント一覧を取得
-    db = firestore.client()
-    events_snap = db.collection("events").get()
+    events_snap = space.col("events").get()
     events_list = []
     for doc in events_snap:
         d = doc.to_dict()
@@ -112,14 +112,16 @@ async def suggest_event(
 既存イベントが1件もない場合はすべて is_new_event: true にしてください。
 """
 
-    response = await _get_genai_client().aio.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=_SuggestResponse,
-        ),
-    )
+    with metered(space):
+        response = await _get_genai_client().aio.models.generate_content(
+            model=_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=_SuggestResponse,
+            ),
+        )
+    record_llm_response(space, _MODEL, response)
     result = _SuggestResponse.model_validate_json(response.text)
     return {"suggestions": [s.model_dump() for s in result.suggestions]}
 
@@ -127,16 +129,19 @@ async def suggest_event(
 # ── バッチ処理 ─────────────────────────────────────────────────────────────────
 
 async def _run_integration(
+    space: SpaceContext,
     batch_id: str,
     files: list[tuple[str, bytes]],
     file_event_map: dict[str, str | None],
 ) -> None:
     from agents.data_integration_agent import process_batch
 
-    db = firestore.client()
+    scoped = space.scoped_db()
     try:
-        db.collection("integration_batches").document(batch_id).update({"status": "processing"})
-        results = await process_batch(files, batch_id, db, file_event_map)
+        scoped.collection("integration_batches").document(batch_id).update({"status": "processing"})
+        # コンピュート実行時間を計測（LLMトークンは process_batch 内で記録）
+        with metered(space):
+            results = await process_batch(files, batch_id, scoped, file_event_map, space=space)
 
         merged: dict[str, int] = {}
         for r in results:
@@ -155,7 +160,7 @@ async def _run_integration(
         all_event_ids.extend(v for v in file_event_map.values() if v)
         event_ids = list(dict.fromkeys(all_event_ids))  # 順序保持で重複除去
 
-        db.collection("integration_batches").document(batch_id).update({
+        scoped.collection("integration_batches").document(batch_id).update({
             "status": batch_status,
             "files": [r.to_dict() for r in results],
             "created_entities": merged,
@@ -173,7 +178,7 @@ async def _run_integration(
     except Exception as e:
         logger.exception("integration failed: batch_id=%s error=%s", batch_id, e)
         try:
-            db.collection("integration_batches").document(batch_id).update({
+            scoped.collection("integration_batches").document(batch_id).update({
                 "status": "error",
                 "error": str(e)[:500],
             })
@@ -184,14 +189,13 @@ async def _run_integration(
 @router.get("/batches")
 async def list_batches(
     event_id: str | None = None,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """データ統合バッチの一覧を返す。event_id が指定された場合は絞り込む。"""
-    db = firestore.client()
     if event_id:
-        docs = db.collection("integration_batches").where("event_ids", "array_contains", event_id).get()
+        docs = space.col("integration_batches").where("event_ids", "array_contains", event_id).get()
     else:
-        docs = db.collection("integration_batches").get()
+        docs = space.col("integration_batches").get()
     batches = [d.to_dict() for d in docs]
     batches.sort(key=lambda b: b.get("created_at", ""), reverse=True)
     return {"batches": batches, "count": len(batches)}
@@ -202,7 +206,7 @@ async def start_integration(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     file_event_map: str | None = Form(None),
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """複数ファイルをアップロードしデータ統合バッチを開始する。
 
@@ -229,7 +233,7 @@ async def start_integration(
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     filenames = [name for name, _ in loaded]
 
-    firestore.client().collection("integration_batches").document(batch_id).set({
+    space.col("integration_batches").document(batch_id).set({
         "batch_id": batch_id,
         "filenames": filenames,
         "files": [{"filename": name, "status": "queued"} for name in filenames],
@@ -240,7 +244,7 @@ async def start_integration(
         "created_at": _now_iso(),
     })
 
-    background_tasks.add_task(_run_integration, batch_id, loaded, parsed_map)
+    background_tasks.add_task(_run_integration, space, batch_id, loaded, parsed_map)
 
     return {"batch_id": batch_id, "filenames": filenames}
 
@@ -248,10 +252,10 @@ async def start_integration(
 @router.get("/batches/{batch_id}")
 async def get_batch_status(
     batch_id: str,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """バッチの処理状況と生成されたエンティティ数を返す。"""
-    doc = firestore.client().collection("integration_batches").document(batch_id).get()
+    doc = space.col("integration_batches").document(batch_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
     data = doc.to_dict()
@@ -271,11 +275,10 @@ async def get_batch_status(
 @router.get("/batches/{batch_id}/report")
 async def get_batch_report(
     batch_id: str,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """バッチの加工処理レポートを返す（Auditable AI）。"""
-    db = firestore.client()
-    batch_doc = db.collection("integration_batches").document(batch_id).get()
+    batch_doc = space.col("integration_batches").document(batch_id).get()
     if not batch_doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
 
@@ -295,7 +298,7 @@ async def get_batch_report(
 
     reports = []
     for lid in lineage_ids:
-        lineage_doc = db.collection("data_lineage").document(lid).get()
+        lineage_doc = space.col("data_lineage").document(lid).get()
         if lineage_doc.exists:
             reports.append(_format_lineage_report(lineage_doc.to_dict()))
 
@@ -336,11 +339,10 @@ def _format_lineage_report(lineage: dict) -> dict:
 @router.get("/batches/{batch_id}/contacts")
 async def get_batch_contacts(
     batch_id: str,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """バッチで取り込まれたコンタクト一覧を返す（複数イベントにまたがる場合も対応）。"""
-    db = firestore.client()
-    batch_doc = db.collection("integration_batches").document(batch_id).get()
+    batch_doc = space.col("integration_batches").document(batch_id).get()
     if not batch_doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
 
@@ -349,7 +351,7 @@ async def get_batch_contacts(
 
     contacts: list[dict] = []
     for eid in event_ids:
-        snap = db.collection(f"events/{eid}/batches/{batch_id}/contacts").get()
+        snap = space.col(f"events/{eid}/batches/{batch_id}/contacts").get()
         contacts.extend(s.to_dict() for s in snap)
 
     return {"contacts": contacts, "count": len(contacts)}

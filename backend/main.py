@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
-from routers import events, integration, marketing
+from routers import events, integration, marketing, spaces
 
 settings = get_settings()
 
@@ -22,6 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(spaces.router)
 app.include_router(integration.router)
 app.include_router(marketing.router)
 app.include_router(events.router)

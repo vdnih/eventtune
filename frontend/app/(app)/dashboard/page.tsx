@@ -1,27 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { auth } from "@/lib/firebase";
+import { API_BASE, authFetch, authHeaders } from "@/lib/api";
+import { useSpace } from "@/lib/space-context";
 import { EmailBlockCard } from "@/components/features/email/EmailBlockCard";
 import EventDataPanel from "@/components/features/explorer/EventDataPanel";
 import { Loader2, Send, Upload, Wrench, Calendar, RefreshCw, Plus, X, Check, FileText, Trash2, MessageSquare } from "lucide-react";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-
-async function getToken(): Promise<string> {
-  return (await auth.currentUser?.getIdToken()) ?? "";
-}
-
-async function authFetch(path: string, init?: RequestInit): Promise<Response> {
-  const token = await getToken();
-  return fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(init?.headers ?? {}),
-    },
-  });
-}
 
 // ── 型定義 ──────────────────────────────────────────────────────────────────
 
@@ -568,6 +552,7 @@ function SourcesPanel({
 // ── メインコンポーネント ──────────────────────────────────────────────────────
 
 export default function DashboardPage() {
+  const { activeSpace } = useSpace();
   const [events, setEvents] = useState<EventSummary[]>([]);
   const [loadingEvents, setLoadingEvents] = useState(true);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
@@ -611,6 +596,12 @@ export default function DashboardPage() {
   // ── イベント一覧取得 ──────────────────────────────────────────────────────
 
   const fetchEvents = useCallback(async () => {
+    // アクティブスペース未確定のうちは X-Space-Id を付与できず 422 になるため叩かない
+    if (!activeSpace) {
+      setEvents([]);
+      setLoadingEvents(false);
+      return;
+    }
     setLoadingEvents(true);
     try {
       const res = await authFetch("/api/events");
@@ -627,7 +618,7 @@ export default function DashboardPage() {
     } finally {
       setLoadingEvents(false);
     }
-  }, []);
+  }, [activeSpace]);
 
   useEffect(() => {
     fetchEvents();
@@ -832,14 +823,12 @@ export default function DashboardPage() {
     ]);
 
     try {
-      const token = await getToken();
       const res = await fetch(`${API_BASE}/api/marketing/chat`, {
         method: "POST",
-        headers: {
+        headers: await authHeaders({
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
           Accept: "text/event-stream",
-        },
+        }),
         body: JSON.stringify({
           message: text,
           session_id: sessionId.current,
@@ -1005,9 +994,8 @@ export default function DashboardPage() {
   }
 
   async function handleDownloadCsv(runId: string) {
-    const token = await getToken();
     const res = await fetch(`${API_BASE}/api/marketing/runs/${runId}/export`, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: await authHeaders(),
     });
     if (!res.ok) return;
     const blob = await res.blob();

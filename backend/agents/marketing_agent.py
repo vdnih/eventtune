@@ -8,22 +8,29 @@ MarketingAgent — Layer 3: マーケティングエージェント
 
 のみを記述する。タスク別の手順は事前定義しない。
 ユーザーの指示に対して、プロのマーケターとして自律的に判断・行動する。
+
+【マルチテナント: AI非依存のスペース束縛】
+ツールはモジュールグローバルではなく make_tools(db) のファクトリで生成し、スペースで
+前置済みの ScopedClient を closure で捕捉する。ツールのシグネチャに space_id は存在せず、
+AI は他スペースを名指しする経路を持たない（最小権限の構造的強制）。Agent はリクエストごとに
+build_agent(db) で構築する。詳細は docs/PHILOSOPHY_AND_NAMING.md。
 """
 
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
 
-from firebase_admin import firestore
 from google import genai
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+from metering import metered, record_compute, record_llm, record_llm_response
 from ontology import (
     CostCategory,
     CostSummary,
@@ -35,6 +42,7 @@ from ontology import (
     EventKPI,
     SurveyResponse,
 )
+from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
@@ -84,232 +92,233 @@ ROI計算が必要な場合の公式:
 """
 
 
-# ── ツール定義 ────────────────────────────────────────────────────────────────
+# ── ツール定義（スペース束縛ファクトリ） ──────────────────────────────────────
+#
+# db は space.ScopedClient（spaces/{space_id}/ で前置済み）。各ツールは db を closure で
+# 捕捉するため、自スペース配下にしか到達できない。ツール引数に space_id は存在しない。
 
-def _db() -> Any:
-    return firestore.client()
+def make_tools(db: Any) -> list:
+    """スペース前置済み db を closure 束縛したツール群を返す。"""
 
+    def list_events() -> str:
+        """登録されているすべてのイベントの一覧を取得する。"""
+        docs = db.collection("events").get()
+        events = [d.to_dict() for d in docs]
+        return json.dumps(events, ensure_ascii=False, default=str)
 
-def list_events() -> str:
-    """登録されているすべてのイベントの一覧を取得する。"""
-    docs = _db().collection("events").get()
-    events = [d.to_dict() for d in docs]
-    return json.dumps(events, ensure_ascii=False, default=str)
+    def get_event_detail(event_id: str) -> str:
+        """指定したイベントの詳細情報を取得する。"""
+        doc = db.collection("events").document(event_id).get()
+        if not doc.exists:
+            return json.dumps({"error": f"event_id '{event_id}' not found"})
+        return json.dumps(doc.to_dict(), ensure_ascii=False, default=str)
 
+    def get_event_contacts(event_id: str, engagement_level: str = "") -> str:
+        """
+        指定したイベントのコンタクト一覧を取得する。
+        engagement_level を指定するとフィルタリングできる（例: "アポ獲得済み"）。
+        """
+        # NOTE: batches/{bid} ドキュメントは取り込み時に実体化されない（contacts のみ書き込む）
+        # ため、コレクションクエリ .get() では祖先パスの幽霊ドキュメントを拾えない。
+        # 幽霊ドキュメントも含めて列挙する .list_documents() を使う。
+        batches = db.collection(f"events/{event_id}/batches").list_documents()
+        contacts = []
+        for batch in batches:
+            coll = db.collection(f"events/{event_id}/batches/{batch.id}/contacts").get()
+            for c in coll:
+                data = c.to_dict()
+                if not engagement_level or data.get("engagement_level") == engagement_level:
+                    contacts.append(data)
+        return json.dumps(contacts, ensure_ascii=False, default=str)
 
-def get_event_detail(event_id: str) -> str:
-    """指定したイベントの詳細情報を取得する。"""
-    doc = _db().collection("events").document(event_id).get()
-    if not doc.exists:
-        return json.dumps({"error": f"event_id '{event_id}' not found"})
-    return json.dumps(doc.to_dict(), ensure_ascii=False, default=str)
+    def get_event_kpi(event_id: str) -> str:
+        """指定したイベントの KPI データを取得する。"""
+        docs = db.collection(f"events/{event_id}/kpi").get()
+        kpis = [d.to_dict() for d in docs]
+        return json.dumps(kpis[0] if kpis else {}, ensure_ascii=False, default=str)
 
+    def get_event_survey(event_id: str) -> str:
+        """指定したイベントのアンケート集計データを取得する。"""
+        docs = db.collection(f"events/{event_id}/survey").get()
+        surveys = [d.to_dict() for d in docs]
+        return json.dumps(surveys[0] if surveys else {}, ensure_ascii=False, default=str)
 
-def get_event_contacts(event_id: str, engagement_level: str = "") -> str:
-    """
-    指定したイベントのコンタクト一覧を取得する。
-    engagement_level を指定するとフィルタリングできる（例: "アポ獲得済み"）。
-    """
-    db = _db()
-    # NOTE: batches/{bid} ドキュメントは取り込み時に実体化されない（contacts のみ書き込む）
-    # ため、コレクションクエリ .get() では祖先パスの幽霊ドキュメントを拾えない。
-    # 幽霊ドキュメントも含めて列挙する .list_documents() を使う。
-    batches = db.collection(f"events/{event_id}/batches").list_documents()
-    contacts = []
-    for batch in batches:
-        coll = db.collection(f"events/{event_id}/batches/{batch.id}/contacts").get()
-        for c in coll:
-            data = c.to_dict()
-            if not engagement_level or data.get("engagement_level") == engagement_level:
-                contacts.append(data)
-    return json.dumps(contacts, ensure_ascii=False, default=str)
+    def get_event_costs(event_id: str) -> str:
+        """
+        指定したイベントの費用明細とカテゴリ別集計（CostSummary）を取得する。
+        返却: { costs: [...], summary: { total_jpy: ..., by_category: {...} } }
+        """
+        docs = db.collection(f"events/{event_id}/costs").get()
+        costs = [d.to_dict() for d in docs]
+        total = sum(c.get("amount_jpy", 0) for c in costs)
+        by_category: dict[str, float] = {}
+        for c in costs:
+            cat = c.get("category", "その他")
+            by_category[cat] = by_category.get(cat, 0) + c.get("amount_jpy", 0)
+        summary = CostSummary(total_jpy=total, by_category=by_category)
+        return json.dumps(
+            {"costs": costs, "summary": summary.model_dump()},
+            ensure_ascii=False,
+            default=str,
+        )
 
+    def get_all_events_summary() -> str:
+        """
+        すべてのイベントを横断した比較サマリーを返す。
+        振り返り・比較分析に使用する。
+        """
+        events = [d.to_dict() for d in db.collection("events").get()]
+        summaries = []
+        for ev in events:
+            eid = ev.get("event_id", "")
+            kpi_docs = db.collection(f"events/{eid}/kpi").get()
+            kpi = kpi_docs[0].to_dict() if kpi_docs else {}
+            cost_docs = db.collection(f"events/{eid}/costs").get()
+            total_cost = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
+            survey_docs = db.collection(f"events/{eid}/survey").get()
+            survey = survey_docs[0].to_dict() if survey_docs else {}
 
-def get_event_kpi(event_id: str) -> str:
-    """指定したイベントの KPI データを取得する。"""
-    docs = _db().collection(f"events/{event_id}/kpi").get()
-    kpis = [d.to_dict() for d in docs]
-    return json.dumps(kpis[0] if kpis else {}, ensure_ascii=False, default=str)
+            roi_pipeline = 0.0
+            if total_cost > 0 and kpi.get("pipeline_value_jpy", 0) > 0:
+                roi_pipeline = round(kpi["pipeline_value_jpy"] / total_cost * 100, 1)
 
+            summaries.append({
+                "event_id": eid,
+                "event_name": ev.get("name", ""),
+                "event_date": ev.get("event_date", ""),
+                "total_contacts": kpi.get("total_contacts_collected", 0),
+                "appointments_booked": kpi.get("appointments_booked", 0),
+                "roi_pipeline": roi_pipeline,
+                "total_cost_jpy": total_cost,
+                "pipeline_value_jpy": kpi.get("pipeline_value_jpy", 0),
+                "nps_score": survey.get("nps_score", None),
+            })
+        return json.dumps(summaries, ensure_ascii=False, default=str)
 
-def get_event_survey(event_id: str) -> str:
-    """指定したイベントのアンケート集計データを取得する。"""
-    docs = _db().collection(f"events/{event_id}/survey").get()
-    surveys = [d.to_dict() for d in docs]
-    return json.dumps(surveys[0] if surveys else {}, ensure_ascii=False, default=str)
+    def get_content_catalog() -> str:
+        """推薦可能なコンテンツ資産（資料・事例・セミナー等）の一覧を取得する。"""
+        docs = db.collection("content_assets").get()
+        assets = [d.to_dict() for d in docs]
+        return json.dumps(assets, ensure_ascii=False, default=str)
 
-
-def get_event_costs(event_id: str) -> str:
-    """
-    指定したイベントの費用明細とカテゴリ別集計（CostSummary）を取得する。
-    返却: { costs: [...], summary: { total_jpy: ..., by_category: {...} } }
-    """
-    docs = _db().collection(f"events/{event_id}/costs").get()
-    costs = [d.to_dict() for d in docs]
-    total = sum(c.get("amount_jpy", 0) for c in costs)
-    by_category: dict[str, float] = {}
-    for c in costs:
-        cat = c.get("category", "その他")
-        by_category[cat] = by_category.get(cat, 0) + c.get("amount_jpy", 0)
-    summary = CostSummary(total_jpy=total, by_category=by_category)
-    return json.dumps(
-        {"costs": costs, "summary": summary.model_dump()},
-        ensure_ascii=False,
-        default=str,
-    )
-
-
-def get_all_events_summary() -> str:
-    """
-    すべてのイベントを横断した比較サマリーを返す。
-    振り返り・比較分析に使用する。
-    """
-    db = _db()
-    events = [d.to_dict() for d in db.collection("events").get()]
-    summaries = []
-    for ev in events:
-        eid = ev.get("event_id", "")
-        kpi_docs = db.collection(f"events/{eid}/kpi").get()
-        kpi = kpi_docs[0].to_dict() if kpi_docs else {}
-        cost_docs = db.collection(f"events/{eid}/costs").get()
-        total_cost = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
-        survey_docs = db.collection(f"events/{eid}/survey").get()
-        survey = survey_docs[0].to_dict() if survey_docs else {}
-
-        roi_pipeline = 0.0
-        if total_cost > 0 and kpi.get("pipeline_value_jpy", 0) > 0:
-            roi_pipeline = round(kpi["pipeline_value_jpy"] / total_cost * 100, 1)
-
-        summaries.append({
-            "event_id": eid,
-            "event_name": ev.get("name", ""),
-            "event_date": ev.get("event_date", ""),
-            "total_contacts": kpi.get("total_contacts_collected", 0),
-            "appointments_booked": kpi.get("appointments_booked", 0),
-            "roi_pipeline": roi_pipeline,
-            "total_cost_jpy": total_cost,
-            "pipeline_value_jpy": kpi.get("pipeline_value_jpy", 0),
-            "nps_score": survey.get("nps_score", None),
+    def save_report(event_id: str, report_type: str, content: str) -> str:
+        """
+        分析レポートや戦略提案を Firestore に保存する。
+        report_type: "retrospective" / "strategy" / その他の自由な文字列
+        content: JSON 文字列または自由テキスト
+        """
+        report_id = f"report_{uuid.uuid4().hex[:12]}"
+        db.collection(f"events/{event_id}/reports").document(report_id).set({
+            "report_id": report_id,
+            "event_id": event_id,
+            "report_type": report_type,
+            "content": content,
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
-    return json.dumps(summaries, ensure_ascii=False, default=str)
+        return json.dumps({"report_id": report_id, "status": "saved"})
 
+    def compose_emails(
+        contact_ids: list[str],
+        purpose: str,
+        context: str = "",
+        content_asset_ids: list[str] = [],
+    ) -> str:
+        """
+        指定したコンタクトに対してメールを生成し、marketing_runs に保存する。
 
-def get_content_catalog() -> str:
-    """推薦可能なコンテンツ資産（資料・事例・セミナー等）の一覧を取得する。"""
-    docs = _db().collection("content_assets").get()
-    assets = [d.to_dict() for d in docs]
-    return json.dumps(assets, ensure_ascii=False, default=str)
+        Args:
+            contact_ids: 対象コンタクトの ID リスト
+            purpose: メールの目的（例: "展示会フォローアップ", "セミナー案内", "製品アップデート通知"）
+            context: 追加の指示・背景情報（自由テキスト）
+            content_asset_ids: 参照させたいコンテンツ資産の asset_id リスト
 
-
-def save_report(event_id: str, report_type: str, content: str) -> str:
-    """
-    分析レポートや戦略提案を Firestore に保存する。
-    report_type: "retrospective" / "strategy" / その他の自由な文字列
-    content: JSON 文字列または自由テキスト
-    """
-    report_id = f"report_{uuid.uuid4().hex[:12]}"
-    _db().collection(f"events/{event_id}/reports").document(report_id).set({
-        "report_id": report_id,
-        "event_id": event_id,
-        "report_type": report_type,
-        "content": content,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    return json.dumps({"report_id": report_id, "status": "saved"})
-
-
-def compose_emails(
-    contact_ids: list[str],
-    purpose: str,
-    context: str = "",
-    content_asset_ids: list[str] = [],
-) -> str:
-    """
-    指定したコンタクトに対してメールを生成し、marketing_runs に保存する。
-
-    Args:
-        contact_ids: 対象コンタクトの ID リスト
-        purpose: メールの目的（例: "展示会フォローアップ", "セミナー案内", "製品アップデート通知"）
-        context: 追加の指示・背景情報（自由テキスト）
-        content_asset_ids: 参照させたいコンテンツ資産の asset_id リスト
-
-    Returns:
-        { run_id, total, status }
-    """
-    run_id = f"run_{uuid.uuid4().hex[:12]}"
-    _db().collection("marketing_runs").document(run_id).set({
-        "run_id": run_id,
-        "status": "queued",
-        "purpose": purpose,
-        "context": context,
-        "contact_ids": contact_ids,
-        "content_asset_ids": content_asset_ids,
-        "total": len(contact_ids),
-        "done": 0,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    # 実行はフロントエンドが POST /api/marketing/runs/{run_id}/execute を呼ぶことで開始する
-    return json.dumps({"run_id": run_id, "total": len(contact_ids), "status": "queued"})
-
-
-def export_emails_csv(run_id: str) -> str:
-    """指定した run_id のメール生成結果を CSV 形式で返す。"""
-    db = _db()
-    run_doc = db.collection("marketing_runs").document(run_id).get()
-    if not run_doc.exists:
-        return json.dumps({"error": f"run_id '{run_id}' not found"})
-    emails = [d.to_dict() for d in db.collection(f"marketing_runs/{run_id}/emails").get()]
-    if not emails:
-        return json.dumps({"error": "no emails found for this run"})
-    # CSV 文字列を生成
-    import csv, io
-    buf = io.StringIO()
-    fieldnames = ["contact_id", "subject", "full_text"]
-    writer = csv.DictWriter(buf, fieldnames=fieldnames)
-    writer.writeheader()
-    for email in emails:
-        blocks = email.get("blocks", [])
-        full_text = "\n\n".join(b.get("block_text", "") for b in blocks)
-        writer.writerow({
-            "contact_id": email.get("contact_id", ""),
-            "subject": email.get("subject", ""),
-            "full_text": full_text,
+        Returns:
+            { run_id, total, status }
+        """
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        db.collection("marketing_runs").document(run_id).set({
+            "run_id": run_id,
+            "status": "queued",
+            "purpose": purpose,
+            "context": context,
+            "contact_ids": contact_ids,
+            "content_asset_ids": content_asset_ids,
+            "total": len(contact_ids),
+            "done": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
-    return json.dumps({"csv": buf.getvalue(), "count": len(emails)})
+        # 実行はフロントエンドが POST /api/marketing/runs/{run_id}/execute を呼ぶことで開始する
+        return json.dumps({"run_id": run_id, "total": len(contact_ids), "status": "queued"})
+
+    def export_emails_csv(run_id: str) -> str:
+        """指定した run_id のメール生成結果を CSV 形式で返す。"""
+        run_doc = db.collection("marketing_runs").document(run_id).get()
+        if not run_doc.exists:
+            return json.dumps({"error": f"run_id '{run_id}' not found"})
+        emails = [d.to_dict() for d in db.collection(f"marketing_runs/{run_id}/emails").get()]
+        if not emails:
+            return json.dumps({"error": "no emails found for this run"})
+        # CSV 文字列を生成
+        import csv, io
+        buf = io.StringIO()
+        fieldnames = ["contact_id", "subject", "full_text"]
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for email in emails:
+            blocks = email.get("blocks", [])
+            full_text = "\n\n".join(b.get("block_text", "") for b in blocks)
+            writer.writerow({
+                "contact_id": email.get("contact_id", ""),
+                "subject": email.get("subject", ""),
+                "full_text": full_text,
+            })
+        return json.dumps({"csv": buf.getvalue(), "count": len(emails)})
+
+    return [
+        list_events,
+        get_event_detail,
+        get_event_contacts,
+        get_event_kpi,
+        get_event_survey,
+        get_event_costs,
+        get_all_events_summary,
+        get_content_catalog,
+        save_report,
+        compose_emails,
+        export_emails_csv,
+    ]
 
 
 # ── エージェント・ランナー構築 ────────────────────────────────────────────────
 
-_TOOLS = [
-    list_events,
-    get_event_detail,
-    get_event_contacts,
-    get_event_kpi,
-    get_event_survey,
-    get_event_costs,
-    get_all_events_summary,
-    get_content_catalog,
-    save_report,
-    compose_emails,
-    export_emails_csv,
-]
+def build_agent(db: Any) -> Agent:
+    """スペース束縛ツールを持つ Agent をリクエストごとに構築する。"""
+    return Agent(
+        name="marketing_agent",
+        model=_MODEL,
+        description="イベントマーケティングAIエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
+        instruction=_SYSTEM_PROMPT,
+        tools=make_tools(db),
+    )
 
-_agent = Agent(
-    name="marketing_agent",
-    model=_MODEL,
-    description="イベントマーケティングAIエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
-    instruction=_SYSTEM_PROMPT,
-    tools=_TOOLS,
-)
 
 _session_service = InMemorySessionService()
 _APP_NAME = "event_marketing_platform"
 
 
+def _accumulate_usage(event: Any, totals: dict[str, int]) -> None:
+    """ADK イベントから usage_metadata を拾って累積する（防御的）。"""
+    usage = getattr(event, "usage_metadata", None)
+    if usage is None:
+        return
+    totals["input"] += getattr(usage, "prompt_token_count", 0) or 0
+    totals["output"] += getattr(usage, "candidates_token_count", 0) or 0
+
+
 async def chat_stream(
     message: str,
     session_id: str,
-    user_id: str = "default_user",
+    space: SpaceContext,
     event_id: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -318,21 +327,23 @@ async def chat_stream(
     Yields:
         { type: "tool_call" | "text" | "done" | "error", ... }
     """
+    db = space.scoped_db()
+    # ADKセッションキーをスペースで名前空間化し、スペース間のセッション混線を防ぐ
+    session_user_id = f"{space.space_id}:{space.uid}"
+
     runner = Runner(
-        agent=_agent,
+        agent=build_agent(db),
         app_name=_APP_NAME,
         session_service=_session_service,
     )
 
     # セッション初期化（既存があれば再利用、無ければ作成）
-    # InMemorySessionService.get_session は未存在時に None を返す（例外を投げない）ため
-    # None チェックで明示的に作成する。
     session = await _session_service.get_session(
-        app_name=_APP_NAME, user_id=user_id, session_id=session_id
+        app_name=_APP_NAME, user_id=session_user_id, session_id=session_id
     )
     if session is None:
         session = await _session_service.create_session(
-            app_name=_APP_NAME, user_id=user_id, session_id=session_id
+            app_name=_APP_NAME, user_id=session_user_id, session_id=session_id
         )
 
     # 選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
@@ -342,7 +353,7 @@ async def chat_stream(
     if event_id:
         event_name = event_id
         try:
-            doc = _db().collection("events").document(event_id).get()
+            doc = db.collection("events").document(event_id).get()
             if doc.exists:
                 event_name = doc.to_dict().get("name", event_id)
         except Exception:
@@ -359,12 +370,15 @@ async def chat_stream(
         parts=[types.Part(text=message_text)],
     )
 
+    usage_totals = {"input": 0, "output": 0}
+    start = time.monotonic()
     try:
         async for event in runner.run_async(
-            user_id=user_id,
+            user_id=session_user_id,
             session_id=session_id,
             new_message=user_content,
         ):
+            _accumulate_usage(event, usage_totals)
             # ToolCall イベント
             if event.get_function_calls():
                 for fc in event.get_function_calls():
@@ -384,16 +398,20 @@ async def chat_stream(
     except Exception as e:
         logger.exception("chat_stream error: session_id=%s", session_id)
         yield {"type": "error", "message": str(e)}
+    finally:
+        # メータリング: LLMトークンとコンピュート実行時間を記録
+        record_llm(space, _MODEL, usage_totals["input"], usage_totals["output"])
+        record_compute(space, int((time.monotonic() - start) * 1000))
 
 
 # ── メール生成バックグラウンドジョブ ─────────────────────────────────────────
 
-async def _execute_email_run(run_id: str) -> None:
+async def _execute_email_run(space: SpaceContext, run_id: str) -> None:
     """
     compose_emails ツールで作成された run を実際に実行する。
     contacts を Firestore から取得し、各コンタクトへのメールを生成して保存する。
     """
-    db = _db()
+    db = space.scoped_db()
     run_doc = db.collection("marketing_runs").document(run_id).get()
     if not run_doc.exists:
         return
@@ -420,47 +438,49 @@ async def _execute_email_run(run_id: str) -> None:
         pass
 
     done = 0
-    for contact_id in contact_ids:
-        # コンタクトを全イベントから検索
-        contact_data = _find_contact(db, contact_id)
-        if not contact_data:
-            logger.warning("contact not found: %s", contact_id)
-            continue
+    with metered(space):
+        for contact_id in contact_ids:
+            # コンタクトを全イベントから検索
+            contact_data = _find_contact(db, contact_id)
+            if not contact_data:
+                logger.warning("contact not found: %s", contact_id)
+                continue
 
-        contact_json = json.dumps(contact_data, ensure_ascii=False, default=str)
-        prompt = f"以下のコンタクト情報に基づいてメールを生成してください:\n\n{contact_json}"
+            contact_json = json.dumps(contact_data, ensure_ascii=False, default=str)
+            prompt = f"以下のコンタクト情報に基づいてメールを生成してください:\n\n{contact_json}"
 
-        try:
-            response = await client.aio.models.generate_content(
-                model=_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=email_system_prompt,
-                    response_mime_type="application/json",
-                    response_schema=_EmailSchema,
-                ),
-            )
-            email = _EmailSchema.model_validate_json(response.text)
-        except Exception as e:
-            logger.exception("email generation failed for contact %s: %s", contact_id, e)
-            continue
+            try:
+                response = await client.aio.models.generate_content(
+                    model=_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=email_system_prompt,
+                        response_mime_type="application/json",
+                        response_schema=_EmailSchema,
+                    ),
+                )
+                record_llm_response(space, _MODEL, response)
+                email = _EmailSchema.model_validate_json(response.text)
+            except Exception as e:
+                logger.exception("email generation failed for contact %s: %s", contact_id, e)
+                continue
 
-        email_id = f"email_{uuid.uuid4().hex[:12]}"
-        email_doc = {
-            **email.model_dump(),
-            "email_id": email_id,
-            "contact_id": contact_id,
-            "run_id": run_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        db.collection(f"marketing_runs/{run_id}/emails").document(email_id).set(email_doc)
+            email_id = f"email_{uuid.uuid4().hex[:12]}"
+            email_doc = {
+                **email.model_dump(),
+                "email_id": email_id,
+                "contact_id": contact_id,
+                "run_id": run_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            db.collection(f"marketing_runs/{run_id}/emails").document(email_id).set(email_doc)
 
-        done += 1
-        db.collection("marketing_runs").document(run_id).update({"done": done})
+            done += 1
+            db.collection("marketing_runs").document(run_id).update({"done": done})
 
-        # レート制限回避
-        if done < len(contact_ids):
-            await asyncio.sleep(1.5)
+            # レート制限回避
+            if done < len(contact_ids):
+                await asyncio.sleep(1.5)
 
     db.collection("marketing_runs").document(run_id).update(
         {"status": "done", "email_count": done}
@@ -494,7 +514,7 @@ def _build_email_system_prompt(purpose: str, context: str, assets: list[dict]) -
 
 
 def _find_contact(db: Any, contact_id: str) -> dict | None:
-    """全イベントのバッチからコンタクトを検索する。"""
+    """全イベントのバッチからコンタクトを検索する（db はスペース前置済み）。"""
     events = db.collection("events").get()
     for ev in events:
         # batches/{bid} は実体化されない幽霊ドキュメントのため list_documents() で列挙する

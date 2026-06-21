@@ -11,11 +11,11 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from firebase_admin import firestore
 from pydantic import BaseModel
 
-from dependencies import get_current_user
+from dependencies import get_space_context
 from ontology import CostSummary, EventStatus, EventType
+from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +42,9 @@ class CreateEventRequest(BaseModel):
 
 
 @router.get("")
-async def list_events(user: dict = Depends(get_current_user)):
+async def list_events(space: SpaceContext = Depends(get_space_context)):
     """登録されているすべてのイベントを返す。Sources パネルの一覧表示に使用。"""
-    docs = firestore.client().collection("events").get()
+    docs = space.col("events").get()
     events = [d.to_dict() for d in docs]
     # 日付降順でソート
     events.sort(key=lambda e: e.get("event_date", ""), reverse=True)
@@ -52,13 +52,12 @@ async def list_events(user: dict = Depends(get_current_user)):
 
 
 @router.get("/summary")
-async def events_summary(user: dict = Depends(get_current_user)):
+async def events_summary(space: SpaceContext = Depends(get_space_context)):
     """全イベントの横断サマリを返す。イベント未選択時の右ペイン表示に使用。
 
     各イベントごとに KPI（来場・名刺）と費用合計を集計し、全体の合計値も付与する。
     """
-    db = firestore.client()
-    event_docs = db.collection("events").get()
+    event_docs = space.col("events").get()
     events_data = [d.to_dict() for d in event_docs]
     events_data.sort(key=lambda e: e.get("event_date", ""), reverse=True)
 
@@ -69,12 +68,12 @@ async def events_summary(user: dict = Depends(get_current_user)):
     for ev in events_data:
         event_id = ev.get("event_id")
 
-        kpi_docs = db.collection(f"events/{event_id}/kpi").get()
+        kpi_docs = space.col(f"events/{event_id}/kpi").get()
         kpi = kpi_docs[0].to_dict() if kpi_docs else None
         visitors = (kpi or {}).get("total_visitors_to_booth", 0)
         contacts = (kpi or {}).get("total_contacts_collected", 0)
 
-        cost_docs = db.collection(f"events/{event_id}/costs").get()
+        cost_docs = space.col(f"events/{event_id}/costs").get()
         cost_total = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
 
         total_cost += cost_total
@@ -106,7 +105,7 @@ async def events_summary(user: dict = Depends(get_current_user)):
 @router.post("", status_code=201)
 async def create_event(
     body: CreateEventRequest,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """新規イベントを作成する。"""
     now = _now_iso()
@@ -126,14 +125,14 @@ async def create_event(
         "created_at": now,
         "updated_at": now,
     }
-    firestore.client().collection("events").document(event_id).set(event_doc)
+    space.col("events").document(event_id).set(event_doc)
     return event_doc
 
 
 @router.get("/{event_id}")
-async def get_event(event_id: str, user: dict = Depends(get_current_user)):
+async def get_event(event_id: str, space: SpaceContext = Depends(get_space_context)):
     """指定したイベントの詳細を返す。"""
-    doc = firestore.client().collection("events").document(event_id).get()
+    doc = space.col("events").document(event_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Event not found")
     return doc.to_dict()
@@ -143,41 +142,40 @@ async def get_event(event_id: str, user: dict = Depends(get_current_user)):
 async def update_event(
     event_id: str,
     body: dict,
-    user: dict = Depends(get_current_user),
+    space: SpaceContext = Depends(get_space_context),
 ):
     """イベントの情報を更新する。"""
-    db = firestore.client()
-    doc = db.collection("events").document(event_id).get()
+    ref = space.col("events").document(event_id)
+    doc = ref.get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Event not found")
     body["updated_at"] = _now_iso()
     body.pop("event_id", None)
-    db.collection("events").document(event_id).update(body)
+    ref.update(body)
     return {**doc.to_dict(), **body}
 
 
 @router.delete("/{event_id}", status_code=204)
-async def delete_event(event_id: str, user: dict = Depends(get_current_user)):
+async def delete_event(event_id: str, space: SpaceContext = Depends(get_space_context)):
     """イベント本体と配下の全サブコレクション（kpi/survey/costs/reports/
     batches/contacts）を再帰削除する。
 
     integration_batches / data_lineage は event_id 参照のメタデータとして残る
     （削除済みイベントを指すダングリングは許容）。
     """
-    db = firestore.client()
-    ref = db.collection("events").document(event_id)
+    ref = space.col("events").document(event_id)
     if not ref.get().exists:
         raise HTTPException(status_code=404, detail="Event not found")
-    db.recursive_delete(ref)
+    space.db.recursive_delete(ref)
     return None
 
 
 # ── KPI ──────────────────────────────────────────────────────────────────────
 
 @router.get("/{event_id}/kpi")
-async def get_event_kpi(event_id: str, user: dict = Depends(get_current_user)):
+async def get_event_kpi(event_id: str, space: SpaceContext = Depends(get_space_context)):
     """指定したイベントの KPI を返す。"""
-    docs = firestore.client().collection(f"events/{event_id}/kpi").get()
+    docs = space.col(f"events/{event_id}/kpi").get()
     kpis = [d.to_dict() for d in docs]
     return {"kpi": kpis[0] if kpis else None}
 
@@ -185,9 +183,9 @@ async def get_event_kpi(event_id: str, user: dict = Depends(get_current_user)):
 # ── Survey ────────────────────────────────────────────────────────────────────
 
 @router.get("/{event_id}/survey")
-async def get_event_survey(event_id: str, user: dict = Depends(get_current_user)):
+async def get_event_survey(event_id: str, space: SpaceContext = Depends(get_space_context)):
     """指定したイベントのアンケート集計を返す。"""
-    docs = firestore.client().collection(f"events/{event_id}/survey").get()
+    docs = space.col(f"events/{event_id}/survey").get()
     surveys = [d.to_dict() for d in docs]
     return {"survey": surveys[0] if surveys else None}
 
@@ -195,9 +193,9 @@ async def get_event_survey(event_id: str, user: dict = Depends(get_current_user)
 # ── Costs ─────────────────────────────────────────────────────────────────────
 
 @router.get("/{event_id}/costs")
-async def get_event_costs(event_id: str, user: dict = Depends(get_current_user)):
+async def get_event_costs(event_id: str, space: SpaceContext = Depends(get_space_context)):
     """指定したイベントの費用明細と集計を返す。"""
-    docs = firestore.client().collection(f"events/{event_id}/costs").get()
+    docs = space.col(f"events/{event_id}/costs").get()
     costs = [d.to_dict() for d in docs]
     total = sum(c.get("amount_jpy", 0) for c in costs)
     by_category: dict[str, float] = {}
