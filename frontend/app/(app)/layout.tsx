@@ -61,6 +61,10 @@ function AppShell({ userEmail, children }: { userEmail: string; children: React.
               イベントマーケティング
             </Link>
             <SpaceSwitcher />
+            <nav className="flex items-center gap-1 text-sm">
+              <NavLink href="/dashboard" label="ダッシュボード" />
+              <NavLink href="/explorer" label="データ" />
+            </nav>
           </div>
           <UserMenu userEmail={userEmail} />
         </div>
@@ -70,6 +74,21 @@ function AppShell({ userEmail, children }: { userEmail: string; children: React.
         {children}
       </main>
     </div>
+  );
+}
+
+function NavLink({ href, label }: { href: string; label: string }) {
+  const pathname = usePathname();
+  const active = pathname === href || pathname.startsWith(`${href}/`);
+  return (
+    <Link
+      href={href}
+      className={`px-2.5 py-1.5 rounded-md ${
+        active ? "bg-brand-50 text-brand-700 font-medium" : "text-gray-600 hover:bg-gray-50"
+      }`}
+    >
+      {label}
+    </Link>
   );
 }
 
