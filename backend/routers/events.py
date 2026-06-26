@@ -68,10 +68,9 @@ async def events_summary(space: SpaceContext = Depends(get_space_context)):
     for ev in events_data:
         event_id = ev.get("event_id")
 
-        kpi_docs = space.col(f"events/{event_id}/kpi").get()
-        kpi = kpi_docs[0].to_dict() if kpi_docs else None
-        visitors = (kpi or {}).get("total_visitors_to_booth", 0)
-        contacts = (kpi or {}).get("total_contacts_collected", 0)
+        # ADR-008: KPI は Event ドキュメントに畳み込み済み
+        visitors = ev.get("total_visitors_to_booth") or 0
+        contacts = ev.get("total_contacts_collected") or 0
 
         cost_docs = space.col(f"events/{event_id}/costs").get()
         cost_total = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
@@ -170,24 +169,38 @@ async def delete_event(event_id: str, space: SpaceContext = Depends(get_space_co
     return None
 
 
-# ── KPI ──────────────────────────────────────────────────────────────────────
+# ── KPI（ADR-008: Event ドキュメントに畳み込み済み）──────────────────────────
+
+_KPI_FIELDS = (
+    "total_visitors_to_booth", "total_contacts_collected", "appointments_booked",
+    "demo_sessions_held", "follow_email_open_rate", "follow_email_reply_rate",
+    "pipeline_value_jpy", "closed_deals_3m", "closed_revenue_3m_jpy",
+)
+_SURVEY_FIELDS = ("nps_score", "total_survey_responses")
+
 
 @router.get("/{event_id}/kpi")
 async def get_event_kpi(event_id: str, space: SpaceContext = Depends(get_space_context)):
-    """指定したイベントの KPI を返す。"""
-    docs = space.col(f"events/{event_id}/kpi").get()
-    kpis = [d.to_dict() for d in docs]
-    return {"kpi": kpis[0] if kpis else None}
+    """指定したイベントの KPI を返す（Event ドキュメントから抽出）。"""
+    doc = space.col("events").document(event_id).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Event not found")
+    data = doc.to_dict() or {}
+    kpi = {k: data[k] for k in _KPI_FIELDS if k in data}
+    return {"kpi": kpi if kpi else None}
 
 
 # ── Survey ────────────────────────────────────────────────────────────────────
 
 @router.get("/{event_id}/survey")
 async def get_event_survey(event_id: str, space: SpaceContext = Depends(get_space_context)):
-    """指定したイベントのアンケート集計を返す。"""
-    docs = space.col(f"events/{event_id}/survey").get()
-    surveys = [d.to_dict() for d in docs]
-    return {"survey": surveys[0] if surveys else None}
+    """指定したイベントのアンケート集計を返す（Event ドキュメントから抽出）。"""
+    doc = space.col("events").document(event_id).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Event not found")
+    data = doc.to_dict() or {}
+    survey = {k: data[k] for k in _SURVEY_FIELDS if k in data}
+    return {"survey": survey if survey else None}
 
 
 # ── Costs ─────────────────────────────────────────────────────────────────────

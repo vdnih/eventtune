@@ -30,23 +30,54 @@ async def list_segments(space: SpaceContext = Depends(get_space_context)):
 
 @router.get("/{segment_id}")
 async def get_segment(segment_id: str, space: SpaceContext = Depends(get_space_context)):
-    """セグメント定義と、割り当て結果（根拠つき）を返す。"""
+    """セグメント定義と、最新スナップショットの割り当て結果（根拠つき）を返す。"""
     doc = space.col("segments").document(segment_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Segment not found")
-    assignments = [
-        a.to_dict() for a in space.col(f"segments/{segment_id}/assignments").get()
-    ]
+
+    # 最新スナップショットを取得
+    snap_docs = list(space.col(f"segments/{segment_id}/snapshots").get())
+    snap_docs.sort(key=lambda d: d.to_dict().get("created_at", ""), reverse=True)
+    latest_snap = snap_docs[0] if snap_docs else None
+
+    assignments: list[dict] = []
     by_bucket: dict[str, int] = {}
-    for a in assignments:
-        b = a.get("bucket", "")
-        by_bucket[b] = by_bucket.get(b, 0) + 1
+    snapshot_id = None
+    if latest_snap:
+        snapshot_id = latest_snap.id
+        assignments = [
+            a.to_dict()
+            for a in space.col(
+                f"segments/{segment_id}/snapshots/{snapshot_id}/assignments"
+            ).get()
+        ]
+        snap_data = latest_snap.to_dict()
+        by_bucket = snap_data.get("by_bucket", {})
+
+    if not by_bucket:
+        for a in assignments:
+            b = a.get("bucket", "")
+            by_bucket[b] = by_bucket.get(b, 0) + 1
+
     return {
         "segment": doc.to_dict(),
+        "snapshot_id": snapshot_id,
         "assignments": assignments,
         "by_bucket": by_bucket,
         "total": len(assignments),
     }
+
+
+@router.get("/{segment_id}/snapshots")
+async def list_snapshots(segment_id: str, space: SpaceContext = Depends(get_space_context)):
+    """セグメントのスナップショット一覧を返す（バージョン履歴）。"""
+    doc = space.col("segments").document(segment_id).get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Segment not found")
+    snap_docs = list(space.col(f"segments/{segment_id}/snapshots").get())
+    snapshots = [d.to_dict() for d in snap_docs]
+    snapshots.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+    return {"snapshots": snapshots, "count": len(snapshots)}
 
 
 @router.get("/{segment_id}/patterns")

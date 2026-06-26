@@ -89,7 +89,8 @@ async def get_run_status(
         "purpose": data.get("purpose"),
         "total": data.get("total", 0),
         "done": data.get("done", 0),
-        "email_count": data.get("email_count", 0),
+        "deliverable_count": data.get("deliverable_count", 0),
+        "snapshot_id": data.get("snapshot_id"),
         "error": data.get("error"),
     }
 
@@ -99,9 +100,9 @@ async def get_run_results(
     run_id: str,
     space: SpaceContext = Depends(get_space_context),
 ):
-    """生成されたメール一覧を返す。"""
-    emails = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/emails").get()]
-    return {"emails": emails, "count": len(emails)}
+    """生成された成果物（Deliverable）一覧を返す。"""
+    deliverables = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/deliverables").get()]
+    return {"deliverables": deliverables, "count": len(deliverables)}
 
 
 @router.get("/runs/{run_id}/export")
@@ -109,22 +110,23 @@ async def export_run_results(
     run_id: str,
     space: SpaceContext = Depends(get_space_context),
 ):
-    """生成されたメールを CSV でエクスポートする。"""
-    emails = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/emails").get()]
-    if not emails:
-        raise HTTPException(status_code=404, detail="メールがまだ生成されていません")
+    """生成された成果物を CSV でエクスポートする。"""
+    deliverables = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/deliverables").get()]
+    if not deliverables:
+        raise HTTPException(status_code=404, detail="成果物がまだ生成されていません")
 
     rows = []
-    for email in emails:
-        blocks = email.get("blocks", [])
+    for dlv in deliverables:
+        blocks = dlv.get("blocks", [])
         full_text = "\n\n".join(b.get("block_text", "") for b in blocks)
         reasons = "\n".join(
             f"[{b.get('block_type','')}] {b.get('reason_for_inclusion','')}"
             for b in blocks
         )
         rows.append({
-            "contact_id": email.get("contact_id", ""),
-            "件名": email.get("subject", ""),
+            "person_id": dlv.get("person_id", ""),
+            "bucket": dlv.get("bucket", ""),
+            "件名": dlv.get("subject", ""),
             "本文（全体）": full_text,
             "包含根拠": reasons,
         })
@@ -137,5 +139,5 @@ async def export_run_results(
     return StreamingResponse(
         buf,
         media_type="text/csv; charset=utf-8-sig",
-        headers={"Content-Disposition": f"attachment; filename=emails_{run_id[:8]}.csv"},
+        headers={"Content-Disposition": f"attachment; filename=deliverables_{run_id[:8]}.csv"},
     )

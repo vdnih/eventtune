@@ -18,32 +18,37 @@ build_agent(db) で構築する。詳細は docs/PHILOSOPHY_AND_NAMING.md。
 
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
 
+import pandas as pd
 from google import genai
 from google.adk.agents import Agent
+from google.adk.code_executors.built_in_code_executor import BuiltInCodeExecutor
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools import ToolContext
 from google.genai import types
 from pydantic import BaseModel
 
 from metering import metered, record_compute, record_llm, record_llm_response
 from ontology import (
-    CostSummary,
-    ComposedEmail,
-    EmailBlock,
+    Deliverable,
+    DeliverableBlock,
     Segment,
     SegmentAxis,
 )
 from segmentation import assign_contacts_to_segment
 from space import SpaceContext
+from space_data import load_space_data
 
 logger = logging.getLogger(__name__)
 
 _MODEL = "gemini-3.1-flash-lite"
+_DATA_DIR = "/tmp/space_data"
 
 
 def _normalize_buckets(buckets: Any) -> list[str] | dict:
@@ -80,6 +85,7 @@ def _normalize_buckets(buckets: Any) -> list[str] | dict:
 
     return cleaned
 
+
 # ── システムプロンプト ────────────────────────────────────────────────────────
 # 背景思想: docs/MARKETING_PHILOSOPHY.md（Static Core & Dynamic Context）。
 # 下記【ブランドの一貫性】ブロックは同ドキュメント第4節のガードレールを実装したもの。
@@ -98,16 +104,16 @@ _SYSTEM_PROMPT = """\
 - Historical Intelligence: イベントをまたいだ蓄積・比較・学習が価値を持つ
 
 【オントロジーの定義】
-- Event: 展示会・セミナー・イベントの記録。KPI・費用・参加者を持つ
-- Contact: 人物（ハウスリストの連絡先）。ContactStage と EngagementLevel を持つ
+- Event: 展示会・セミナー・イベントの記録。KPI・費用を直接保持する
+- Person: ハウスリストの人物（旧 Contact）。ContactStage と EngagementLevel を持つ
   - ContactStage: LEAD / MQL / SQL / CUSTOMER / EXCLUDED
   - EngagementLevel (stage=LEAD のとき有効): アポ獲得済み / アポなし・感度高 / 通常リード
-- EventKPI: イベントの定量成果（来場者数・アポ数・パイプライン額など）
-- SurveyResponse: 参加者アンケート集計（NPS・満足度・バーバティムコメント）
-- CostItem: イベントの費用明細
-- ContentAsset: 推薦可能なコンテンツ（資料・事例・セミナー等）
-- ComposedEmail: AIが生成したメール。EmailBlock のリストで構成される
-  - EmailBlock.reason_for_inclusion: そのブロックを含めた理由（必須・非null）
+- Account: 企業マスター。Person に account_id で紐づく
+- EventAttendance: イベント × Person のファクトテーブル（誰がどのイベントに参加したか）
+- ProductInterest: 製品 × Person のファクトテーブル（誰がどの製品に関心を持つか）
+- Content: 推薦可能なコンテンツ（資料・事例・セミナー等）
+- Deliverable: AIが生成したメール等の成果物。DeliverableBlock のリストで構成
+  - DeliverableBlock.reason_for_inclusion: そのブロックを含めた理由（必須・非null）
 
 【あなたの役割】
 プロのマーケターとして、ユーザーの曖昧な意図を読み解き、進め方をあなた自身が組み立てて
@@ -119,13 +125,43 @@ ROI計算が必要な場合の公式:
   cost_per_contact = total_cost_jpy / total_contacts_collected
   cost_per_appointment = total_cost_jpy / appointments_booked
 
+【データ分析 — get_space_data + コード実行】
+データを分析するときは以下の手順で:
+1. get_space_data() を呼ぶ（セッション内で1回だけでよい）
+   → スキーマと件数が返る。Parquet ファイルが /tmp/space_data/ に書き出される。
+
+2. コード実行ブロックで Parquet を pandas として読み込む:
+
+   import pandas as pd
+   DATA_DIR = "/tmp/space_data"
+   persons           = pd.read_parquet(f"{DATA_DIR}/persons.parquet")
+   events            = pd.read_parquet(f"{DATA_DIR}/events.parquet")
+   event_attendances = pd.read_parquet(f"{DATA_DIR}/event_attendances.parquet")
+   product_interests = pd.read_parquet(f"{DATA_DIR}/product_interests.parquet")
+   accounts          = pd.read_parquet(f"{DATA_DIR}/accounts.parquet")
+   products          = pd.read_parquet(f"{DATA_DIR}/products.parquet")
+   contents          = pd.read_parquet(f"{DATA_DIR}/contents.parquet")
+
+3. numpy (import numpy as np), pandas (import pandas as pd) が利用可能。
+4. コサイン類似度（appeal_vector 列の比較）:
+   import numpy as np
+   def cosine(a, b):
+       a, b = np.array(a), np.array(b)
+       return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+5. Parquet はセッション中ディスクに残るため再ロード不要。
+   get_space_data() を再呼び出しすれば最新データに更新される。
+
+各フィールドの型は get_space_data() の返り値の schema フィールドを参照すること。
+
 【個別カスタマイズ（メール等）の進め方 — セグメント方式 + HIL】
 全コンタクトに1通ずつフル生成するのではなく、少数のセグメントに切り分け、セグメント単位で
 コンテンツのパターンを作り、各コンタクトのメールは決定論的に組み立てます（高速・低コスト）。
 
 あなたが自律的に進める標準の流れ（ただし各ゲートで必ず確認を取ること = Human-In-the-Loop）:
-  1. 対象を特定し（get_event_* 等）、コンタクトの分布を踏まえて**適切なセグメント軸を自分で設計**する
-     （例: 課題感 × 購買意欲）。→ 「この軸で切り分けます。よろしいですか？」と提案し**承認を待つ**。
+  1. get_space_data() でデータをロードし、コード実行で Person の分布を把握して
+     **適切なセグメント軸を自分で設計**する（例: 課題感 × 購買意欲）。
+     → 「この軸で切り分けます。よろしいですか？」と提案し**承認を待つ**。
   2. 承認後に define_segment でセグメントを登録し、assign_segment で分類する。
      → 各バケットの人数と分類根拠の例を提示し、「この分類で進めます。修正は？」と**確認する**。
   3. 承認後に generate_patterns でバケットごとのコンテンツパターンを生成する。
@@ -143,13 +179,31 @@ ROI計算が必要な場合の公式:
 - 不変のコア（変えない）: 自社が提供する機能・価値、専門用語の定義、トーン＆マナー（ブランド資産）。
 
 文面に関わるとき（generate_patterns 等）は次のガードレールを守ること:
-  ① 捏造禁止: 提示する機能・解決策・効果は get_content_catalog で得たコンテンツ資産（ContentAsset）と
+  ① 捏造禁止: 提示する機能・解決策・効果は get_space_data で得た contents（Content）と
      自社プロダクトに実在するものに限定する。存在しない機能・誇張・本来と異なる用途を創作しない
      （相手の課題への過剰な迎合を禁ずる。解決策は必ずマスターに帰結させる）。
   ② 1機能フォーカス（押し売り禁止）: 個別アプローチでは、相手の課題に直結する「1つの機能」に絞って訴求する。
      一度に複数機能やプラットフォーム全体像を詰め込まない。
   ③ ブランド資産の維持: 文脈を個別最適化しても、トーン＆マナー・用語・言い回しはセグメント横断で一貫させる。
 """
+
+
+# ── スキーマテキスト生成 ──────────────────────────────────────────────────────
+
+def _build_schema_text() -> str:
+    """ontology.py の Pydantic モデル定義からスキーマ説明を自動生成する。"""
+    from ontology import (
+        Account, Content, Event, EventAttendance,
+        Person, Product, ProductInterest, Segment,
+    )
+    models = [Person, Event, Account, EventAttendance, ProductInterest, Product, Content, Segment]
+    lines = []
+    for model in models:
+        lines.append(f"\n{model.__name__}:")
+        for name, info in model.model_fields.items():
+            ann = str(info.annotation).replace("typing.", "")
+            lines.append(f"  {name}: {ann}")
+    return "\n".join(lines)
 
 
 # ── ツール定義（スペース束縛ファクトリ） ──────────────────────────────────────
@@ -161,106 +215,44 @@ ROI計算が必要な場合の公式:
 def make_tools(db: Any, space: SpaceContext) -> list:
     """スペース前置済み db を closure 束縛したツール群を返す。"""
 
-    def list_events() -> str:
-        """登録されているすべてのイベントの一覧を取得する。"""
-        docs = db.collection("events").get()
-        events = [d.to_dict() for d in docs]
-        return json.dumps(events, ensure_ascii=False, default=str)
-
-    def get_event_detail(event_id: str) -> str:
-        """指定したイベントの詳細情報を取得する。"""
-        doc = db.collection("events").document(event_id).get()
-        if not doc.exists:
-            return json.dumps({"error": f"event_id '{event_id}' not found"})
-        return json.dumps(doc.to_dict(), ensure_ascii=False, default=str)
-
-    def get_event_contacts(event_id: str, engagement_level: str = "") -> str:
+    def get_space_data(tool_context: ToolContext) -> str:
         """
-        指定したイベントのコンタクト一覧を取得する。
-        engagement_level を指定するとフィルタリングできる（例: "アポ獲得済み"）。
-        """
-        # NOTE: batches/{bid} ドキュメントは取り込み時に実体化されない（contacts のみ書き込む）
-        # ため、コレクションクエリ .get() では祖先パスの幽霊ドキュメントを拾えない。
-        # 幽霊ドキュメントも含めて列挙する .list_documents() を使う。
-        batches = db.collection(f"events/{event_id}/batches").list_documents()
-        contacts = []
-        for batch in batches:
-            coll = db.collection(f"events/{event_id}/batches/{batch.id}/contacts").get()
-            for c in coll:
-                data = c.to_dict()
-                if not engagement_level or data.get("engagement_level") == engagement_level:
-                    contacts.append(data)
-        return json.dumps(contacts, ensure_ascii=False, default=str)
+        スペースの全データを Firestore からロードし、Parquet ファイルとして書き出す。
+        分析コードを書く前に必ず呼ぶこと。同一セッションでは1回で十分。
 
-    def get_event_kpi(event_id: str) -> str:
-        """指定したイベントの KPI データを取得する。"""
-        docs = db.collection(f"events/{event_id}/kpi").get()
-        kpis = [d.to_dict() for d in docs]
-        return json.dumps(kpis[0] if kpis else {}, ensure_ascii=False, default=str)
+        Parquet ファイルは /tmp/space_data/ に書き出される。
+        コード実行で pd.read_parquet(f"{DATA_DIR}/{name}.parquet") として読み込む。
 
-    def get_event_survey(event_id: str) -> str:
-        """指定したイベントのアンケート集計データを取得する。"""
-        docs = db.collection(f"events/{event_id}/survey").get()
-        surveys = [d.to_dict() for d in docs]
-        return json.dumps(surveys[0] if surveys else {}, ensure_ascii=False, default=str)
+        Returns:
+            { loaded, data_dir, counts, schema }
+        """
+        data = load_space_data(space)
+        os.makedirs(_DATA_DIR, exist_ok=True)
 
-    def get_event_costs(event_id: str) -> str:
-        """
-        指定したイベントの費用明細とカテゴリ別集計（CostSummary）を取得する。
-        返却: { costs: [...], summary: { total_jpy: ..., by_category: {...} } }
-        """
-        docs = db.collection(f"events/{event_id}/costs").get()
-        costs = [d.to_dict() for d in docs]
-        total = sum(c.get("amount_jpy", 0) for c in costs)
-        by_category: dict[str, float] = {}
-        for c in costs:
-            cat = c.get("category", "その他")
-            by_category[cat] = by_category.get(cat, 0) + c.get("amount_jpy", 0)
-        summary = CostSummary(total_jpy=total, by_category=by_category)
+        datasets: dict[str, list] = {
+            "events": data.events,
+            "persons": data.persons,
+            "accounts": data.accounts,
+            "event_attendances": data.event_attendances,
+            "product_interests": data.product_interests,
+            "products": data.products,
+            "contents": data.contents,
+            "segments": data.segments,
+        }
+        counts: dict[str, int] = {}
+        for name, items in datasets.items():
+            df = pd.DataFrame([m.model_dump() for m in items]) if items else pd.DataFrame()
+            df.to_parquet(f"{_DATA_DIR}/{name}.parquet", index=False)
+            counts[name] = len(items)
+
+        tool_context.state["data_dir"] = _DATA_DIR
+        tool_context.state["data_loaded"] = True
+
+        schema = _build_schema_text()
         return json.dumps(
-            {"costs": costs, "summary": summary.model_dump()},
+            {"loaded": True, "data_dir": _DATA_DIR, "counts": counts, "schema": schema},
             ensure_ascii=False,
-            default=str,
         )
-
-    def get_all_events_summary() -> str:
-        """
-        すべてのイベントを横断した比較サマリーを返す。
-        振り返り・比較分析に使用する。
-        """
-        events = [d.to_dict() for d in db.collection("events").get()]
-        summaries = []
-        for ev in events:
-            eid = ev.get("event_id", "")
-            kpi_docs = db.collection(f"events/{eid}/kpi").get()
-            kpi = kpi_docs[0].to_dict() if kpi_docs else {}
-            cost_docs = db.collection(f"events/{eid}/costs").get()
-            total_cost = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
-            survey_docs = db.collection(f"events/{eid}/survey").get()
-            survey = survey_docs[0].to_dict() if survey_docs else {}
-
-            roi_pipeline = 0.0
-            if total_cost > 0 and kpi.get("pipeline_value_jpy", 0) > 0:
-                roi_pipeline = round(kpi["pipeline_value_jpy"] / total_cost * 100, 1)
-
-            summaries.append({
-                "event_id": eid,
-                "event_name": ev.get("name", ""),
-                "event_date": ev.get("event_date", ""),
-                "total_contacts": kpi.get("total_contacts_collected", 0),
-                "appointments_booked": kpi.get("appointments_booked", 0),
-                "roi_pipeline": roi_pipeline,
-                "total_cost_jpy": total_cost,
-                "pipeline_value_jpy": kpi.get("pipeline_value_jpy", 0),
-                "nps_score": survey.get("nps_score", None),
-            })
-        return json.dumps(summaries, ensure_ascii=False, default=str)
-
-    def get_content_catalog() -> str:
-        """推薦可能なコンテンツ資産（資料・事例・セミナー等）の一覧を取得する。"""
-        docs = db.collection("content_assets").get()
-        assets = [d.to_dict() for d in docs]
-        return json.dumps(assets, ensure_ascii=False, default=str)
 
     def save_report(event_id: str, report_type: str, content: str) -> str:
         """
@@ -330,28 +322,28 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
     def assign_segment(segment_id: str, event_id: str = "") -> str:
         """
-        登録済みセグメントに従って対象コンタクトを各バケットへ分類する（HILゲート①承認後）。
-        event_id を指定するとそのイベントのコンタクトのみ、未指定なら全コンタクトが対象。
+        登録済みセグメントに従って対象 Person を各バケットへ分類する（HILゲート①承認後）。
+        event_id を指定するとそのイベントの参加者のみ、未指定なら全 Person が対象。
 
         構造化フィールドで自明な分は決定論、意味判断が要る分のみ軽量モデルで判別する。
         各割り当てには根拠（reason）が残る。
 
         Returns:
-            { total, by_bucket, llm_contacts }（人数分布と分類根拠の概況）
+            { snapshot_id, total, by_bucket, llm_persons }（人数分布と分類根拠の概況）
         """
         doc = db.collection("segments").document(segment_id).get()
         if not doc.exists:
             return json.dumps({"error": f"segment_id '{segment_id}' not found"})
         segment = Segment.model_validate(doc.to_dict())
         with metered(space):
-            summary = assign_contacts_to_segment(db, space, segment, event_id or None)
+            summary = assign_contacts_to_segment(space, segment, event_id or None)
         return json.dumps(summary, ensure_ascii=False)
 
     def generate_patterns(
         segment_id: str,
         purpose: str = "",
         context: str = "",
-        content_asset_ids: list[str] = [],
+        content_ids: list[str] = [],
     ) -> str:
         """
         バケットごとに1つずつコンテンツパターン（件名＋本文ブロック）を生成する（HILゲート②承認後）。
@@ -368,8 +360,8 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         segment = Segment.model_validate(doc.to_dict())
 
         assets = []
-        for asset_id in content_asset_ids:
-            a = db.collection("content_assets").document(asset_id).get()
+        for content_id in content_ids:
+            a = db.collection("contents").document(content_id).get()
             if a.exists:
                 assets.append(a.to_dict())
 
@@ -378,21 +370,26 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         with metered(space):
             for bucket in segment.buckets:
                 pattern = _generate_one_pattern(space, segment, bucket, eff_purpose, context, assets)
-                db.collection(f"segments/{segment_id}/patterns").document(bucket).set(pattern)
-                results.append({"bucket": bucket, "subject": pattern.get("subject", "")})
+                pattern_key = f"{bucket}__EMAIL"
+                db.collection(f"segments/{segment_id}/patterns").document(pattern_key).set(pattern)
+                results.append({"bucket": bucket, "pattern_key": pattern_key, "subject": pattern.get("subject", "")})
         return json.dumps(
             {"segment_id": segment_id, "patterns": results, "count": len(results)},
             ensure_ascii=False,
         )
 
-    def run_assembly(segment_id: str) -> str:
+    def run_assembly(segment_id: str, snapshot_id: str = "") -> str:
         """
-        セグメントの分類とパターンから、各コンタクトのメールを決定論的に組み立てる（HILゲート③の
+        セグメントの分類とパターンから、各 Person のメールを決定論的に組み立てる（HILゲート③の
         明示承認後にのみ呼ぶ）。LLMは使わずプレースホルダ置換で組み立てるため高速。
         結果は marketing_runs に保存し、CSVは GET /api/marketing/runs/{run_id}/export で取得できる。
 
+        Args:
+            segment_id: 対象セグメント
+            snapshot_id: 使用するスナップショット（省略時は最新）
+
         Returns:
-            { run_id, count }
+            { run_id, count, snapshot_id }
         """
         doc = db.collection("segments").document(segment_id).get()
         if not doc.exists:
@@ -407,19 +404,20 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         if not patterns:
             return json.dumps({"error": "パターンが未生成です。先に generate_patterns を実行してください"})
 
+        # スナップショット解決（省略時は最新）
+        if not snapshot_id:
+            snap_docs = list(db.collection(f"segments/{segment_id}/snapshots").get())
+            if not snap_docs:
+                return json.dumps({"error": "セグメント割り当てがありません。先に assign_segment を実行してください"})
+            snap_docs.sort(key=lambda d: d.to_dict().get("created_at", ""), reverse=True)
+            snapshot_id = snap_docs[0].id
+
         run_id = f"run_{uuid.uuid4().hex[:12]}"
-        count = _assemble_run(db, segment, patterns, run_id)
-        return json.dumps({"run_id": run_id, "count": count}, ensure_ascii=False)
+        count = _assemble_run(db, segment, patterns, run_id, snapshot_id)
+        return json.dumps({"run_id": run_id, "count": count, "snapshot_id": snapshot_id}, ensure_ascii=False)
 
     return [
-        list_events,
-        get_event_detail,
-        get_event_contacts,
-        get_event_kpi,
-        get_event_survey,
-        get_event_costs,
-        get_all_events_summary,
-        get_content_catalog,
+        get_space_data,
         save_report,
         define_segment,
         assign_segment,
@@ -438,6 +436,7 @@ def build_agent(db: Any, space: SpaceContext) -> Agent:
         description="イベントマーケティングAIエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
         instruction=_SYSTEM_PROMPT,
         tools=make_tools(db, space),
+        code_executor=BuiltInCodeExecutor(),
     )
 
 
@@ -486,8 +485,6 @@ async def chat_stream(
         )
 
     # 選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
-    # これによりエージェントは list_events での推測を省き、対象イベントの
-    # get_event_* 系ツールへ直接 event_id を渡せる。未選択時は従来どおり全体が対象。
     message_text = message
     if event_id:
         event_name = event_id
@@ -499,8 +496,7 @@ async def chat_stream(
             logger.warning("failed to load event context: event_id=%s", event_id)
         message_text = (
             f"[コンテキスト] ユーザーは現在「{event_name}」(event_id={event_id})を選択中です。"
-            "特定イベントへの問い合わせは、明示が無い限りこのイベントを対象として "
-            f"get_event_* 系ツールに event_id={event_id} を渡してください。\n\n"
+            "データを分析する場合は get_space_data() を呼んでからコード実行で絞り込んでください。\n\n"
             f"ユーザーの質問: {message}"
         )
 
@@ -553,10 +549,10 @@ async def chat_stream(
 
 # ── Stage 2a: バケット単位のコンテンツパターン生成 ───────────────────────────
 #
-# 文体ルールの唯一の情報源。全コンタクトへのフル生成はせず、バケットごとに1パターンのみ
+# 文体ルールの唯一の情報源。全 Person へのフル生成はせず、バケットごとに1パターンのみ
 # 生成する。本文中の個人差分はプレースホルダで表現し、組み立て時に決定論で置換する。
 
-# プレースホルダとして使える Contact フィールド
+# プレースホルダとして使える Person フィールド（account_name は fill 時に company_name として提供）
 _PLACEHOLDER_FIELDS = ("name", "company_name", "department", "job_title")
 
 
@@ -580,11 +576,7 @@ def _generate_one_pattern(
     context: str,
     assets: list[dict],
 ) -> dict:
-    """1バケットぶんのコンテンツパターンを生成して dict で返す。
-
-    必須ルールには docs/MARKETING_PHILOSOPHY.md（Static Core & Dynamic Context）第4節の
-    ガードレール（捏造禁止／1機能×1CEP／ブランド資産の維持）をプロンプトとして埋め込む。
-    """
+    """1バケットぶんのコンテンツパターンを生成して dict で返す。"""
     assets_text = json.dumps(assets, ensure_ascii=False, indent=2) if assets else "（なし）"
     system_prompt = f"""\
 あなたはプロのマーケターです。施策「{segment.name}」のために、あるセグメントへ送る
@@ -606,10 +598,10 @@ def _generate_one_pattern(
 【必須ルール】
 - 宛名や会社名など個人ごとに変わる箇所は、プレースホルダ {{name}} {{company_name}}
   {{department}} {{job_title}} で表現する（実名を埋め込まない）。
-- 各 EmailBlock に reason_for_inclusion（そのブロックをこのセグメントに含めた理由）を必ず記述する。
+- 各ブロックに reason_for_inclusion（そのブロックをこのセグメントに含めた理由）を必ず記述する。
 - 件名は20〜40文字程度、具体的で開封したくなるもの。
 - 本文はビジネス敬語（〜です・ます調）。1ブロック100〜200文字程度。
-- associated_asset_ids: 参照したコンテンツ資産の asset_id を設定する。
+- associated_asset_ids: 参照したコンテンツ資産の content_id を設定する。
 
 【ブランドの一貫性（必ず守る）】
 - 1機能フォーカス: このメールでは相手の課題に直結する「1つの機能（解決策）」のみを提示し、
@@ -640,24 +632,33 @@ def _generate_one_pattern(
 
 # ── Stage 2b: 決定論的な組み立て（LLM不使用） ────────────────────────────────
 
-def _fill(template: str, contact: dict) -> str:
-    """テンプレート中のプレースホルダを Contact の値で決定論的に置換する。"""
-    values = {f: str(contact.get(f, "") or "") for f in _PLACEHOLDER_FIELDS}
+def _fill(template: str, ctx: dict) -> str:
+    """テンプレート中のプレースホルダを Person/Account の値で決定論的に置換する。"""
+    values = {f: str(ctx.get(f, "") or "") for f in _PLACEHOLDER_FIELDS}
     for key, val in values.items():
         template = template.replace(f"{{{key}}}", val)
     return template
 
 
-def _assemble_run(db: Any, segment: Segment, patterns: dict[str, dict], run_id: str) -> int:
-    """割り当てとパターンから各コンタクトの ComposedEmail を組み立てて保存する。"""
+def _assemble_run(
+    db: Any,
+    segment: Segment,
+    patterns: dict[str, dict],
+    run_id: str,
+    snapshot_id: str,
+) -> int:
+    """割り当てとパターンから各 Person の Deliverable を組み立てて保存する。"""
     assignments = [
         a.to_dict()
-        for a in db.collection(f"segments/{segment.segment_id}/assignments").get()
+        for a in db.collection(
+            f"segments/{segment.segment_id}/snapshots/{snapshot_id}/assignments"
+        ).get()
     ]
     db.collection("marketing_runs").document(run_id).set({
         "run_id": run_id,
         "status": "running",
         "segment_id": segment.segment_id,
+        "snapshot_id": snapshot_id,
         "purpose": segment.purpose,
         "total": len(assignments),
         "done": 0,
@@ -666,54 +667,57 @@ def _assemble_run(db: Any, segment: Segment, patterns: dict[str, dict], run_id: 
 
     done = 0
     for asn in assignments:
-        contact_id = asn.get("contact_id", "")
+        person_id = asn.get("person_id", "")
         bucket = asn.get("bucket", "")
-        pattern = patterns.get(bucket)
+        # パターンキーは {bucket}__EMAIL 形式
+        pattern_key = f"{bucket}__EMAIL"
+        pattern = patterns.get(pattern_key) or patterns.get(bucket)
         if not pattern:
-            logger.warning("no pattern for bucket '%s' (contact %s)", bucket, contact_id)
+            logger.warning("no pattern for bucket '%s' (person %s)", bucket, person_id)
             continue
-        contact = _find_contact(db, contact_id) or {"contact_id": contact_id}
+
+        person_doc = db.collection("persons").document(person_id).get()
+        person = person_doc.to_dict() if person_doc.exists else {"person_id": person_id}
+
+        # Account から company_name を解決してプレースホルダ用コンテキストに追加
+        account_name = ""
+        account_id = person.get("account_id")
+        if account_id:
+            acc_doc = db.collection("accounts").document(account_id).get()
+            if acc_doc.exists:
+                account_name = acc_doc.to_dict().get("account_name", "")
+        fill_ctx = {**person, "company_name": account_name}
 
         blocks = [
-            EmailBlock(
+            DeliverableBlock(
                 block_type=b.get("block_type", ""),
                 reason_for_inclusion=b.get("reason_for_inclusion", ""),
                 associated_asset_ids=b.get("associated_asset_ids", []),
-                block_text=_fill(b.get("block_text", ""), contact),
+                block_text=_fill(b.get("block_text", ""), fill_ctx),
             )
             for b in pattern.get("blocks", [])
         ]
-        email_id = f"email_{uuid.uuid4().hex[:12]}"
-        email = ComposedEmail(
-            email_id=email_id,
-            contact_id=contact_id,
-            event_id=contact.get("source_event_id"),
+        deliverable_id = f"dlv_{uuid.uuid4().hex[:12]}"
+        deliverable = Deliverable(
+            deliverable_id=deliverable_id,
+            space_id=person.get("space_id", ""),
             run_id=run_id,
-            subject=_fill(pattern.get("subject", ""), contact),
+            person_id=person_id,
+            snapshot_id=snapshot_id,
+            pattern_id=pattern_key,
+            format="EMAIL",
+            bucket=bucket,
+            subject=_fill(pattern.get("subject", ""), fill_ctx),
             blocks=blocks,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        db.collection(f"marketing_runs/{run_id}/emails").document(email_id).set(email.model_dump())
+        db.collection(f"marketing_runs/{run_id}/deliverables").document(deliverable_id).set(
+            deliverable.model_dump()
+        )
         done += 1
 
     db.collection("marketing_runs").document(run_id).update(
-        {"status": "done", "done": done, "email_count": done}
+        {"status": "done", "done": done, "deliverable_count": done}
     )
     logger.info("assembly completed: run_id=%s segment=%s done=%d", run_id, segment.segment_id, done)
     return done
-
-
-def _find_contact(db: Any, contact_id: str) -> dict | None:
-    """全イベントのバッチからコンタクトを検索する（db はスペース前置済み）。"""
-    events = db.collection("events").get()
-    for ev in events:
-        # batches/{bid} は実体化されない幽霊ドキュメントのため list_documents() で列挙する
-        # （get_event_contacts と同じ理由）。
-        batches = db.collection(f"events/{ev.id}/batches").list_documents()
-        for batch in batches:
-            doc = db.document(
-                f"events/{ev.id}/batches/{batch.id}/contacts/{contact_id}"
-            ).get()
-            if doc.exists:
-                return doc.to_dict()
-    return None

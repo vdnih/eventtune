@@ -170,8 +170,7 @@ async def _run_integration(
 
     scoped = space.scoped_db()
     try:
-        scoped.collection("integration_batches").document(batch_id).update({"status": "processing"})
-        # コンピュート実行時間を計測（LLMトークンは process_batch 内で記録）
+        scoped.collection("integration_jobs").document(batch_id).update({"status": "processing"})
         with metered(space):
             results = await process_batch(files, batch_id, scoped, file_event_map, space=space)
 
@@ -183,24 +182,22 @@ async def _run_integration(
         any_ok = any(r.status == "done" for r in results)
         any_err = any(r.status == "error" for r in results)
         batch_status = "done" if any_ok else "error"
-        lineage_ids = [r.lineage_id for r in results if r.lineage_id]
+        child_job_ids = [r.job_id for r in results if r.job_id]
 
-        # 全ファイルから生成・指定された event_id を収集
         all_event_ids: list[str] = []
         for r in results:
             all_event_ids.extend(r.generated_event_ids)
         for ids in file_event_map.values():
             all_event_ids.extend(ids)
-        event_ids = list(dict.fromkeys(all_event_ids))  # 順序保持で重複除去
+        event_ids = list(dict.fromkeys(all_event_ids))
 
-        scoped.collection("integration_batches").document(batch_id).update({
+        scoped.collection("integration_jobs").document(batch_id).update({
             "status": batch_status,
             "files": [r.to_dict() for r in results],
             "created_entities": merged,
             "event_ids": event_ids,
             "event_id": event_ids[0] if event_ids else None,
-            "lineage_ids": lineage_ids,
-            "lineage_id": lineage_ids[0] if lineage_ids else None,
+            "child_job_ids": child_job_ids,
             "partial": any_ok and any_err,
         })
         logger.info(
@@ -211,7 +208,7 @@ async def _run_integration(
     except Exception as e:
         logger.exception("integration failed: batch_id=%s error=%s", batch_id, e)
         try:
-            scoped.collection("integration_batches").document(batch_id).update({
+            scoped.collection("integration_jobs").document(batch_id).update({
                 "status": "error",
                 "error": str(e)[:500],
             })
@@ -224,11 +221,11 @@ async def list_batches(
     event_id: str | None = None,
     space: SpaceContext = Depends(get_space_context),
 ):
-    """データ統合バッチの一覧を返す。event_id が指定された場合は絞り込む。"""
+    """データ統合ジョブの一覧を返す。event_id が指定された場合は絞り込む。"""
     if event_id:
-        docs = space.col("integration_batches").where("event_ids", "array_contains", event_id).get()
+        docs = space.col("integration_jobs").where("event_ids", "array_contains", event_id).get()
     else:
-        docs = space.col("integration_batches").get()
+        docs = space.col("integration_jobs").get()
     batches = [d.to_dict() for d in docs]
     batches.sort(key=lambda b: b.get("created_at", ""), reverse=True)
     return {"batches": batches, "count": len(batches)}
@@ -275,7 +272,7 @@ async def start_integration(
     filenames = [name for name, _ in loaded]
     all_event_ids = list(dict.fromkeys(eid for ids in parsed_map.values() for eid in ids))
 
-    space.col("integration_batches").document(batch_id).set({
+    space.col("integration_jobs").document(batch_id).set({
         "batch_id": batch_id,
         "filenames": filenames,
         "files": [{"filename": name, "status": "queued"} for name in filenames],
@@ -297,7 +294,7 @@ async def get_batch_status(
     space: SpaceContext = Depends(get_space_context),
 ):
     """バッチの処理状況と生成されたエンティティ数を返す。"""
-    doc = space.col("integration_batches").document(batch_id).get()
+    doc = space.col("integration_jobs").document(batch_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
     data = doc.to_dict()
@@ -320,29 +317,29 @@ async def get_batch_report(
     space: SpaceContext = Depends(get_space_context),
 ):
     """バッチの加工処理レポートを返す（Auditable AI）。"""
-    batch_doc = space.col("integration_batches").document(batch_id).get()
+    batch_doc = space.col("integration_jobs").document(batch_id).get()
     if not batch_doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
 
     batch = batch_doc.to_dict()
     status = batch.get("status")
-    lineage_ids = batch.get("lineage_ids") or ([batch["lineage_id"]] if batch.get("lineage_id") else [])
+    child_job_ids = batch.get("child_job_ids") or []
 
-    if status != "done" or not lineage_ids:
+    if status != "done" or not child_job_ids:
         return {
             "batch_id": batch_id,
             "status": status,
             "report": None,
             "reports": [],
-            "detail": "レポートは処理完了後に利用できます" if status != "done" else "lineage が見つかりません",
+            "detail": "レポートは処理完了後に利用できます" if status != "done" else "子ジョブが見つかりません",
             "error": batch.get("error"),
         }
 
     reports = []
-    for lid in lineage_ids:
-        lineage_doc = space.col("data_lineage").document(lid).get()
-        if lineage_doc.exists:
-            reports.append(_format_lineage_report(lineage_doc.to_dict()))
+    for jid in child_job_ids:
+        job_doc = space.col("integration_jobs").document(jid).get()
+        if job_doc.exists:
+            reports.append(_format_job_report(job_doc.to_dict()))
 
     return {
         "batch_id": batch_id,
@@ -357,24 +354,24 @@ async def get_batch_report(
     }
 
 
-def _format_lineage_report(lineage: dict) -> dict:
+def _format_job_report(job: dict) -> dict:
     return {
         "source": {
-            "filename": lineage.get("source_filename"),
-            "source_type": lineage.get("source_type"),
-            "batch_id": lineage.get("batch_id"),
-            "created_at": lineage.get("created_at"),
+            "filename": job.get("source_filename"),
+            "source_type": job.get("source_type"),
+            "batch_id": job.get("batch_id"),
+            "created_at": job.get("created_at"),
         },
         "stage1_ai": {
-            "column_mapping": lineage.get("column_mapping"),
-            "raw_extraction": lineage.get("raw_extraction"),
+            "column_mapping": job.get("column_mapping"),
+            "raw_extraction": job.get("raw_extraction"),
         },
         "stage2_transformations": {
-            "transformations": lineage.get("transformations", []),
-            "skipped_records": lineage.get("skipped_records", []),
+            "transformations": job.get("transformations", []),
+            "skipped_records": job.get("skipped_records", []),
         },
-        "summary": lineage.get("transformation_summary"),
-        "created_entity_ids": lineage.get("created_entity_ids", {}),
+        "summary": job.get("transformation_summary"),
+        "created_entities": job.get("created_entities", {}),
     }
 
 
@@ -383,17 +380,19 @@ async def get_batch_contacts(
     batch_id: str,
     space: SpaceContext = Depends(get_space_context),
 ):
-    """バッチで取り込まれたコンタクト一覧を返す（複数イベントにまたがる場合も対応）。"""
-    batch_doc = space.col("integration_batches").document(batch_id).get()
+    """バッチで取り込まれた Person 一覧を返す（source_job_id で逆引き）。"""
+    batch_doc = space.col("integration_jobs").document(batch_id).get()
     if not batch_doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
 
+    # child_job_ids に含まれる各ジョブで作成された Person を source_job_id で引く
     data = batch_doc.to_dict()
-    event_ids = data.get("event_ids") or ([data["event_id"]] if data.get("event_id") else ["unknown"])
+    child_job_ids: list[str] = data.get("child_job_ids") or []
+    target_ids = set(child_job_ids) | {batch_id}
 
-    contacts: list[dict] = []
-    for eid in event_ids:
-        snap = space.col(f"events/{eid}/batches/{batch_id}/contacts").get()
-        contacts.extend(s.to_dict() for s in snap)
+    persons: list[dict] = []
+    for job_id in target_ids:
+        snap = space.col("persons").where("source_job_id", "==", job_id).get()
+        persons.extend(s.to_dict() for s in snap)
 
-    return {"contacts": contacts, "count": len(contacts)}
+    return {"contacts": persons, "count": len(persons)}

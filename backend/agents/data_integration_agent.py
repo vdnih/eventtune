@@ -26,15 +26,16 @@ from agents.ontology_mapper import OntologyMapper
 from metering import record_llm_response
 from space import SpaceContext
 from ontology import (
+    Account,
     ColumnMappingResult,
-    Contact,
-    ContentAsset,
+    Content,
     CostItem,
-    DataLineage,
     DocumentExtractionResult,
     Event,
-    EventKPI,
-    SurveyResponse,
+    EventAttendance,
+    IntegrationJob,
+    Person,
+    ProductInterest,
     TransformationSummary,
 )
 
@@ -376,23 +377,29 @@ def _find_existing_event_by_name(db: Any, name: str) -> str | None:
 
 # ── Firestore パス解決 ─────────────────────────────────────────────────────────
 
-def _entity_to_firestore_path(
-    entity: Any, event_id: str | None, batch_id: str | None
-) -> tuple[str | None, str | None]:
-    if isinstance(entity, Contact):
-        eid = entity.source_event_id or event_id or "unknown"
-        bid = batch_id or "unknown"
-        return f"events/{eid}/batches/{bid}/contacts", entity.contact_id
+_KPI_SURVEY_FIELDS = frozenset({
+    "total_visitors_to_booth", "total_contacts_collected", "appointments_booked",
+    "demo_sessions_held", "follow_email_open_rate", "follow_email_reply_rate",
+    "pipeline_value_jpy", "closed_deals_3m", "closed_revenue_3m_jpy",
+    "nps_score", "total_survey_responses", "updated_at",
+})
+
+
+def _entity_to_firestore_path(entity: Any) -> tuple[str | None, str | None]:
+    if isinstance(entity, Person):
+        return "persons", entity.person_id
+    if isinstance(entity, Account):
+        return "accounts", entity.account_id
+    if isinstance(entity, EventAttendance):
+        return "event_attendances", entity.attendance_id
+    if isinstance(entity, ProductInterest):
+        return "product_interests", entity.interest_id
     if isinstance(entity, Event):
         return "events", entity.event_id
-    if isinstance(entity, EventKPI):
-        return f"events/{entity.event_id}/kpi", entity.kpi_id
     if isinstance(entity, CostItem):
         return f"events/{entity.event_id}/costs", entity.cost_id
-    if isinstance(entity, SurveyResponse):
-        return f"events/{entity.event_id}/survey", entity.survey_id
-    if isinstance(entity, ContentAsset):
-        return "content_assets", entity.asset_id
+    if isinstance(entity, Content):
+        return "contents", entity.content_id
     return None, None
 
 
@@ -405,7 +412,7 @@ async def process_file(
     batch_id: str,
     db: Any,  # space.ScopedClient（スペース前置済み）
     space: Optional[SpaceContext] = None,
-) -> tuple[list[Any], DataLineage]:
+) -> tuple[list[Any], IntegrationJob]:
     """
     1ファイルを処理してオントロジーエンティティを生成し、Firestore に保存する。
 
@@ -416,13 +423,12 @@ async def process_file(
                     候補イベント名を抽出AIに与え、名前ベース照合で各イベントへ統合する。
 
     Returns:
-        (entities, lineage): 生成されたエンティティのリストと DataLineage レコード
+        (entities, job): 生成されたエンティティのリストと IntegrationJob レコード
     """
-    # 単一指定のときだけ event_id を固定。複数/未指定は None にして
-    # 名前ベース照合（候補イベント）または AI 生成に委ねる。
+    job_id = _new_id("job_")
+    space_id = space.space_id if space is not None else ""
+
     event_id: str | None = event_ids[0] if len(event_ids) == 1 else None
-    # 紐づけ先イベント名を抽出AIに与え、抽出 Event 名を確定イベント名と一致させる
-    # （merge 書き込みでユーザー確定名が AI 命名に上書きされるのを防ぐ）。
     candidate_event_names: list[str] = []
     for eid in event_ids:
         snap = db.document(f"events/{eid}").get()
@@ -431,8 +437,8 @@ async def process_file(
             if name:
                 candidate_event_names.append(name)
     logger.info(
-        "process_file: filename=%s batch_id=%s event_id=%s candidates=%s",
-        filename, batch_id, event_id, candidate_event_names,
+        "process_file: filename=%s job_id=%s event_id=%s candidates=%s",
+        filename, job_id, event_id, candidate_event_names,
     )
 
     entities: list[Any] = []
@@ -449,8 +455,7 @@ async def process_file(
                     column_mapping.entity_type, len(column_mapping.column_map), column_mapping.event_routing_column)
 
         routing_col = column_mapping.event_routing_column
-        if routing_col and column_mapping.entity_type == "contacts":
-            # イベントルーティング列がある場合: 列の値でグループ化し各グループを別イベントとして処理
+        if routing_col and column_mapping.entity_type in ("contacts", "persons"):
             groups: dict[str, list[dict]] = {}
             for row in rows:
                 key = str(row.get(routing_col, "")).strip()
@@ -460,14 +465,14 @@ async def process_file(
             all_transformations: list[Any] = []
             all_skipped: list[Any] = []
             for event_name, group_rows in groups.items():
-                # イベント名でFirestoreを検索して event_id を解決
-                group_event_id = event_id  # 明示指定がある場合はそれを優先
+                group_event_id = event_id
                 if not group_event_id and event_name:
                     snap = db.collection("events").where("name", "==", event_name).limit(1).get()
                     if snap:
                         group_event_id = snap[0].id
                 e_list, t_list, s_list = _mapper.map_rows(
-                    column_mapping, group_rows, event_id=group_event_id, batch_id=batch_id
+                    column_mapping, group_rows,
+                    event_id=group_event_id, space_id=space_id, job_id=job_id,
                 )
                 all_entities.extend(e_list)
                 all_transformations.extend(t_list)
@@ -475,7 +480,8 @@ async def process_file(
             entities, transformations, skipped = all_entities, all_transformations, all_skipped
         else:
             entities, transformations, skipped = _mapper.map_rows(
-                column_mapping, rows, event_id=event_id, batch_id=batch_id
+                column_mapping, rows,
+                event_id=event_id, space_id=space_id, job_id=job_id,
             )
     else:
         # ─ パス B: テキスト / その他 ─────────────────────────────────────
@@ -486,54 +492,48 @@ async def process_file(
         raw_extraction_dict = extraction.model_dump()
         logger.info("document_extractor result: detected=%s", extraction.detected_entity_types)
         entities, transformations, skipped = _mapper.map_extraction(
-            extraction, event_id=event_id, batch_id=batch_id,
+            extraction, event_id=event_id, space_id=space_id, job_id=job_id,
             event_id_resolver=lambda name: _find_existing_event_by_name(db, name),
         )
 
     # Firestore に書き込み
     created_ids: dict[str, list[str]] = {}
-    # Contact が入った events/{eid}/batches/{bid} の親ドキュメントを実体化するため、
-    # コンタクトが書き込まれた event_id を記録する。
-    contact_event_ids: set[str] = set()
     for entity in entities:
-        collection, doc_id = _entity_to_firestore_path(entity, event_id, batch_id)
-        if collection and doc_id:
-            db.document(collection + "/" + doc_id).set(entity.model_dump(), merge=True)
-            key = type(entity).__name__
-            created_ids.setdefault(key, []).append(doc_id)
-            if isinstance(entity, Contact):
-                contact_event_ids.add(entity.source_event_id or event_id or "unknown")
-
-    # batches/{batch_id} ドキュメントを明示的に作成する。
-    # これを書かないと中間ドキュメントが「幽霊（サブコレクションのみの祖先）」となり、
-    # コレクションクエリ collection(".../batches").get() でバッチを列挙できなくなる。
-    for eid in contact_event_ids:
-        db.document(f"events/{eid}/batches/{batch_id}").set(
-            {"batch_id": batch_id, "event_id": eid}, merge=True
-        )
+        if isinstance(entity, Event) and not entity.name and not entity.created_at:
+            # KPI/Survey patch — 既存 Event ドキュメントへ KPI/Survey フィールドだけ merge
+            patch = {k: v for k, v in entity.model_dump().items()
+                     if k in _KPI_SURVEY_FIELDS and v is not None}
+            if patch:
+                db.document(f"events/{entity.event_id}").set(patch, merge=True)
+        else:
+            collection, doc_id = _entity_to_firestore_path(entity)
+            if collection and doc_id:
+                db.document(collection + "/" + doc_id).set(entity.model_dump(), merge=True)
+                key = type(entity).__name__
+                created_ids.setdefault(key, []).append(doc_id)
 
     logger.info("process_file done: created=%s", {k: len(v) for k, v in created_ids.items()})
 
-    # ステージ2（加工処理）のサマリを集計
     summary = _summarize_transformations(entities, transformations, skipped)
 
-    # DataLineage レコードを保存
-    lineage = DataLineage(
-        lineage_id=_new_id("lineage_"),
-        source_filename=filename,
-        source_type="tabular" if _is_tabular(filename) else "unstructured",
-        batch_id=batch_id,
+    # IntegrationJob レコードを保存
+    job = IntegrationJob(
+        job_id=job_id,
+        space_id=space_id,
+        filenames=[filename],
+        status="done",
+        created_entities={k: len(v) for k, v in created_ids.items()},
+        event_ids=event_ids,
         column_mapping=column_mapping,
         raw_extraction=raw_extraction_dict,
-        created_entity_ids=created_ids,
         transformations=transformations,
         skipped_records=skipped,
         transformation_summary=summary,
         created_at=_now_iso(),
     )
-    db.collection("data_lineage").document(lineage.lineage_id).set(lineage.model_dump())
+    db.collection("integration_jobs").document(job.job_id).set(job.model_dump())
 
-    return entities, lineage
+    return entities, job
 
 
 def _summarize_transformations(
@@ -548,12 +548,12 @@ def _summarize_transformations(
 
     for entity in entities:
         entity_counts[type(entity).__name__] = entity_counts.get(type(entity).__name__, 0) + 1
-        if isinstance(entity, Contact):
+        if isinstance(entity, Person):
             if entity.engagement_level:
                 lvl = entity.engagement_level.value
                 engagement_breakdown[lvl] = engagement_breakdown.get(lvl, 0) + 1
-            for product in entity.interested_products:
-                product_breakdown[product.value] = product_breakdown.get(product.value, 0) + 1
+        if isinstance(entity, ProductInterest):
+            product_breakdown[entity.product_id] = product_breakdown.get(entity.product_id, 0) + 1
 
     return TransformationSummary(
         entity_counts=entity_counts,
@@ -571,16 +571,16 @@ class BatchFileResult:
 
     filename: str
     status: str  # "done" | "error"
-    lineage_id: str | None = None
+    job_id: str | None = None
     created_entities: dict[str, int] = field(default_factory=dict)
     error: str | None = None
-    generated_event_ids: list[str] = field(default_factory=list)  # このファイルが生成した Event の id リスト
+    generated_event_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "filename": self.filename,
             "status": self.status,
-            "lineage_id": self.lineage_id,
+            "job_id": self.job_id,
             "created_entities": self.created_entities,
             "error": self.error,
         }
@@ -655,7 +655,7 @@ async def _process_one(
 ) -> BatchFileResult:
     """1ファイルを process_file で処理し、部分失敗を吸収して結果を返す。"""
     try:
-        entities, lineage = await process_file(filename, content, event_ids, batch_id, db, space=space)
+        entities, job = await process_file(filename, content, event_ids, batch_id, db, space=space)
         counts: dict[str, int] = {}
         for entity in entities:
             counts[type(entity).__name__] = counts.get(type(entity).__name__, 0) + 1
@@ -663,7 +663,7 @@ async def _process_one(
         return BatchFileResult(
             filename=filename,
             status="done",
-            lineage_id=lineage.lineage_id,
+            job_id=job.job_id,
             created_entities=counts,
             generated_event_ids=generated_event_ids,
         )
