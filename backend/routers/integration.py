@@ -5,10 +5,10 @@ Data Integration Router — /api/integration
 
   POST /api/integration/suggest-event  → AI がファイル内容を読みイベント候補を返す
   POST /api/integration/batches        → file_event_map 付きで実際の取り込みを開始
-  GET  /api/integration/batches        → バッチ一覧
-  GET  /api/integration/batches/{id}   → バッチ状態
-  GET  /api/integration/batches/{id}/report   → 加工レポート
-  GET  /api/integration/batches/{id}/contacts → 取り込み済みコンタクト
+  GET  /api/integration/batches/{id}   → バッチ状態の確認
+
+バッチ一覧・加工レポート・コンタクト一覧は廃止。
+データ閲覧は /api/data（汎用データブラウザ）で行う。
 """
 
 import json
@@ -60,7 +60,6 @@ class _FileSuggestion(BaseModel):
     confidence: float = 0.0
     is_new_event: bool = False
     is_multi_event: bool = False
-    # 新規（1件）/複数（N件）の場合に提示する仮タイトル候補。既存一致時は空。
     proposed_events: list[_ProposedEvent] = []
 
 
@@ -74,7 +73,6 @@ async def suggest_event(
     space: SpaceContext = Depends(get_space_context),
 ):
     """ファイルを受け取り、AIが既存イベントとの照合結果を返す（データは保存しない）。"""
-    # ファイルプレビューを構築（テキスト系は先頭500文字、バイナリはファイル名のみ）
     file_previews = []
     for f in files:
         content = await f.read()
@@ -85,7 +83,6 @@ async def suggest_event(
             preview = ""
         file_previews.append({"filename": filename, "preview": preview})
 
-    # 既存イベント一覧を取得
     events_snap = space.col("events").get()
     events_list = []
     for doc in events_snap:
@@ -117,8 +114,8 @@ async def suggest_event(
 - is_new_event: true = 新しいイベントとして取り込むべき（既存イベントに対応しない）
 - is_multi_event: true = このファイルには複数のイベントのデータが含まれる可能性がある
 - proposed_events: 新規作成すべきイベントの仮タイトル候補リスト。各要素は {{name, event_date, event_type}}。
-    - is_new_event が true（単一の新規イベント）→ proposed_events は **1件**。ファイル内容から推定した自然で具体的なイベント名を name に入れる。
-    - is_multi_event が true（複数イベントに分割）→ proposed_events は **分割される件数ぶん（複数件）**。各イベントの名前・日付・種別を入れる。
+    - is_new_event が true（単一の新規イベント）→ proposed_events は **1件**。
+    - is_multi_event が true（複数イベントに分割）→ proposed_events は **分割される件数ぶん（複数件）**。
     - 既存イベントに一致する場合 → proposed_events は **空リスト**。
   name は具体的に（例「2025春 ○○展示会」）。event_date は YYYY-MM-DD、不明なら null。
   event_type は「展示会」「セミナー」「プライベートイベント」のいずれか、不明なら null。
@@ -143,10 +140,7 @@ async def suggest_event(
 # ── バッチ処理 ─────────────────────────────────────────────────────────────────
 
 def _normalize_event_map(raw: dict) -> dict[str, list[str]]:
-    """file_event_map を {filename: [event_id, ...]} 形式に正規化する。
-
-    後方互換: 値が str なら [str]、null/空なら [] （AI が生成）、list なら空要素を除去。
-    """
+    """file_event_map を {index: [event_id, ...]} 形式に正規化する。"""
     normalized: dict[str, list[str]] = {}
     for filename, value in raw.items():
         if value is None or value == "":
@@ -171,7 +165,6 @@ async def _run_integration(
     scoped = space.scoped_db()
     try:
         scoped.collection("integration_batches").document(batch_id).update({"status": "processing"})
-        # コンピュート実行時間を計測（LLMトークンは process_batch 内で記録）
         with metered(space):
             results = await process_batch(files, batch_id, scoped, file_event_map, space=space)
 
@@ -185,13 +178,12 @@ async def _run_integration(
         batch_status = "done" if any_ok else "error"
         lineage_ids = [r.lineage_id for r in results if r.lineage_id]
 
-        # 全ファイルから生成・指定された event_id を収集
         all_event_ids: list[str] = []
         for r in results:
             all_event_ids.extend(r.generated_event_ids)
         for ids in file_event_map.values():
             all_event_ids.extend(ids)
-        event_ids = list(dict.fromkeys(all_event_ids))  # 順序保持で重複除去
+        event_ids = list(dict.fromkeys(all_event_ids))
 
         scoped.collection("integration_batches").document(batch_id).update({
             "status": batch_status,
@@ -219,21 +211,6 @@ async def _run_integration(
             pass
 
 
-@router.get("/batches")
-async def list_batches(
-    event_id: str | None = None,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """データ統合バッチの一覧を返す。event_id が指定された場合は絞り込む。"""
-    if event_id:
-        docs = space.col("integration_batches").where("event_ids", "array_contains", event_id).get()
-    else:
-        docs = space.col("integration_batches").get()
-    batches = [d.to_dict() for d in docs]
-    batches.sort(key=lambda b: b.get("created_at", ""), reverse=True)
-    return {"batches": batches, "count": len(batches)}
-
-
 @router.post("/batches", status_code=202)
 async def start_integration(
     background_tasks: BackgroundTasks,
@@ -256,8 +233,6 @@ async def start_integration(
             raise HTTPException(status_code=400, detail="file_event_map が不正な JSON です")
     norm_map = _normalize_event_map(raw_map)
 
-    # 空ファイルをスキップしつつ、元インデックスの割り当てを詰め直したインデックスへ再マップする
-    # （process_batch は loaded の並び順インデックスで参照するため整合させる）。
     loaded: list[tuple[str, bytes]] = []
     parsed_map: dict[str, list[str]] = {}
     for orig_idx, f in enumerate(files):
@@ -312,88 +287,3 @@ async def get_batch_status(
         "partial": data.get("partial", False),
         "error": data.get("error"),
     }
-
-
-@router.get("/batches/{batch_id}/report")
-async def get_batch_report(
-    batch_id: str,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """バッチの加工処理レポートを返す（Auditable AI）。"""
-    batch_doc = space.col("integration_batches").document(batch_id).get()
-    if not batch_doc.exists:
-        raise HTTPException(status_code=404, detail="Batch not found")
-
-    batch = batch_doc.to_dict()
-    status = batch.get("status")
-    lineage_ids = batch.get("lineage_ids") or ([batch["lineage_id"]] if batch.get("lineage_id") else [])
-
-    if status != "done" or not lineage_ids:
-        return {
-            "batch_id": batch_id,
-            "status": status,
-            "report": None,
-            "reports": [],
-            "detail": "レポートは処理完了後に利用できます" if status != "done" else "lineage が見つかりません",
-            "error": batch.get("error"),
-        }
-
-    reports = []
-    for lid in lineage_ids:
-        lineage_doc = space.col("data_lineage").document(lid).get()
-        if lineage_doc.exists:
-            reports.append(_format_lineage_report(lineage_doc.to_dict()))
-
-    return {
-        "batch_id": batch_id,
-        "status": status,
-        "cross_file_summary": {
-            "event_ids": batch.get("event_ids", []),
-            "files": batch.get("files", []),
-            "partial": batch.get("partial", False),
-        },
-        "reports": reports,
-        "report": reports[0] if reports else None,
-    }
-
-
-def _format_lineage_report(lineage: dict) -> dict:
-    return {
-        "source": {
-            "filename": lineage.get("source_filename"),
-            "source_type": lineage.get("source_type"),
-            "batch_id": lineage.get("batch_id"),
-            "created_at": lineage.get("created_at"),
-        },
-        "stage1_ai": {
-            "column_mapping": lineage.get("column_mapping"),
-            "raw_extraction": lineage.get("raw_extraction"),
-        },
-        "stage2_transformations": {
-            "transformations": lineage.get("transformations", []),
-            "skipped_records": lineage.get("skipped_records", []),
-        },
-        "summary": lineage.get("transformation_summary"),
-        "created_entity_ids": lineage.get("created_entity_ids", {}),
-    }
-
-
-@router.get("/batches/{batch_id}/contacts")
-async def get_batch_contacts(
-    batch_id: str,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """バッチで取り込まれたコンタクト一覧を返す（複数イベントにまたがる場合も対応）。"""
-    batch_doc = space.col("integration_batches").document(batch_id).get()
-    if not batch_doc.exists:
-        raise HTTPException(status_code=404, detail="Batch not found")
-
-    data = batch_doc.to_dict()
-    event_ids = data.get("event_ids") or ([data["event_id"]] if data.get("event_id") else ["unknown"])
-
-    contacts: list[dict] = []
-    for eid in event_ids:
-        snap = space.col(f"events/{eid}/batches/{batch_id}/contacts").get()
-        contacts.extend(s.to_dict() for s in snap)
-
-    return {"contacts": contacts, "count": len(contacts)}
