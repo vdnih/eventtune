@@ -37,10 +37,20 @@ export function isComplex(value: unknown): boolean {
 
 /**
  * 行から「由来を追う」対象の entity_id を推定する。
- * *_id を優先し、無ければ末尾フォールバックとして id を見る。
+ * 新オントロジー（person_id, account_id 等）を優先し、末尾 _id にフォールバックする。
  */
 export function pickEntityId(row: Record<string, unknown>): string | null {
-  const preferred = ["contact_id", "event_id", "segment_id", "asset_id", "email_id", "run_id"];
+  const preferred = [
+    "person_id",
+    "account_id",
+    "attendance_id",
+    "interest_id",
+    "deliverable_id",
+    "job_id",
+    "event_id",
+    "segment_id",
+    "run_id",
+  ];
   for (const k of preferred) {
     const v = row[k];
     if (typeof v === "string" && v) return v;

@@ -1,180 +1,224 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { Search } from "lucide-react";
-import { authFetch } from "@/lib/api";
+import { useEffect, useState, useCallback } from "react";
+import { ChevronRight, GitBranch, Loader2 } from "lucide-react";
+import { useSpace } from "@/lib/space-context";
 import { DataTable } from "@/components/ui/DataTable";
 import { Drawer } from "@/components/ui/Drawer";
 import { formatDetail, isComplex, pickEntityId } from "@/components/ui/format";
 
-type Collection = { key: string; label: string };
-type Row = Record<string, unknown>;
-type LineageReport = Record<string, unknown>;
+interface Collection {
+  key: string;
+  label: string;
+  count: number;
+}
 
-/**
- * 汎用データエクスプローラー。
- * バックエンド主導（/api/data）で全データモデルを横断閲覧する薄いビュー。
- * 編集はチャットの AI エージェントに委ね、ここは閲覧＋由来逆引きに特化する。
- */
+interface LineageNode {
+  job_id?: string;
+  source_filename?: string;
+  created_at?: string;
+  [key: string]: unknown;
+}
+
 export default function ExplorerPage() {
+  const { activeSpace } = useSpace();
+  const spaceId = activeSpace?.space_id ?? null;
+
   const [collections, setCollections] = useState<Collection[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [rows, setRows] = useState<Row[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [rows, setRows] = useState<Record<string, unknown>[]>([]);
+  const [loadingCols, setLoadingCols] = useState(false);
+  const [loadingRows, setLoadingRows] = useState(false);
 
-  // 左メニュー: コレクション一覧
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const selectedRow = selectedIndex !== null ? rows[selectedIndex] : null;
+
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [lineage, setLineage] = useState<LineageNode[]>([]);
+  const [loadingLineage, setLoadingLineage] = useState(false);
+
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+
+  const fetchWithAuth = useCallback(
+    async (path: string) => {
+      const { auth } = await import("@/lib/firebase");
+      const token = await auth.currentUser?.getIdToken();
+      const res = await fetch(`${apiBase}${path}`, {
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(spaceId ? { "x-space-id": spaceId } : {}),
+        },
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    },
+    [apiBase, spaceId]
+  );
+
+  // Load collection list
   useEffect(() => {
-    authFetch("/api/data/collections")
-      .then((r) => r.json())
-      .then((d) => {
-        const cols: Collection[] = d.collections ?? [];
+    if (!spaceId) return;
+    setLoadingCols(true);
+    fetchWithAuth("/api/data/collections")
+      .then((data) => {
+        const cols: Collection[] = data.collections ?? [];
         setCollections(cols);
         if (cols.length > 0) setActiveKey(cols[0].key);
       })
-      .catch(() => setCollections([]));
+      .catch(console.error)
+      .finally(() => setLoadingCols(false));
+  }, [spaceId, fetchWithAuth]);
+
+  // Load rows when active collection changes
+  useEffect(() => {
+    if (!activeKey || !spaceId) return;
+    setLoadingRows(true);
+    setRows([]);
+    setSelectedIndex(null);
+    fetchWithAuth(`/api/data/${activeKey}`)
+      .then((data) => setRows(data.rows ?? []))
+      .catch(console.error)
+      .finally(() => setLoadingRows(false));
+  }, [activeKey, spaceId, fetchWithAuth]);
+
+  const handleSelectRow = useCallback((index: number) => {
+    setSelectedIndex((prev) => (prev === index ? null : index));
   }, []);
 
-  // 中央: 選択ビューの行を取得
-  useEffect(() => {
-    if (!activeKey) return;
-    setLoading(true);
-    setSelectedIndex(null);
-    authFetch(`/api/data/${activeKey}`)
-      .then((r) => r.json())
-      .then((d) => setRows(d.rows ?? []))
-      .catch(() => setRows([]))
-      .finally(() => setLoading(false));
-  }, [activeKey]);
-
-  const selectedRow = selectedIndex !== null ? rows[selectedIndex] : null;
+  const handleTraceLineage = useCallback(async () => {
+    if (!selectedRow) return;
+    const entityId = pickEntityId(selectedRow as Record<string, unknown>);
+    if (!entityId) return;
+    setDrawerOpen(true);
+    setLoadingLineage(true);
+    try {
+      const data = await fetchWithAuth(`/api/data/lineage/by-entity/${entityId}`);
+      setLineage(data.jobs ?? data.lineage ?? []);
+    } catch {
+      setLineage([]);
+    } finally {
+      setLoadingLineage(false);
+    }
+  }, [selectedRow, fetchWithAuth]);
 
   return (
-    <div className="h-full flex">
-      {/* 左: コレクションセレクタ */}
-      <aside className="w-56 shrink-0 border-r border-gray-200 bg-white overflow-auto">
-        <div className="px-4 py-3 text-xs font-semibold text-gray-400 uppercase tracking-wide">
-          データ
+    <div className="h-full flex overflow-hidden">
+      {/* Left: collection nav */}
+      <aside className="w-52 shrink-0 border-r border-gray-200 bg-white overflow-y-auto">
+        <div className="px-3 pt-4 pb-2 text-xs font-semibold text-gray-400 uppercase tracking-wide">
+          コレクション
         </div>
-        <nav className="px-2 pb-4 space-y-0.5">
-          {collections.map((c) => (
-            <button
-              key={c.key}
-              onClick={() => setActiveKey(c.key)}
-              className={`w-full text-left px-3 py-2 rounded-md text-sm ${
-                activeKey === c.key
-                  ? "bg-brand-50 text-brand-700 font-medium"
-                  : "text-gray-600 hover:bg-gray-50"
-              }`}
-            >
-              {c.label}
-            </button>
-          ))}
-        </nav>
+        {loadingCols ? (
+          <div className="flex justify-center py-8">
+            <Loader2 className="w-5 h-5 animate-spin text-gray-300" />
+          </div>
+        ) : (
+          <ul>
+            {collections.map((col) => (
+              <li key={col.key}>
+                <button
+                  onClick={() => setActiveKey(col.key)}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-sm transition ${
+                    activeKey === col.key
+                      ? "bg-brand-50 text-brand-700 font-medium"
+                      : "text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  <span className="truncate">{col.label}</span>
+                  <span className="text-xs text-gray-400 ml-1 shrink-0">{col.count}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </aside>
 
-      {/* 中央: 一覧テーブル */}
-      <section className="flex-1 min-w-0 flex flex-col bg-white">
-        <div className="shrink-0 px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-          <h1 className="font-semibold text-gray-800">
-            {collections.find((c) => c.key === activeKey)?.label ?? "データ"}
-          </h1>
-          <span className="text-sm text-gray-400">{rows.length} 件</span>
-        </div>
-        <div className="flex-1 min-h-0">
-          {loading ? (
-            <div className="flex items-center justify-center h-full">
-              <div className="w-6 h-6 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
-            </div>
-          ) : (
-            <DataTable rows={rows} selectedIndex={selectedIndex} onSelectRow={setSelectedIndex} />
+      {/* Center: DataTable */}
+      <div className="flex-1 min-w-0 overflow-hidden flex flex-col">
+        <div className="shrink-0 px-4 h-11 flex items-center border-b border-gray-200 bg-white">
+          <span className="text-sm font-medium text-gray-700">
+            {collections.find((c) => c.key === activeKey)?.label ?? activeKey ?? "—"}
+          </span>
+          {!loadingRows && rows.length > 0 && (
+            <span className="ml-2 text-xs text-gray-400">{rows.length} 件</span>
           )}
         </div>
-      </section>
-
-      {/* 右: 選択行の詳細 + 由来を追う */}
-      {selectedRow && (
-        <DetailPane row={selectedRow} onClose={() => setSelectedIndex(null)} />
-      )}
-    </div>
-  );
-}
-
-function DetailPane({ row, onClose }: { row: Row; onClose: () => void }) {
-  const [lineageOpen, setLineageOpen] = useState(false);
-  const [lineage, setLineage] = useState<LineageReport | null>(null);
-  const [lineageLoading, setLineageLoading] = useState(false);
-  const [notFound, setNotFound] = useState(false);
-
-  const entityId = pickEntityId(row);
-
-  const traceLineage = useCallback(() => {
-    if (!entityId) return;
-    setLineageOpen(true);
-    setLineageLoading(true);
-    setNotFound(false);
-    authFetch(`/api/data/lineage/by-entity/${encodeURIComponent(entityId)}`)
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.report) setLineage(d.report);
-        else setNotFound(true);
-      })
-      .catch(() => setNotFound(true))
-      .finally(() => setLineageLoading(false));
-  }, [entityId]);
-
-  return (
-    <aside className="w-80 shrink-0 border-l border-gray-200 bg-white overflow-auto">
-      <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-        <h2 className="font-semibold text-gray-800 text-sm">詳細</h2>
-        <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-sm">
-          閉じる
-        </button>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          {loadingRows ? (
+            <div className="flex justify-center items-center h-full">
+              <Loader2 className="w-6 h-6 animate-spin text-gray-300" />
+            </div>
+          ) : (
+            <DataTable rows={rows} selectedIndex={selectedIndex} onSelectRow={handleSelectRow} />
+          )}
+        </div>
       </div>
 
-      {entityId && (
-        <div className="px-4 py-3 border-b border-gray-200">
-          <button
-            onClick={traceLineage}
-            className="w-full flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-md border border-brand-200 text-brand-700 hover:bg-brand-50"
-          >
-            <Search className="w-4 h-4" /> 由来を追う
-          </button>
-        </div>
+      {/* Right: detail pane */}
+      {selectedRow && (
+        <aside className="w-72 shrink-0 border-l border-gray-200 bg-white overflow-y-auto">
+          <div className="px-4 pt-4 pb-2 flex items-center justify-between">
+            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide">詳細</span>
+            <button
+              onClick={handleTraceLineage}
+              className="flex items-center gap-1 text-xs text-brand-600 hover:text-brand-700"
+            >
+              <GitBranch className="w-3.5 h-3.5" />
+              由来を追う
+            </button>
+          </div>
+          <dl className="divide-y divide-gray-100">
+            {Object.entries(selectedRow).map(([k, v]) => (
+              <div key={k} className="px-4 py-2">
+                <dt className="text-xs font-medium text-gray-400 mb-0.5">{k}</dt>
+                <dd className={`text-sm text-gray-800 break-all ${isComplex(v) ? "font-mono text-xs" : ""}`}>
+                  {isComplex(v) ? (
+                    <pre className="whitespace-pre-wrap">{formatDetail(v)}</pre>
+                  ) : (
+                    formatDetail(v)
+                  )}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </aside>
       )}
 
-      <dl className="px-4 py-3 space-y-3">
-        {Object.entries(row).map(([key, value]) => (
-          <div key={key}>
-            <dt className="text-xs font-medium text-gray-400">{key}</dt>
-            <dd className="mt-0.5 text-sm text-gray-800 break-words">
-              {isComplex(value) ? (
-                <pre className="text-xs bg-gray-50 rounded p-2 overflow-auto whitespace-pre-wrap">
-                  {formatDetail(value)}
-                </pre>
-              ) : (
-                formatDetail(value)
-              )}
-            </dd>
+      {/* Lineage drawer */}
+      <Drawer
+        open={drawerOpen}
+        title="データ由来（Integration Jobs）"
+        onClose={() => setDrawerOpen(false)}
+      >
+        {loadingLineage ? (
+          <div className="flex justify-center py-8">
+            <Loader2 className="w-6 h-6 animate-spin text-gray-300" />
           </div>
-        ))}
-      </dl>
-
-      <Drawer open={lineageOpen} title="データの由来" onClose={() => setLineageOpen(false)}>
-        {lineageLoading ? (
-          <div className="flex items-center justify-center py-12">
-            <div className="w-6 h-6 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
-          </div>
-        ) : notFound ? (
-          <p className="text-sm text-gray-500">
-            このレコードの由来（取り込み来歴）は見つかりませんでした。手動作成やエージェント生成のデータには来歴が無い場合があります。
-          </p>
+        ) : lineage.length === 0 ? (
+          <p className="text-sm text-gray-400">由来情報が見つかりませんでした</p>
         ) : (
-          <pre className="text-xs bg-gray-50 rounded p-3 overflow-auto whitespace-pre-wrap">
-            {formatDetail(lineage)}
-          </pre>
+          <ul className="space-y-3">
+            {lineage.map((node, i) => (
+              <li key={i} className="border border-gray-100 rounded-lg p-3 text-sm space-y-1">
+                {node.source_filename && (
+                  <div className="flex items-center gap-1.5 text-gray-700 font-medium">
+                    <ChevronRight className="w-4 h-4 text-gray-400" />
+                    {node.source_filename}
+                  </div>
+                )}
+                {node.job_id && (
+                  <div className="text-xs text-gray-400 font-mono">{node.job_id}</div>
+                )}
+                {node.created_at && (
+                  <div className="text-xs text-gray-400">
+                    {new Date(node.created_at).toLocaleString("ja-JP")}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
         )}
       </Drawer>
-    </aside>
+    </div>
   );
 }
