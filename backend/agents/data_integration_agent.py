@@ -1,14 +1,19 @@
 """
-DataIntegrationAgent — Layer 1: データ統合パイプライン
+DataIntegrationAgent — Layer 1: データ統合パイプライン（OSI 星座型）
 
-入力ファイルの種別に応じて2つの処理パスを実行する:
-  パス A (表形式: CSV/Excel): SchemaMapper でカラムマッピングを生成 → OntologyMapper で行変換
-  パス B (非構造化: TXT):     DocumentExtractor でエンティティ抽出 → OntologyMapper で変換
+入力ファイルを読み、含まれるエンティティ（5マスタ＋ファクト）へ分解して Firestore に保存する。
+docs/INGESTION_MAPPING.md に従い、ファイルは「レコードの容れ物」であり、イベントは経路キーでなく
+リンク（FK）として扱う。リンクは「列 → ファイル既定（ヒント）→ 名寄せ（安定ID）」で解決する。
 
-どちらのパスも OntologyMapper を通すことで、EngagementLevel 判定などの
-ビジネスロジックを AI から切り離し、決定論的に実行する。
+  パス A (表形式 CSV/Excel): SchemaMapper でカラム/リンクを判定 → OntologyMapper で行分解
+  パス B (非構造化 TXT):      DocumentExtractor でエンティティ抽出 → OntologyMapper で変換
+
+決定論的な分解は OntologyMapper（AI 不使用）。各マスタの appeal_summary / appeal_vector は
+本モジュールが semantic_search（AI）で後付けする。リンク先マスタは identity スタブを
+merge 書き込みして存在を保証する（後から詳細ファイルが merge される）。
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -22,19 +27,22 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+import semantic_search
 from agents.ontology_mapper import OntologyMapper
 from metering import record_llm_response
 from space import SpaceContext
 from ontology import (
+    Account,
     ColumnMappingResult,
-    Contact,
-    ContentAsset,
+    Content,
     CostItem,
-    DataLineage,
     DocumentExtractionResult,
     Event,
-    EventKPI,
-    SurveyResponse,
+    EventAttendance,
+    IntegrationJob,
+    Person,
+    Product,
+    ProductInterest,
     TransformationSummary,
 )
 
@@ -60,75 +68,66 @@ def _new_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
+def _hint_block(hint: str | None) -> str:
+    hint = (hint or "").strip()
+    return f"\n\n【ユーザーのヒント（リンク解決・種別判定の補正に使う）】\n{hint}\n" if hint else ""
+
+
 # ── パスA: SchemaMapper ──────────────────────────────────────────────────────
 #
-# column_map はキーがCSVカラム名で可変のため、response_schema（controlled generation）
-# では空 dict になってしまう。そのため response_schema は使わず JSONモードのみで
-# 自由形式 JSON を受け取り、Python でパースする。
+# column_map はキーが CSV カラム名で可変のため response_schema は使わず JSON モードのみ。
 
 _SCHEMA_MAPPER_PROMPT = """\
-あなたはデータ統合の専門家です。
-以下のCSVカラムヘッダーとサンプルデータを読んで、
-このテーブルがどのエンティティを表しているか判断し、
-各カラムをオントロジーフィールドにマッピングしてください。
+あなたはデータ統合の専門家です。CSV のヘッダーとサンプル行（とユーザーのヒント）を読み、
+このテーブルがどのエンティティ種別かを判定し、各カラムをオントロジーフィールドへマッピングしてください。
 
-【オントロジーのエンティティとフィールド】
+【エンティティ種別とフィールド】
+persons（人物リスト。氏名・会社・役職などを含む）:
+  name / name_last / name_first / company_name / department / job_title / email / extracted_challenge
+  __engagement_signal（判定ランク A/B/C）/ __temperature_signal（温度感）/ __product_signal（関心製品名）
+  __memo / __needs / __caution（notes へ集約される所感・要望・注意）
+accounts（企業マスタ）: account_name（または company_name）/ industry_type / company_size
+events（イベントマスタ）: name / event_type（展示会/セミナー/プライベートイベント）/ status / venue /
+  event_date（YYYY-MM-DD）/ event_date_end / total_budget / target_contact_count / description
+products（製品マスタ）: product_name / product_category
+contents（素材マスタ）: name / content_type / url / description
+cost_items（費用）: category / description / amount_jpy / vendor_name / invoice_date
 
-contacts (Contact エンティティ):
-  - name_last: 姓
-  - name_first: 名
-  - company_name: 会社名
-  - department: 部署名
-  - job_title: 役職
-  - email: メールアドレス
-  - extracted_challenge: 課題・悩み
-  - __engagement_signal: 判定ランク (A/B/C)。EngagementLevel の判定に使用
-  - __temperature_signal: 温度感 (ホット/ウォーム/コールド/高/中/低)。EngagementLevel の判定に使用
-  - __product_signal: 関心サービス・製品名。Product の名寄せに使用
-  - __memo: 接客内容メモ・所感 → notes フィールドへ集約
-  - __needs: お客様の要望・ニーズ → notes フィールドへ集約
-  - __caution: 注意事項 → notes フィールドへ集約
+【リンク列 link_columns】
+行ごとに異なるリンク先マスタを識別する列があれば {種別: カラム名} で設定する:
+  "event": イベント名・展示会名の列 / "account": 会社名の列 / "product": 製品名の列
 
-cost_items (CostItem エンティティ):
-  - category: 費用カテゴリ
-  - description: 費用の説明
-  - amount_jpy: 金額（円）
-  - vendor_name: 業者名
-  - invoice_date: 請求書日付
+【ファイル既定リンク default_links】
+行に該当列が無いが、ファイル全体が特定マスタに属するとヒント等から分かる場合 {種別: 名称} を設定する。
+  例: ヒント「2025秋展示会の参加者リスト」→ {"event": "2025秋展示会"}
 
 【ルール】
-- entity_type は "contacts" または "cost_items" を返す
+- entity_type は persons / accounts / events / products / contents / cost_items のいずれか
 - column_map にすべてのカラムを含める（マッピングできないものは unmapped_columns へ）
-- contacts 判断基準: 氏名・会社名・部署などの人物情報が含まれている
-- cost_items 判断基準: 金額・費用項目などの経費情報が含まれている
-- __ プレフィックスのフィールドは OntologyMapper でさらに変換される特殊フィールド
-- 「イベント名」「展示会名」「event_name」など、行ごとに異なるイベントを識別するカラムがあれば
-  event_routing_column にそのカラム名を設定する（なければ null）
+- __ プレフィックスは OntologyMapper でさらに変換される特殊フィールド
+- 推測でリンクを作らない。根拠がある場合のみ link_columns / default_links を設定する
 
-【出力形式】
-次の形の JSON オブジェクトのみを返してください（説明文やコードフェンスは不要）:
+【出力形式】次の形の JSON オブジェクトのみを返す（説明やコードフェンスは不要）:
 {
-  "entity_type": "contacts" または "cost_items",
+  "entity_type": "...",
   "column_map": { "CSVカラム名": "オントロジーフィールド名", ... },
-  "unmapped_columns": [ "マッピングできなかったCSVカラム名", ... ],
-  "event_routing_column": "カラム名 or null"
+  "unmapped_columns": [ ... ],
+  "link_columns": { "event": "カラム名", ... },
+  "default_links": { "event": "名称", ... }
 }
 """
 
 
 def _parse_json_response(text: str) -> dict:
-    """JSONモードのレスポンス文字列を dict にパースする。
-    コードフェンスや前後ノイズが混じっても落ちないよう防御的に処理する。"""
+    """JSON モードのレスポンス文字列を dict にパースする（フェンス・ノイズに防御的）。"""
     text = text.strip()
     if text.startswith("```"):
-        # ```json ... ``` のフェンスを除去
         text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
         if text.lstrip().startswith("json"):
             text = text.lstrip()[4:]
     try:
         result = json.loads(text)
     except json.JSONDecodeError:
-        # オブジェクト本体だけを抽出して再試行
         start, end = text.find("{"), text.rfind("}")
         if start == -1 or end == -1:
             raise
@@ -136,46 +135,40 @@ def _parse_json_response(text: str) -> dict:
     return result if isinstance(result, dict) else {}
 
 
+def _str_map(raw: Any) -> dict[str, str]:
+    return {str(k): str(v) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
+
+
 async def run_schema_mapper(
     headers: list[str], sample_rows: list[dict],
     space: Optional[SpaceContext] = None,
+    hint: str | None = None,
 ) -> ColumnMappingResult:
     sample_text = json.dumps(sample_rows[:5], ensure_ascii=False, indent=2)
     prompt = (
-        f"{_SCHEMA_MAPPER_PROMPT}\n\n"
+        f"{_SCHEMA_MAPPER_PROMPT}{_hint_block(hint)}\n\n"
         f"【カラムヘッダー】\n{headers}\n\n"
         f"【サンプルデータ（先頭5行）】\n{sample_text}"
     )
-    # column_map のキーが可変のため response_schema は使わず JSONモードのみ
     response = await _get_client().aio.models.generate_content(
         model=_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
     if space is not None:
         record_llm_response(space, _MODEL, response)
     parsed = _parse_json_response(response.text)
-    raw_map = parsed.get("column_map") or {}
-    # キー・値とも str に正規化（防御的）
-    column_map = {str(k): str(v) for k, v in raw_map.items() if v}
     unmapped = parsed.get("unmapped_columns") or []
-    event_routing_column = parsed.get("event_routing_column") or None
     return ColumnMappingResult(
         entity_type=str(parsed.get("entity_type", "")),
-        column_map=column_map,
+        column_map=_str_map(parsed.get("column_map")),
         unmapped_columns=[str(c) for c in unmapped],
-        event_routing_column=str(event_routing_column) if event_routing_column else None,
+        link_columns=_str_map(parsed.get("link_columns")),
+        default_links=_str_map(parsed.get("default_links")),
     )
 
 
 # ── パスB: DocumentExtractor ─────────────────────────────────────────────────
-#
-# 自由 dict は controlled generation で空になるため、固定キーの具体スキーマで定義する。
-# フィールドは ontology の最終型に近い型（AI が表記正規化まで行う前提）。
-# 全フィールド Optional・ID/タイムスタンプ無し・enum は表記揃えのため str
-# （最終的な enum 化・判定・名寄せは OntologyMapper が決定論的に行う）。
 
 class _EngagementCountsExtraction(BaseModel):
     appointment_booked: Optional[int] = None
@@ -264,25 +257,22 @@ _DOCUMENT_EXTRACTOR_PROMPT = """\
 Event（複数可）:
   name, event_type（展示会/セミナー/プライベートイベント）, status（計画中/開催中/終了）,
   venue, event_date（YYYY-MM-DD）, event_date_end（YYYY-MM-DD）, booth_number,
-  total_budget（数値のみ、円記号・カンマ除去）, target_contact_count（数値）,
-  description（所感・目的・担当者メモなど、構造化できない文脈情報をすべてここに）
+  total_budget（数値のみ）, target_contact_count（数値）, description（所感・目的・担当者メモ等）
 
 EventKPI:
   total_visitors_to_booth, total_contacts_collected, appointments_booked, demo_sessions_held,
-  follow_email_open_rate（0.0〜1.0の小数。61%→0.61）,
-  follow_email_reply_rate（0.0〜1.0の小数）,
-  pipeline_value_jpy（数値のみ）, closed_deals_3m, closed_revenue_3m_jpy（数値のみ）,
-  contacts_by_engagement: { appointment_booked: 数値, high_intent: 数値, nurturing: 数値 }
+  follow_email_open_rate（0.0〜1.0）, follow_email_reply_rate（0.0〜1.0）,
+  pipeline_value_jpy, closed_deals_3m, closed_revenue_3m_jpy,
+  contacts_by_engagement: { appointment_booked, high_intent, nurturing }
 
 CostItem（複数可）:
   category（ブース出展料/ブース装飾・設営/機材・備品/人件費・派遣/交通・宿泊/印刷・販促物/飲食・接待/その他）,
-  description（費用の説明）, amount_jpy（数値のみ）, vendor_name, invoice_date（YYYY-MM-DD）
+  description, amount_jpy（数値のみ）, vendor_name, invoice_date（YYYY-MM-DD）
 
 SurveyResponse:
-  total_responses, nps_score（-100〜100の小数）, nps_promoters, nps_passives, nps_detractors,
-  satisfaction_scores: [{ category: カテゴリ名, avg_score: 小数, response_count: 数値 }],
-  verbatim_positives: [コメント文字列], verbatim_negatives: [コメント文字列],
-  verbatim_suggestions: [コメント文字列]
+  total_responses, nps_score（-100〜100）, nps_promoters, nps_passives, nps_detractors,
+  satisfaction_scores: [{ category, avg_score, response_count }],
+  verbatim_positives/negatives/suggestions: [コメント文字列]
 
 ContentAsset（複数可）:
   asset_id, content_type（未来のセミナー（募集中）/未来のイベント（募集中）/資料・ホワイトペーパー/導入事例）,
@@ -290,8 +280,7 @@ ContentAsset（複数可）:
 
 【ルール】
 - ドキュメントに含まれるエンティティのみ detected_entity_types に列挙する
-- 数値フィールドのカンマ・通貨記号・単位を除去する
-- パーセント表記（61%）は小数（0.61）に変換する
+- 数値のカンマ・通貨記号・単位を除去し、パーセント(61%)は小数(0.61)に変換する
 - 構造化できない文脈・所感・メモは Event.description に集約する
 - 含まれない情報は null にする（推測で埋めない）
 """
@@ -300,18 +289,9 @@ ContentAsset（複数可）:
 async def run_document_extractor(
     text: str,
     space: Optional[SpaceContext] = None,
-    candidate_event_names: list[str] | None = None,
+    hint: str | None = None,
 ) -> DocumentExtractionResult:
-    prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}"
-    if candidate_event_names:
-        names_json = json.dumps(candidate_event_names, ensure_ascii=False)
-        prompt += (
-            "\n\n【イベント名の制約】\n"
-            f"このドキュメントのデータは次のイベントに属します: {names_json}\n"
-            "抽出する各 Event の name は、必ず上記リストのいずれかと完全一致させてください。"
-            "新しいイベント名を作らず、各データを最も適切なイベント名に割り当ててください。"
-        )
-    prompt += f"\n\n【ドキュメント】\n{text}"
+    prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}{_hint_block(hint)}\n\n【ドキュメント】\n{text}"
     response = await _get_client().aio.models.generate_content(
         model=_MODEL,
         contents=prompt,
@@ -323,8 +303,6 @@ async def run_document_extractor(
     if space is not None:
         record_llm_response(space, _MODEL, response)
     parsed = _DocumentExtractionResponse.model_validate_json(response.text)
-    # 具体スキーマ → dict 境界（DocumentExtractionResult）へ詰め直す。
-    # 以降の OntologyMapper / DataLineage は従来通り dict を受ける。
     return DocumentExtractionResult(
         detected_entity_types=parsed.detected_entity_types,
         events=[e.model_dump() for e in parsed.events] if parsed.events else [],
@@ -356,205 +334,205 @@ def _read_text(content: bytes) -> str:
     return content.decode("utf-8", errors="replace")
 
 
-# ── 既存イベント照合 ───────────────────────────────────────────────────────────
+# ── Firestore パス解決 ─────────────────────────────────────────────────────────
 
-def _find_existing_event_by_name(db: Any, name: str) -> str | None:
-    """同名の既存イベントを検索し、その event_id を返す（重複防止・決定論的）。
+_KPI_SURVEY_FIELDS = frozenset({
+    "total_visitors_to_booth", "total_contacts_collected", "appointments_booked",
+    "demo_sessions_held", "follow_email_open_rate", "follow_email_reply_rate",
+    "pipeline_value_jpy", "closed_deals_3m", "closed_revenue_3m_jpy",
+    "nps_score", "total_survey_responses", "updated_at",
+})
 
-    overview.txt 由来のイベント名で完全一致検索する。名前が空なら誤マッチ防止に
-    None を返す。一致が複数あっても先頭を採用する（取り込みのたびに新規採番されて
-    重複する問題への対処）。
+
+def _entity_to_firestore_path(entity: Any) -> tuple[str | None, str | None]:
+    if isinstance(entity, Person):
+        return "persons", entity.person_id
+    if isinstance(entity, Account):
+        return "accounts", entity.account_id
+    if isinstance(entity, EventAttendance):
+        return "event_attendances", entity.attendance_id
+    if isinstance(entity, ProductInterest):
+        return "product_interests", entity.interest_id
+    if isinstance(entity, Product):
+        return "products", entity.product_id
+    if isinstance(entity, Event):
+        return "events", entity.event_id
+    if isinstance(entity, CostItem):
+        return f"events/{entity.event_id}/costs", entity.cost_id
+    if isinstance(entity, Content):
+        return "contents", entity.content_id
+    return None, None
+
+
+# ── appeal 生成（AI, 非ブロッキング）─────────────────────────────────────────
+
+def _appeal_spec(entity: Any) -> tuple[str, dict] | None:
+    """appeal を生成すべきエンティティなら (kind, payload) を返す。
+
+    KPI/Survey パッチ用 Event（name 空）や identity スタブはここに来ない（payload なし）。
     """
-    name = (name or "").strip()
-    if not name:
-        return None
-    docs = db.collection("events").where("name", "==", name).limit(1).get()
-    for d in docs:
-        return d.to_dict().get("event_id") or d.id
+    if isinstance(entity, Person):
+        return "person", {
+            "name": entity.name, "department": entity.department,
+            "job_title": entity.job_title, "extracted_challenge": entity.extracted_challenge,
+            "notes": entity.notes,
+        }
+    if isinstance(entity, Event) and entity.name:
+        return "event", {
+            "name": entity.name, "event_type": entity.event_type.value,
+            "venue": entity.venue, "description": entity.description,
+        }
+    if isinstance(entity, Product) and entity.product_name:
+        return "product", {
+            "product_name": entity.product_name, "product_category": entity.product_category,
+        }
+    if isinstance(entity, Content) and entity.content_name:
+        return "content", {
+            "content_name": entity.content_name, "content_type": entity.content_type.value,
+            "description": entity.description,
+        }
     return None
 
 
-# ── Firestore パス解決 ─────────────────────────────────────────────────────────
-
-def _entity_to_firestore_path(
-    entity: Any, event_id: str | None, batch_id: str | None
-) -> tuple[str | None, str | None]:
-    if isinstance(entity, Contact):
-        eid = entity.source_event_id or event_id or "unknown"
-        bid = batch_id or "unknown"
-        return f"events/{eid}/batches/{bid}/contacts", entity.contact_id
-    if isinstance(entity, Event):
-        return "events", entity.event_id
-    if isinstance(entity, EventKPI):
-        return f"events/{entity.event_id}/kpi", entity.kpi_id
-    if isinstance(entity, CostItem):
-        return f"events/{entity.event_id}/costs", entity.cost_id
-    if isinstance(entity, SurveyResponse):
-        return f"events/{entity.event_id}/survey", entity.survey_id
-    if isinstance(entity, ContentAsset):
-        return "content_assets", entity.asset_id
-    return None, None
+async def _apply_appeal(entities: list[Any], space: Optional[SpaceContext]) -> None:
+    """対象マスタ/Person に appeal_summary / appeal_vector を並列生成して付与する。"""
+    targets: list[tuple[Any, str, dict]] = []
+    for e in entities:
+        spec = _appeal_spec(e)
+        if spec is not None:
+            targets.append((e, spec[0], spec[1]))
+    if not targets:
+        return
+    results = await asyncio.gather(
+        *[semantic_search.build_appeal(kind, payload, space=space) for _, kind, payload in targets]
+    )
+    for (entity, _kind, _payload), (summary, vector) in zip(targets, results):
+        entity.appeal_summary = summary
+        entity.appeal_vector = vector
 
 
 # ── メイン処理 ────────────────────────────────────────────────────────────────
 
+def _dedup_masters(refs: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str, str]] = []
+    for kind, mid, name in refs:
+        key = (kind, mid)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((kind, mid, name))
+    return out
+
+
+def _write_link_stubs(db: Any, refs: list[tuple[str, str, str]], space_id: str) -> None:
+    """リンク先マスタの identity スタブを merge 書き込みし、存在を保証する。
+
+    identity フィールドのみ書くため、別ファイル由来の詳細（appeal/種別等）を上書きしない。
+    """
+    paths = {
+        "event": ("events", "event_id", "name"),
+        "product": ("products", "product_id", "product_name"),
+        "account": ("accounts", "account_id", "account_name"),
+    }
+    for kind, mid, name in _dedup_masters(refs):
+        spec = paths.get(kind)
+        if not spec:
+            continue
+        collection, id_field, name_field = spec
+        db.document(f"{collection}/{mid}").set(
+            {id_field: mid, "space_id": space_id, name_field: name}, merge=True
+        )
+
+
 async def process_file(
     filename: str,
     content: bytes,
-    event_ids: list[str],
+    hint: str | None,
     batch_id: str,
     db: Any,  # space.ScopedClient（スペース前置済み）
     space: Optional[SpaceContext] = None,
-) -> tuple[list[Any], DataLineage]:
-    """
-    1ファイルを処理してオントロジーエンティティを生成し、Firestore に保存する。
+) -> tuple[list[Any], IntegrationJob]:
+    """1ファイルを処理してオントロジーエンティティを生成し、Firestore に保存する。"""
+    job_id = _new_id("job_")
+    space_id = space.space_id if space is not None else ""
+    logger.info("process_file: filename=%s job_id=%s hint=%r", filename, job_id, hint)
 
-    event_ids:
-        - []      → AI がファイル内容からイベントを生成/解決する（従来の新規挙動）
-        - [id]    → そのイベントへ紐づける（従来の既存紐づけ挙動）
-        - [id, …] → 複数の既存（先行作成済み）イベントへデータを振り分ける。
-                    候補イベント名を抽出AIに与え、名前ベース照合で各イベントへ統合する。
-
-    Returns:
-        (entities, lineage): 生成されたエンティティのリストと DataLineage レコード
-    """
-    # 単一指定のときだけ event_id を固定。複数/未指定は None にして
-    # 名前ベース照合（候補イベント）または AI 生成に委ねる。
-    event_id: str | None = event_ids[0] if len(event_ids) == 1 else None
-    # 紐づけ先イベント名を抽出AIに与え、抽出 Event 名を確定イベント名と一致させる
-    # （merge 書き込みでユーザー確定名が AI 命名に上書きされるのを防ぐ）。
-    candidate_event_names: list[str] = []
-    for eid in event_ids:
-        snap = db.document(f"events/{eid}").get()
-        if snap.exists:
-            name = (snap.to_dict() or {}).get("name", "")
-            if name:
-                candidate_event_names.append(name)
-    logger.info(
-        "process_file: filename=%s batch_id=%s event_id=%s candidates=%s",
-        filename, batch_id, event_id, candidate_event_names,
-    )
-
-    entities: list[Any] = []
-    transformations: list[Any] = []
-    skipped: list[Any] = []
     column_mapping = None
     raw_extraction_dict = None
 
     if _is_tabular(filename):
-        # ─ パス A: CSV / Excel ───────────────────────────────────────────
         headers, rows = _read_tabular(filename, content)
-        column_mapping = await run_schema_mapper(headers, rows, space=space)
-        logger.info("schema_mapper result: entity_type=%s columns=%d routing_col=%s",
-                    column_mapping.entity_type, len(column_mapping.column_map), column_mapping.event_routing_column)
-
-        routing_col = column_mapping.event_routing_column
-        if routing_col and column_mapping.entity_type == "contacts":
-            # イベントルーティング列がある場合: 列の値でグループ化し各グループを別イベントとして処理
-            groups: dict[str, list[dict]] = {}
-            for row in rows:
-                key = str(row.get(routing_col, "")).strip()
-                groups.setdefault(key, []).append(row)
-
-            all_entities: list[Any] = []
-            all_transformations: list[Any] = []
-            all_skipped: list[Any] = []
-            for event_name, group_rows in groups.items():
-                # イベント名でFirestoreを検索して event_id を解決
-                group_event_id = event_id  # 明示指定がある場合はそれを優先
-                if not group_event_id and event_name:
-                    snap = db.collection("events").where("name", "==", event_name).limit(1).get()
-                    if snap:
-                        group_event_id = snap[0].id
-                e_list, t_list, s_list = _mapper.map_rows(
-                    column_mapping, group_rows, event_id=group_event_id, batch_id=batch_id
-                )
-                all_entities.extend(e_list)
-                all_transformations.extend(t_list)
-                all_skipped.extend(s_list)
-            entities, transformations, skipped = all_entities, all_transformations, all_skipped
-        else:
-            entities, transformations, skipped = _mapper.map_rows(
-                column_mapping, rows, event_id=event_id, batch_id=batch_id
-            )
+        column_mapping = await run_schema_mapper(headers, rows, space=space, hint=hint)
+        logger.info("schema_mapper: entity_type=%s cols=%d link=%s default=%s",
+                    column_mapping.entity_type, len(column_mapping.column_map),
+                    column_mapping.link_columns, column_mapping.default_links)
+        result = _mapper.map_rows(column_mapping, rows, space_id=space_id, job_id=job_id)
     else:
-        # ─ パス B: テキスト / その他 ─────────────────────────────────────
         text = _read_text(content)
-        extraction = await run_document_extractor(
-            text, space=space, candidate_event_names=candidate_event_names or None
-        )
+        extraction = await run_document_extractor(text, space=space, hint=hint)
         raw_extraction_dict = extraction.model_dump()
-        logger.info("document_extractor result: detected=%s", extraction.detected_entity_types)
-        entities, transformations, skipped = _mapper.map_extraction(
-            extraction, event_id=event_id, batch_id=batch_id,
-            event_id_resolver=lambda name: _find_existing_event_by_name(db, name),
-        )
+        logger.info("document_extractor: detected=%s", extraction.detected_entity_types)
+        result = _mapper.map_extraction(extraction, space_id=space_id, job_id=job_id)
 
-    # Firestore に書き込み
+    # appeal_summary / appeal_vector を付与（非ブロッキング）
+    await _apply_appeal(result.entities, space)
+
+    # リンク先マスタの identity スタブを保証
+    _write_link_stubs(db, result.referenced_masters, space_id)
+
+    # エンティティを書き込み
     created_ids: dict[str, list[str]] = {}
-    # Contact が入った events/{eid}/batches/{bid} の親ドキュメントを実体化するため、
-    # コンタクトが書き込まれた event_id を記録する。
-    contact_event_ids: set[str] = set()
-    for entity in entities:
-        collection, doc_id = _entity_to_firestore_path(entity, event_id, batch_id)
-        if collection and doc_id:
-            db.document(collection + "/" + doc_id).set(entity.model_dump(), merge=True)
-            key = type(entity).__name__
-            created_ids.setdefault(key, []).append(doc_id)
-            if isinstance(entity, Contact):
-                contact_event_ids.add(entity.source_event_id or event_id or "unknown")
-
-    # batches/{batch_id} ドキュメントを明示的に作成する。
-    # これを書かないと中間ドキュメントが「幽霊（サブコレクションのみの祖先）」となり、
-    # コレクションクエリ collection(".../batches").get() でバッチを列挙できなくなる。
-    for eid in contact_event_ids:
-        db.document(f"events/{eid}/batches/{batch_id}").set(
-            {"batch_id": batch_id, "event_id": eid}, merge=True
-        )
+    for entity in result.entities:
+        if isinstance(entity, Event) and not entity.name and not entity.created_at:
+            # KPI/Survey パッチ — 既存 Event へ該当フィールドだけ merge
+            patch = {k: v for k, v in entity.model_dump().items()
+                     if k in _KPI_SURVEY_FIELDS and v is not None}
+            if patch:
+                db.document(f"events/{entity.event_id}").set(patch, merge=True)
+        else:
+            collection, doc_id = _entity_to_firestore_path(entity)
+            if collection and doc_id:
+                db.document(collection + "/" + doc_id).set(entity.model_dump(), merge=True)
+                created_ids.setdefault(type(entity).__name__, []).append(doc_id)
 
     logger.info("process_file done: created=%s", {k: len(v) for k, v in created_ids.items()})
 
-    # ステージ2（加工処理）のサマリを集計
-    summary = _summarize_transformations(entities, transformations, skipped)
-
-    # DataLineage レコードを保存
-    lineage = DataLineage(
-        lineage_id=_new_id("lineage_"),
-        source_filename=filename,
-        source_type="tabular" if _is_tabular(filename) else "unstructured",
-        batch_id=batch_id,
+    summary = _summarize_transformations(result.entities, result.skipped)
+    job = IntegrationJob(
+        job_id=job_id,
+        space_id=space_id,
+        filenames=[filename],
+        hint=hint or "",
+        status="done",
+        created_entities={k: len(v) for k, v in created_ids.items()},
+        resolved_links=[{"kind": k, "id": i, "name": n}
+                        for k, i, n in _dedup_masters(result.referenced_masters)],
         column_mapping=column_mapping,
         raw_extraction=raw_extraction_dict,
-        created_entity_ids=created_ids,
-        transformations=transformations,
-        skipped_records=skipped,
+        transformations=result.transformations,
+        skipped_records=result.skipped,
         transformation_summary=summary,
         created_at=_now_iso(),
     )
-    db.collection("data_lineage").document(lineage.lineage_id).set(lineage.model_dump())
+    db.collection("integration_jobs").document(job.job_id).set(job.model_dump())
 
-    return entities, lineage
+    return result.entities, job
 
 
 def _summarize_transformations(
-    entities: list[Any],
-    transformations: list[Any],
-    skipped: list[Any],
+    entities: list[Any], skipped: list[Any]
 ) -> TransformationSummary:
-    """ステージ2の加工結果からバッチ単位のサマリを集計する。"""
     entity_counts: dict[str, int] = {}
     engagement_breakdown: dict[str, int] = {}
     product_breakdown: dict[str, int] = {}
-
     for entity in entities:
         entity_counts[type(entity).__name__] = entity_counts.get(type(entity).__name__, 0) + 1
-        if isinstance(entity, Contact):
-            if entity.engagement_level:
-                lvl = entity.engagement_level.value
-                engagement_breakdown[lvl] = engagement_breakdown.get(lvl, 0) + 1
-            for product in entity.interested_products:
-                product_breakdown[product.value] = product_breakdown.get(product.value, 0) + 1
-
+        if isinstance(entity, Person) and entity.engagement_level:
+            lvl = entity.engagement_level.value
+            engagement_breakdown[lvl] = engagement_breakdown.get(lvl, 0) + 1
+        if isinstance(entity, ProductInterest):
+            product_breakdown[entity.product_id] = product_breakdown.get(entity.product_id, 0) + 1
     return TransformationSummary(
         entity_counts=entity_counts,
         engagement_breakdown=engagement_breakdown,
@@ -571,76 +549,34 @@ class BatchFileResult:
 
     filename: str
     status: str  # "done" | "error"
-    lineage_id: str | None = None
+    job_id: str | None = None
     created_entities: dict[str, int] = field(default_factory=dict)
     error: str | None = None
-    generated_event_ids: list[str] = field(default_factory=list)  # このファイルが生成した Event の id リスト
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "filename": self.filename,
             "status": self.status,
-            "lineage_id": self.lineage_id,
+            "job_id": self.job_id,
             "created_entities": self.created_entities,
             "error": self.error,
         }
-
-
-def _resolve_event_id(explicit: str | None, batch_resolved: str | None) -> str | None:
-    """(互換維持のため残存。新コードでは使用しない)
-
-    優先順位:
-      1. UI で明示選択された event_id（既存イベントへの追加取り込み）
-      2. バッチ内ドキュメントから生成された Event の event_id（overview.txt 由来）
-      3. None → 既存フォールバック（Contact は events/unknown/... に入る）
-    """
-    return explicit or batch_resolved or None
-
-
-def _is_event_defining_name(filename: str) -> bool:
-    """ファイル名から Event を定義しうるドキュメントかを推定する（決定論ヒューリスティック）。
-
-    overview / 概要 を含む非表形式ファイルを先に処理することで、
-    survey 等の依存ドキュメントが処理される前に event_id を確定させる。
-    """
-    lower = filename.lower()
-    return "overview" in lower or "概要" in filename
-
-
-def _coerce_event_ids(value: Any) -> list[str]:
-    """file_event_map の値（str | list | None）を event_id のリストへ正規化する。"""
-    if value is None or value == "":
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [v for v in value if v]
-    return []
 
 
 async def process_batch(
     files: list[tuple[str, bytes]],
     batch_id: str,
     db: Any,  # space.ScopedClient（スペース前置済み）
-    file_event_map: dict[str, Any] | None = None,
+    hint: str | None = None,
     space: Optional[SpaceContext] = None,
 ) -> list[BatchFileResult]:
     """複数ファイルを並列に処理する。
 
-    file_event_map のキーはファイルの並び順インデックス（文字列）。同名ファイルでも
-    衝突しない。値は event_id 文字列・event_id リスト・None のいずれか。空/None の
-    ファイルはファイル内容から AI がイベントを生成/解決する。複数指定時はそれらの
-    既存イベントへデータを振り分ける。
-    space は LLMトークン計測のために使う（None なら計測しない）。
+    hint はユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正）。全ファイル共通。
+    space は LLM トークン計測に使う（None なら計測しない）。
     """
-    import asyncio
-
-    async def _process(idx: int, filename: str, content: bytes) -> BatchFileResult:
-        event_ids = _coerce_event_ids((file_event_map or {}).get(str(idx)))
-        return await _process_one(filename, content, event_ids, batch_id, db, space=space)
-
     results = await asyncio.gather(
-        *[_process(i, fn, content) for i, (fn, content) in enumerate(files)]
+        *[_process_one(fn, content, hint, batch_id, db, space=space) for fn, content in files]
     )
     return list(results)
 
@@ -648,29 +584,20 @@ async def process_batch(
 async def _process_one(
     filename: str,
     content: bytes,
-    event_ids: list[str],
+    hint: str | None,
     batch_id: str,
     db: Any,
     space: Optional[SpaceContext] = None,
 ) -> BatchFileResult:
     """1ファイルを process_file で処理し、部分失敗を吸収して結果を返す。"""
     try:
-        entities, lineage = await process_file(filename, content, event_ids, batch_id, db, space=space)
+        entities, job = await process_file(filename, content, hint, batch_id, db, space=space)
         counts: dict[str, int] = {}
         for entity in entities:
             counts[type(entity).__name__] = counts.get(type(entity).__name__, 0) + 1
-        generated_event_ids = [e.event_id for e in entities if isinstance(e, Event)]
         return BatchFileResult(
-            filename=filename,
-            status="done",
-            lineage_id=lineage.lineage_id,
-            created_entities=counts,
-            generated_event_ids=generated_event_ids,
+            filename=filename, status="done", job_id=job.job_id, created_entities=counts,
         )
     except Exception as e:
         logger.exception("process_one failed: filename=%s error=%s", filename, e)
-        return BatchFileResult(
-            filename=filename,
-            status="error",
-            error=str(e)[:500],
-        )
+        return BatchFileResult(filename=filename, status="error", error=str(e)[:500])

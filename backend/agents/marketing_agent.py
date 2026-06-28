@@ -23,23 +23,28 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
 
+import pandas as pd
+import vertexai
 from google import genai
 from google.adk.agents import Agent
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import VertexAiSessionService
+from google.adk.tools import ToolContext
 from google.genai import types
 from pydantic import BaseModel
+from vertexai import types as vai_types
 
+from config import get_settings
 from metering import metered, record_compute, record_llm, record_llm_response
 from ontology import (
-    CostSummary,
-    ComposedEmail,
-    EmailBlock,
+    Deliverable,
+    DeliverableBlock,
     Segment,
     SegmentAxis,
 )
 from segmentation import assign_contacts_to_segment
 from space import SpaceContext
+from space_data import load_space_data
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +85,7 @@ def _normalize_buckets(buckets: Any) -> list[str] | dict:
 
     return cleaned
 
+
 # ── システムプロンプト ────────────────────────────────────────────────────────
 # 背景思想: docs/MARKETING_PHILOSOPHY.md（Static Core & Dynamic Context）。
 # 下記【ブランドの一貫性】ブロックは同ドキュメント第4節のガードレールを実装したもの。
@@ -98,34 +104,78 @@ _SYSTEM_PROMPT = """\
 - Historical Intelligence: イベントをまたいだ蓄積・比較・学習が価値を持つ
 
 【オントロジーの定義】
-- Event: 展示会・セミナー・イベントの記録。KPI・費用・参加者を持つ
-- Contact: 人物（ハウスリストの連絡先）。ContactStage と EngagementLevel を持つ
+- Event: 展示会・セミナー・イベントの記録。KPI・費用を直接保持する
+- Person: ハウスリストの人物（旧 Contact）。ContactStage と EngagementLevel を持つ
   - ContactStage: LEAD / MQL / SQL / CUSTOMER / EXCLUDED
   - EngagementLevel (stage=LEAD のとき有効): アポ獲得済み / アポなし・感度高 / 通常リード
-- EventKPI: イベントの定量成果（来場者数・アポ数・パイプライン額など）
-- SurveyResponse: 参加者アンケート集計（NPS・満足度・バーバティムコメント）
-- CostItem: イベントの費用明細
-- ContentAsset: 推薦可能なコンテンツ（資料・事例・セミナー等）
-- ComposedEmail: AIが生成したメール。EmailBlock のリストで構成される
-  - EmailBlock.reason_for_inclusion: そのブロックを含めた理由（必須・非null）
+- Account: 企業マスター。Person に account_id で紐づく
+- EventAttendance: イベント × Person のファクトテーブル（誰がどのイベントに参加したか）
+- ProductInterest: 製品 × Person のファクトテーブル（誰がどの製品に関心を持つか）
+- Content: 推薦可能なコンテンツ（資料・事例・セミナー等）
+- Deliverable: AIが生成したメール等の成果物。DeliverableBlock のリストで構成
+  - DeliverableBlock.reason_for_inclusion: そのブロックを含めた理由（必須・非null）
 
 【あなたの役割】
 プロのマーケターとして、ユーザーの曖昧な意図を読み解き、進め方をあなた自身が組み立てて
 遂行してください。手順は固定されていません。状況に応じてツールを組み合わせてください。
 結果は分かりやすい日本語で、判断の根拠とともに報告してください。
+手元のデータで価値を出すことを最優先にし、欲しい数値が無いことを理由に分析を放棄しないこと。
 
-ROI計算が必要な場合の公式:
+ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / appointments_booked / total_budget）が
+**入力済みのときに限り**算出する（無ければ算出せず、未入力である旨を注記するだけにとどめる）。公式:
   roi_pipeline = (pipeline_value_jpy / total_cost_jpy) × 100 (%)
   cost_per_contact = total_cost_jpy / total_contacts_collected
   cost_per_appointment = total_cost_jpy / appointments_booked
+
+【データ分析 — get_space_data + run_python_code】
+分析は必ず「run_python_code ツールで Python を実行し、その出力（実データの計算結果）に基づいて」行うこと。
+数値を推測・暗算で答えてはならない。手順:
+
+1. get_space_data() を呼ぶ（セッション内で1回だけでよい）
+   → スキーマ・件数と、サンドボックスに配置された CSV ファイル名一覧が返る。
+
+2. run_python_code(code) ツールを呼んで分析する。CSV は作業ディレクトリにあるので pd.read_csv で読む。例:
+
+   run_python_code(code="persons = pd.read_csv('persons.csv'); print(persons.columns.tolist())")
+
+   他に events.csv / event_attendances.csv / product_interests.csv / accounts.csv / products.csv /
+   contents.csv がある。get_space_data 実行後は pandas が pd、numpy が np として import 済みで使える。
+   scipy 等それ以外を使うときは自分で import する（pip install は不可）。
+
+【run_python_code の作法（重要）】
+- コードの実行は必ず run_python_code ツールで行う。run_python_code 以外に「コードを実行するツール」は無い。
+- ステートフル: 変数・import・読み込んだファイルはセッション内で持続する。前回 run_python_code で定義した
+  変数や import は次の呼び出しでもそのまま使える。再初期化・再読込・再 import は不要。
+- 出力は必ず print() する（標準出力に出した内容だけが結果として返る）。
+  例: print(df.shape) / print(f"{roi=}") のように、確認したい値を明示的に出力する。
+- データの中身を勝手に仮定しない。列名・型・欠損は df.head() や df.columns で実際に確認してから使う。
+- 各フィールドの型は get_space_data() の返り値の schema を参照する。
+
+【分析・振り返りの進め方（重要）— 1テーブルで早合点しない】
+1. まず俯瞰する: 1つの CSV だけ見て結論を出さない。関係する全データセットの件数・主要列・非欠損状況を
+   確認してから分析に入る。
+2. ファクトテーブルを横断する（Firestore は JOIN しないので pandas で結合・集計する）。具体例:
+   - イベントの**実参加者数** = event_attendances を event_id で件数集計
+     （例: event_attendances[event_attendances.event_id == X].shape[0]）。events の KPI 列ではなくここから出す。
+   - 参加者の属性分布 = event_attendances → persons（→ accounts）を person_id/account_id で merge し、
+     contact_stage / engagement_level / 業種・企業規模で集計。
+   - 関心製品の分布 = product_interests を product_id・イベント別に集計。
+   - 予算・目標名刺数・定性メモ = events の total_budget / target_contact_count / description。
+3. **欠損は「止まる理由」ではなく「注記」**: ある数値列（KPI 等）が NaN でも分析を放棄しない。
+   まず出せる要約を必ず提示し、そのうえで「○○は未入力のため算出不可。入力すれば算出可能」と添える。
+   いきなり「データが無いので振り返れません／入力してください／定性ヒアリングしましょう」に切り替えない。
+4. 「イベントの振り返り」の既定アウトプット例:
+   概要（名称/種別/会場/会期/予算/目標名刺数）＋ 実参加者数（attendances）＋ 参加者の属性・関心の分布
+   ＋ description の定性要点 ＋（KPI があれば）ROI、無ければ未入力項目の注記。
 
 【個別カスタマイズ（メール等）の進め方 — セグメント方式 + HIL】
 全コンタクトに1通ずつフル生成するのではなく、少数のセグメントに切り分け、セグメント単位で
 コンテンツのパターンを作り、各コンタクトのメールは決定論的に組み立てます（高速・低コスト）。
 
 あなたが自律的に進める標準の流れ（ただし各ゲートで必ず確認を取ること = Human-In-the-Loop）:
-  1. 対象を特定し（get_event_* 等）、コンタクトの分布を踏まえて**適切なセグメント軸を自分で設計**する
-     （例: 課題感 × 購買意欲）。→ 「この軸で切り分けます。よろしいですか？」と提案し**承認を待つ**。
+  1. get_space_data() でデータをロードし、run_python_code で Person の分布を把握して
+     **適切なセグメント軸を自分で設計**する（例: 課題感 × 購買意欲）。
+     → 「この軸で切り分けます。よろしいですか？」と提案し**承認を待つ**。
   2. 承認後に define_segment でセグメントを登録し、assign_segment で分類する。
      → 各バケットの人数と分類根拠の例を提示し、「この分類で進めます。修正は？」と**確認する**。
   3. 承認後に generate_patterns でバケットごとのコンテンツパターンを生成する。
@@ -143,13 +193,103 @@ ROI計算が必要な場合の公式:
 - 不変のコア（変えない）: 自社が提供する機能・価値、専門用語の定義、トーン＆マナー（ブランド資産）。
 
 文面に関わるとき（generate_patterns 等）は次のガードレールを守ること:
-  ① 捏造禁止: 提示する機能・解決策・効果は get_content_catalog で得たコンテンツ資産（ContentAsset）と
+  ① 捏造禁止: 提示する機能・解決策・効果は get_space_data で得た contents（Content）と
      自社プロダクトに実在するものに限定する。存在しない機能・誇張・本来と異なる用途を創作しない
      （相手の課題への過剰な迎合を禁ずる。解決策は必ずマスターに帰結させる）。
   ② 1機能フォーカス（押し売り禁止）: 個別アプローチでは、相手の課題に直結する「1つの機能」に絞って訴求する。
      一度に複数機能やプラットフォーム全体像を詰め込まない。
   ③ ブランド資産の維持: 文脈を個別最適化しても、トーン＆マナー・用語・言い回しはセグメント横断で一貫させる。
 """
+
+
+# ── スキーマテキスト生成 ──────────────────────────────────────────────────────
+
+def _build_schema_text() -> str:
+    """ontology.py の Pydantic モデル定義からスキーマ説明を自動生成する。"""
+    from ontology import (
+        Account, Content, Event, EventAttendance,
+        Person, Product, ProductInterest, Segment,
+    )
+    models = [Person, Event, Account, EventAttendance, ProductInterest, Product, Content, Segment]
+    lines = []
+    for model in models:
+        lines.append(f"\n{model.__name__}:")
+        for name, info in model.model_fields.items():
+            ann = str(info.annotation).replace("typing.", "")
+            lines.append(f"  {name}: {ann}")
+    return "\n".join(lines)
+
+
+# ── Agent Engine コード実行サンドボックス ─────────────────────────────────────
+#
+# コード実行は ADK の code_executor（CodeAct）でなく run_python_code 関数ツールで行う。
+# サンドボックスは Agent Engine 上に「セッション毎に1つ」作り、tool_context.state に名前を保持して
+# 再利用する（変数・ファイルが持続するステートフル実行）。詳細は docs/ADR.md ADR-009。
+
+_vertex: vertexai.Client | None = None
+
+
+def _vertex_client() -> vertexai.Client:
+    global _vertex
+    if _vertex is None:
+        settings = get_settings()
+        _vertex = vertexai.Client(
+            project=settings.google_cloud_project,
+            location=settings.agent_runtime_location,
+        )
+    return _vertex
+
+
+def _ensure_sandbox(tool_context: ToolContext) -> str:
+    """セッション用のコード実行サンドボックスを確保し、resource name を返す。
+
+    既存（RUNNING）があれば再利用、無ければ Agent Engine 上に新規作成して state に保存する。
+    """
+    from google.api_core import exceptions as gapi_exc
+    from google.genai import errors as genai_errors
+
+    client = _vertex_client()
+    name = tool_context.state.get("sandbox_name")
+    if name:
+        try:
+            sb = client.agent_engines.sandboxes.get(name=name)
+            if sb is not None and getattr(sb, "state", None) == "STATE_RUNNING":
+                return name
+        except (gapi_exc.NotFound, genai_errors.ClientError):
+            pass  # 失効 → 作り直す
+
+    settings = get_settings()
+    op = client.agent_engines.sandboxes.create(
+        spec={"code_execution_environment": {}},
+        name=settings.agent_engine_resource_name,
+        config=vai_types.CreateAgentEngineSandboxConfig(
+            display_name="marketing_agent_sandbox",
+            ttl="3600s",
+        ),
+    )
+    name = op.response.name
+    tool_context.state["sandbox_name"] = name
+    return name
+
+
+def _exec_in_sandbox(sandbox_name: str, code: str, files: list[dict] | None = None) -> tuple[str, str]:
+    """サンドボックスでコードを実行し (stdout, stderr) を返す。
+
+    files は [{"name","content"(bytes),"mimeType"}]。execute_code が読むのは 'content'（単数）＋生 bytes。
+    """
+    input_data: dict[str, Any] = {"code": code}
+    if files:
+        input_data["files"] = files
+    resp = _vertex_client().agent_engines.sandboxes.execute_code(
+        name=sandbox_name, input_data=input_data
+    )
+    stdout, stderr = "", ""
+    for out in resp.outputs:
+        attrs = getattr(getattr(out, "metadata", None), "attributes", None)
+        if out.mime_type == "application/json" and (attrs is None or "file_name" not in attrs):
+            j = json.loads(out.data.decode("utf-8"))
+            stdout, stderr = j.get("msg_out", ""), j.get("msg_err", "")
+    return stdout, stderr
 
 
 # ── ツール定義（スペース束縛ファクトリ） ──────────────────────────────────────
@@ -161,106 +301,98 @@ ROI計算が必要な場合の公式:
 def make_tools(db: Any, space: SpaceContext) -> list:
     """スペース前置済み db を closure 束縛したツール群を返す。"""
 
-    def list_events() -> str:
-        """登録されているすべてのイベントの一覧を取得する。"""
-        docs = db.collection("events").get()
-        events = [d.to_dict() for d in docs]
-        return json.dumps(events, ensure_ascii=False, default=str)
-
-    def get_event_detail(event_id: str) -> str:
-        """指定したイベントの詳細情報を取得する。"""
-        doc = db.collection("events").document(event_id).get()
-        if not doc.exists:
-            return json.dumps({"error": f"event_id '{event_id}' not found"})
-        return json.dumps(doc.to_dict(), ensure_ascii=False, default=str)
-
-    def get_event_contacts(event_id: str, engagement_level: str = "") -> str:
+    def get_space_data(tool_context: ToolContext) -> str:
         """
-        指定したイベントのコンタクト一覧を取得する。
-        engagement_level を指定するとフィルタリングできる（例: "アポ獲得済み"）。
-        """
-        # NOTE: batches/{bid} ドキュメントは取り込み時に実体化されない（contacts のみ書き込む）
-        # ため、コレクションクエリ .get() では祖先パスの幽霊ドキュメントを拾えない。
-        # 幽霊ドキュメントも含めて列挙する .list_documents() を使う。
-        batches = db.collection(f"events/{event_id}/batches").list_documents()
-        contacts = []
-        for batch in batches:
-            coll = db.collection(f"events/{event_id}/batches/{batch.id}/contacts").get()
-            for c in coll:
-                data = c.to_dict()
-                if not engagement_level or data.get("engagement_level") == engagement_level:
-                    contacts.append(data)
-        return json.dumps(contacts, ensure_ascii=False, default=str)
+        スペースの全データを Firestore からロードし、コード実行サンドボックスへ CSV として投入する。
+        分析（run_python_code）の前に必ず1回呼ぶこと。
 
-    def get_event_kpi(event_id: str) -> str:
-        """指定したイベントの KPI データを取得する。"""
-        docs = db.collection(f"events/{event_id}/kpi").get()
-        kpis = [d.to_dict() for d in docs]
-        return json.dumps(kpis[0] if kpis else {}, ensure_ascii=False, default=str)
+        各データセットは "{name}.csv"（persons.csv 等）としてサンドボックスの作業ディレクトリに置かれ、
+        以降の run_python_code から pd.read_csv("persons.csv") で読める（ファイルはセッション内で持続）。
 
-    def get_event_survey(event_id: str) -> str:
-        """指定したイベントのアンケート集計データを取得する。"""
-        docs = db.collection(f"events/{event_id}/survey").get()
-        surveys = [d.to_dict() for d in docs]
-        return json.dumps(surveys[0] if surveys else {}, ensure_ascii=False, default=str)
+        Returns:
+            { loaded, files, counts, schema }
+        """
+        data = load_space_data(space)
 
-    def get_event_costs(event_id: str) -> str:
-        """
-        指定したイベントの費用明細とカテゴリ別集計（CostSummary）を取得する。
-        返却: { costs: [...], summary: { total_jpy: ..., by_category: {...} } }
-        """
-        docs = db.collection(f"events/{event_id}/costs").get()
-        costs = [d.to_dict() for d in docs]
-        total = sum(c.get("amount_jpy", 0) for c in costs)
-        by_category: dict[str, float] = {}
-        for c in costs:
-            cat = c.get("category", "その他")
-            by_category[cat] = by_category.get(cat, 0) + c.get("amount_jpy", 0)
-        summary = CostSummary(total_jpy=total, by_category=by_category)
+        datasets: dict[str, list] = {
+            "events": data.events,
+            "persons": data.persons,
+            "accounts": data.accounts,
+            "event_attendances": data.event_attendances,
+            "product_interests": data.product_interests,
+            "products": data.products,
+            "contents": data.contents,
+            "segments": data.segments,
+        }
+        counts: dict[str, int] = {}
+        files: list[dict] = []
+        for name, items in datasets.items():
+            counts[name] = len(items)
+            df = pd.DataFrame([m.model_dump() for m in items]) if items else pd.DataFrame()
+            # appeal_vector（埋め込み）は CSV で文字列化して扱いづらく、分析には不要なので落とす。
+            # 類似度計算は semantic_search.py（決定論 Python）が担う。
+            if "appeal_vector" in df.columns:
+                df = df.drop(columns=["appeal_vector"])
+            files.append({
+                "name": f"{name}.csv",
+                "content": df.to_csv(index=False).encode("utf-8"),
+                "mimeType": "text/csv",
+            })
+
+        sandbox = _ensure_sandbox(tool_context)
+        # ファイルをサンドボックスへ投入し、pandas/numpy を pre-import する。
+        # サンドボックスはステートフルなので、ここでの import とファイルは後続 run_python_code でも残る
+        # （= モデルは pd / np を import なしで使える）。
+        setup = (
+            "import pandas as pd\n"
+            "import numpy as np\n"
+            "import os\n"
+            "print(sorted(p for p in os.listdir('.') if p.endswith('.csv')))"
+        )
+        _, stderr = _exec_in_sandbox(sandbox, setup, files=files)
+        if stderr:
+            logger.warning("get_space_data upload stderr: %s", stderr)
+        tool_context.state["data_loaded"] = True
+
+        schema = _build_schema_text()
         return json.dumps(
-            {"costs": costs, "summary": summary.model_dump()},
+            {"loaded": True, "files": [f["name"] for f in files], "counts": counts, "schema": schema},
             ensure_ascii=False,
-            default=str,
         )
 
-    def get_all_events_summary() -> str:
+    def run_python_code(code: str, tool_context: ToolContext) -> str:
         """
-        すべてのイベントを横断した比較サマリーを返す。
-        振り返り・比較分析に使用する。
+        Python コードをコード実行サンドボックスで実行し、標準出力を返す。データ分析はこのツールで行う。
+
+        - 事前に get_space_data() を呼ぶこと（persons.csv 等が作業ディレクトリに配置される）。
+        - pandas/numpy/scipy/matplotlib は import 済みで利用可能（pip install は不可）。
+        - 結果は必ず print() すること（標準出力だけが返る）。
+        - ステートフル: 変数・import・ファイルはセッション内で持続する（再読込・再定義は不要）。
+
+        Args:
+            code: 実行する Python コード。
+
+        Returns:
+            { stdout, stderr } の JSON 文字列。
         """
-        events = [d.to_dict() for d in db.collection("events").get()]
-        summaries = []
-        for ev in events:
-            eid = ev.get("event_id", "")
-            kpi_docs = db.collection(f"events/{eid}/kpi").get()
-            kpi = kpi_docs[0].to_dict() if kpi_docs else {}
-            cost_docs = db.collection(f"events/{eid}/costs").get()
-            total_cost = sum(c.to_dict().get("amount_jpy", 0) for c in cost_docs)
-            survey_docs = db.collection(f"events/{eid}/survey").get()
-            survey = survey_docs[0].to_dict() if survey_docs else {}
+        from google.api_core import exceptions as gapi_exc
+        from google.genai import errors as genai_errors
 
-            roi_pipeline = 0.0
-            if total_cost > 0 and kpi.get("pipeline_value_jpy", 0) > 0:
-                roi_pipeline = round(kpi["pipeline_value_jpy"] / total_cost * 100, 1)
-
-            summaries.append({
-                "event_id": eid,
-                "event_name": ev.get("name", ""),
-                "event_date": ev.get("event_date", ""),
-                "total_contacts": kpi.get("total_contacts_collected", 0),
-                "appointments_booked": kpi.get("appointments_booked", 0),
-                "roi_pipeline": roi_pipeline,
-                "total_cost_jpy": total_cost,
-                "pipeline_value_jpy": kpi.get("pipeline_value_jpy", 0),
-                "nps_score": survey.get("nps_score", None),
-            })
-        return json.dumps(summaries, ensure_ascii=False, default=str)
-
-    def get_content_catalog() -> str:
-        """推薦可能なコンテンツ資産（資料・事例・セミナー等）の一覧を取得する。"""
-        docs = db.collection("content_assets").get()
-        assets = [d.to_dict() for d in docs]
-        return json.dumps(assets, ensure_ascii=False, default=str)
+        sandbox = tool_context.state.get("sandbox_name")
+        if not sandbox:
+            return json.dumps(
+                {"error": "サンドボックス未初期化です。先に get_space_data() を呼んでください。"},
+                ensure_ascii=False,
+            )
+        try:
+            stdout, stderr = _exec_in_sandbox(sandbox, code)
+        except (gapi_exc.NotFound, genai_errors.ClientError):
+            tool_context.state.pop("sandbox_name", None)
+            return json.dumps(
+                {"error": "サンドボックスが失効しました。get_space_data() を再実行してください。"},
+                ensure_ascii=False,
+            )
+        return json.dumps({"stdout": stdout, "stderr": stderr}, ensure_ascii=False)
 
     def save_report(event_id: str, report_type: str, content: str) -> str:
         """
@@ -330,28 +462,28 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
     def assign_segment(segment_id: str, event_id: str = "") -> str:
         """
-        登録済みセグメントに従って対象コンタクトを各バケットへ分類する（HILゲート①承認後）。
-        event_id を指定するとそのイベントのコンタクトのみ、未指定なら全コンタクトが対象。
+        登録済みセグメントに従って対象 Person を各バケットへ分類する（HILゲート①承認後）。
+        event_id を指定するとそのイベントの参加者のみ、未指定なら全 Person が対象。
 
         構造化フィールドで自明な分は決定論、意味判断が要る分のみ軽量モデルで判別する。
         各割り当てには根拠（reason）が残る。
 
         Returns:
-            { total, by_bucket, llm_contacts }（人数分布と分類根拠の概況）
+            { snapshot_id, total, by_bucket, llm_persons }（人数分布と分類根拠の概況）
         """
         doc = db.collection("segments").document(segment_id).get()
         if not doc.exists:
             return json.dumps({"error": f"segment_id '{segment_id}' not found"})
         segment = Segment.model_validate(doc.to_dict())
         with metered(space):
-            summary = assign_contacts_to_segment(db, space, segment, event_id or None)
+            summary = assign_contacts_to_segment(space, segment, event_id or None)
         return json.dumps(summary, ensure_ascii=False)
 
     def generate_patterns(
         segment_id: str,
         purpose: str = "",
         context: str = "",
-        content_asset_ids: list[str] = [],
+        content_ids: list[str] = [],
     ) -> str:
         """
         バケットごとに1つずつコンテンツパターン（件名＋本文ブロック）を生成する（HILゲート②承認後）。
@@ -368,8 +500,8 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         segment = Segment.model_validate(doc.to_dict())
 
         assets = []
-        for asset_id in content_asset_ids:
-            a = db.collection("content_assets").document(asset_id).get()
+        for content_id in content_ids:
+            a = db.collection("contents").document(content_id).get()
             if a.exists:
                 assets.append(a.to_dict())
 
@@ -378,21 +510,26 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         with metered(space):
             for bucket in segment.buckets:
                 pattern = _generate_one_pattern(space, segment, bucket, eff_purpose, context, assets)
-                db.collection(f"segments/{segment_id}/patterns").document(bucket).set(pattern)
-                results.append({"bucket": bucket, "subject": pattern.get("subject", "")})
+                pattern_key = f"{bucket}__EMAIL"
+                db.collection(f"segments/{segment_id}/patterns").document(pattern_key).set(pattern)
+                results.append({"bucket": bucket, "pattern_key": pattern_key, "subject": pattern.get("subject", "")})
         return json.dumps(
             {"segment_id": segment_id, "patterns": results, "count": len(results)},
             ensure_ascii=False,
         )
 
-    def run_assembly(segment_id: str) -> str:
+    def run_assembly(segment_id: str, snapshot_id: str = "") -> str:
         """
-        セグメントの分類とパターンから、各コンタクトのメールを決定論的に組み立てる（HILゲート③の
+        セグメントの分類とパターンから、各 Person のメールを決定論的に組み立てる（HILゲート③の
         明示承認後にのみ呼ぶ）。LLMは使わずプレースホルダ置換で組み立てるため高速。
         結果は marketing_runs に保存し、CSVは GET /api/marketing/runs/{run_id}/export で取得できる。
 
+        Args:
+            segment_id: 対象セグメント
+            snapshot_id: 使用するスナップショット（省略時は最新）
+
         Returns:
-            { run_id, count }
+            { run_id, count, snapshot_id }
         """
         doc = db.collection("segments").document(segment_id).get()
         if not doc.exists:
@@ -407,19 +544,21 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         if not patterns:
             return json.dumps({"error": "パターンが未生成です。先に generate_patterns を実行してください"})
 
+        # スナップショット解決（省略時は最新）
+        if not snapshot_id:
+            snap_docs = list(db.collection(f"segments/{segment_id}/snapshots").get())
+            if not snap_docs:
+                return json.dumps({"error": "セグメント割り当てがありません。先に assign_segment を実行してください"})
+            snap_docs.sort(key=lambda d: d.to_dict().get("created_at", ""), reverse=True)
+            snapshot_id = snap_docs[0].id
+
         run_id = f"run_{uuid.uuid4().hex[:12]}"
-        count = _assemble_run(db, segment, patterns, run_id)
-        return json.dumps({"run_id": run_id, "count": count}, ensure_ascii=False)
+        count = _assemble_run(db, segment, patterns, run_id, snapshot_id)
+        return json.dumps({"run_id": run_id, "count": count, "snapshot_id": snapshot_id}, ensure_ascii=False)
 
     return [
-        list_events,
-        get_event_detail,
-        get_event_contacts,
-        get_event_kpi,
-        get_event_survey,
-        get_event_costs,
-        get_all_events_summary,
-        get_content_catalog,
+        get_space_data,
+        run_python_code,
         save_report,
         define_segment,
         assign_segment,
@@ -431,7 +570,11 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 # ── エージェント・ランナー構築 ────────────────────────────────────────────────
 
 def build_agent(db: Any, space: SpaceContext) -> Agent:
-    """スペース束縛ツールを持つ Agent をリクエストごとに構築する。"""
+    """スペース束縛ツールを持つ Agent をリクエストごとに構築する。
+
+    コード実行は ADK の code_executor ではなく run_python_code 関数ツールで行う（ADR-009）。
+    関数ツールはモデルが自然に呼べ、Agent Engine サンドボックス（隔離・ステートフル）を直接叩く。
+    """
     return Agent(
         name="marketing_agent",
         model=_MODEL,
@@ -441,8 +584,16 @@ def build_agent(db: Any, space: SpaceContext) -> Agent:
     )
 
 
-_session_service = InMemorySessionService()
-_APP_NAME = "event_marketing_platform"
+# セッションは Agent Engine のマネージドセッションに保存する。Cloud Run のオートスケール/再起動を
+# 跨いで session.state（= サンドボックス名）が永続し、ステートフルなコード実行が本番でも機能する。
+# app_name は agent_engine_id に解決される（VertexAiSessionService._get_reasoning_engine_id）。
+_settings = get_settings()
+_session_service = VertexAiSessionService(
+    project=_settings.google_cloud_project,
+    location=_settings.agent_runtime_location,
+    agent_engine_id=_settings.agent_engine_id,
+)
+_APP_NAME = _settings.agent_engine_id
 
 
 def _accumulate_usage(event: Any, totals: dict[str, int]) -> None:
@@ -452,6 +603,17 @@ def _accumulate_usage(event: Any, totals: dict[str, int]) -> None:
         return
     totals["input"] += getattr(usage, "prompt_token_count", 0) or 0
     totals["output"] += getattr(usage, "candidates_token_count", 0) or 0
+
+
+def _parse_tool_response(resp: Any) -> dict:
+    """関数ツールの戻り値（ADK は文字列を {"result": ...} で包むことがある）を dict に正規化する。"""
+    inner = resp.get("result", resp) if isinstance(resp, dict) else resp
+    if isinstance(inner, str):
+        try:
+            return json.loads(inner)
+        except Exception:
+            return {"stdout": inner}
+    return inner if isinstance(inner, dict) else {"stdout": str(inner)}
 
 
 async def chat_stream(
@@ -464,7 +626,9 @@ async def chat_stream(
     MarketingAgent とのチャットを SSE 用のイベント辞書としてストリーミングする。
 
     Yields:
-        { type: "tool_call" | "text" | "done" | "error", ... }
+        { type: "tool_call" | "tool_result" | "code" | "code_result" | "text" | "done" | "error", ... }
+        - code:        AIが生成して実行した Python コード（{code}）
+        - code_result: その実行結果（{outcome, output}）
     """
     db = space.scoped_db()
     # ADKセッションキーをスペースで名前空間化し、スペース間のセッション混線を防ぐ
@@ -486,8 +650,6 @@ async def chat_stream(
         )
 
     # 選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
-    # これによりエージェントは list_events での推測を省き、対象イベントの
-    # get_event_* 系ツールへ直接 event_id を渡せる。未選択時は従来どおり全体が対象。
     message_text = message
     if event_id:
         event_name = event_id
@@ -499,8 +661,7 @@ async def chat_stream(
             logger.warning("failed to load event context: event_id=%s", event_id)
         message_text = (
             f"[コンテキスト] ユーザーは現在「{event_name}」(event_id={event_id})を選択中です。"
-            "特定イベントへの問い合わせは、明示が無い限りこのイベントを対象として "
-            f"get_event_* 系ツールに event_id={event_id} を渡してください。\n\n"
+            "データを分析する場合は get_space_data() を呼んでから run_python_code で絞り込んでください。\n\n"
             f"ユーザーの質問: {message}"
         )
 
@@ -518,23 +679,37 @@ async def chat_stream(
             new_message=user_content,
         ):
             _accumulate_usage(event, usage_totals)
-            # ToolCall イベント
+            # ToolCall イベント。run_python_code は「AIが実行したコード」として可視化する。
             if event.get_function_calls():
                 for fc in event.get_function_calls():
-                    yield {
-                        "type": "tool_call",
-                        "tool_name": fc.name,
-                        "args": dict(fc.args) if fc.args else {},
-                    }
-            # ToolResponse イベント（run_id / segment_id 等の成果物をフロントへ）
+                    if fc.name == "run_python_code":
+                        yield {"type": "code", "code": (fc.args or {}).get("code", "")}
+                    else:
+                        yield {
+                            "type": "tool_call",
+                            "tool_name": fc.name,
+                            "args": dict(fc.args) if fc.args else {},
+                        }
+            # ToolResponse イベント。run_python_code の結果はコード実行結果として可視化する。
             elif event.get_function_responses():
                 for fr in event.get_function_responses():
-                    yield {
-                        "type": "tool_result",
-                        "tool_name": fr.name,
-                        "result": fr.response if isinstance(fr.response, dict) else {"value": fr.response},
-                    }
-            # テキスト応答
+                    if fr.name == "run_python_code":
+                        parsed = _parse_tool_response(fr.response)
+                        out = parsed.get("stdout") or parsed.get("error") or ""
+                        if parsed.get("stderr"):
+                            out = f"{out}\n{parsed['stderr']}" if out else parsed["stderr"]
+                        yield {
+                            "type": "code_result",
+                            "outcome": "ERROR" if (parsed.get("stderr") or parsed.get("error")) else "OK",
+                            "output": out,
+                        }
+                    else:
+                        yield {
+                            "type": "tool_result",
+                            "tool_name": fr.name,
+                            "result": fr.response if isinstance(fr.response, dict) else {"value": fr.response},
+                        }
+            # 最終テキスト応答
             elif event.is_final_response() and event.content and event.content.parts:
                 for part in event.content.parts:
                     if part.text:
@@ -553,10 +728,10 @@ async def chat_stream(
 
 # ── Stage 2a: バケット単位のコンテンツパターン生成 ───────────────────────────
 #
-# 文体ルールの唯一の情報源。全コンタクトへのフル生成はせず、バケットごとに1パターンのみ
+# 文体ルールの唯一の情報源。全 Person へのフル生成はせず、バケットごとに1パターンのみ
 # 生成する。本文中の個人差分はプレースホルダで表現し、組み立て時に決定論で置換する。
 
-# プレースホルダとして使える Contact フィールド
+# プレースホルダとして使える Person フィールド（account_name は fill 時に company_name として提供）
 _PLACEHOLDER_FIELDS = ("name", "company_name", "department", "job_title")
 
 
@@ -580,11 +755,7 @@ def _generate_one_pattern(
     context: str,
     assets: list[dict],
 ) -> dict:
-    """1バケットぶんのコンテンツパターンを生成して dict で返す。
-
-    必須ルールには docs/MARKETING_PHILOSOPHY.md（Static Core & Dynamic Context）第4節の
-    ガードレール（捏造禁止／1機能×1CEP／ブランド資産の維持）をプロンプトとして埋め込む。
-    """
+    """1バケットぶんのコンテンツパターンを生成して dict で返す。"""
     assets_text = json.dumps(assets, ensure_ascii=False, indent=2) if assets else "（なし）"
     system_prompt = f"""\
 あなたはプロのマーケターです。施策「{segment.name}」のために、あるセグメントへ送る
@@ -606,10 +777,10 @@ def _generate_one_pattern(
 【必須ルール】
 - 宛名や会社名など個人ごとに変わる箇所は、プレースホルダ {{name}} {{company_name}}
   {{department}} {{job_title}} で表現する（実名を埋め込まない）。
-- 各 EmailBlock に reason_for_inclusion（そのブロックをこのセグメントに含めた理由）を必ず記述する。
+- 各ブロックに reason_for_inclusion（そのブロックをこのセグメントに含めた理由）を必ず記述する。
 - 件名は20〜40文字程度、具体的で開封したくなるもの。
 - 本文はビジネス敬語（〜です・ます調）。1ブロック100〜200文字程度。
-- associated_asset_ids: 参照したコンテンツ資産の asset_id を設定する。
+- associated_asset_ids: 参照したコンテンツ資産の content_id を設定する。
 
 【ブランドの一貫性（必ず守る）】
 - 1機能フォーカス: このメールでは相手の課題に直結する「1つの機能（解決策）」のみを提示し、
@@ -640,24 +811,33 @@ def _generate_one_pattern(
 
 # ── Stage 2b: 決定論的な組み立て（LLM不使用） ────────────────────────────────
 
-def _fill(template: str, contact: dict) -> str:
-    """テンプレート中のプレースホルダを Contact の値で決定論的に置換する。"""
-    values = {f: str(contact.get(f, "") or "") for f in _PLACEHOLDER_FIELDS}
+def _fill(template: str, ctx: dict) -> str:
+    """テンプレート中のプレースホルダを Person/Account の値で決定論的に置換する。"""
+    values = {f: str(ctx.get(f, "") or "") for f in _PLACEHOLDER_FIELDS}
     for key, val in values.items():
         template = template.replace(f"{{{key}}}", val)
     return template
 
 
-def _assemble_run(db: Any, segment: Segment, patterns: dict[str, dict], run_id: str) -> int:
-    """割り当てとパターンから各コンタクトの ComposedEmail を組み立てて保存する。"""
+def _assemble_run(
+    db: Any,
+    segment: Segment,
+    patterns: dict[str, dict],
+    run_id: str,
+    snapshot_id: str,
+) -> int:
+    """割り当てとパターンから各 Person の Deliverable を組み立てて保存する。"""
     assignments = [
         a.to_dict()
-        for a in db.collection(f"segments/{segment.segment_id}/assignments").get()
+        for a in db.collection(
+            f"segments/{segment.segment_id}/snapshots/{snapshot_id}/assignments"
+        ).get()
     ]
     db.collection("marketing_runs").document(run_id).set({
         "run_id": run_id,
         "status": "running",
         "segment_id": segment.segment_id,
+        "snapshot_id": snapshot_id,
         "purpose": segment.purpose,
         "total": len(assignments),
         "done": 0,
@@ -666,54 +846,57 @@ def _assemble_run(db: Any, segment: Segment, patterns: dict[str, dict], run_id: 
 
     done = 0
     for asn in assignments:
-        contact_id = asn.get("contact_id", "")
+        person_id = asn.get("person_id", "")
         bucket = asn.get("bucket", "")
-        pattern = patterns.get(bucket)
+        # パターンキーは {bucket}__EMAIL 形式
+        pattern_key = f"{bucket}__EMAIL"
+        pattern = patterns.get(pattern_key) or patterns.get(bucket)
         if not pattern:
-            logger.warning("no pattern for bucket '%s' (contact %s)", bucket, contact_id)
+            logger.warning("no pattern for bucket '%s' (person %s)", bucket, person_id)
             continue
-        contact = _find_contact(db, contact_id) or {"contact_id": contact_id}
+
+        person_doc = db.collection("persons").document(person_id).get()
+        person = person_doc.to_dict() if person_doc.exists else {"person_id": person_id}
+
+        # Account から company_name を解決してプレースホルダ用コンテキストに追加
+        account_name = ""
+        account_id = person.get("account_id")
+        if account_id:
+            acc_doc = db.collection("accounts").document(account_id).get()
+            if acc_doc.exists:
+                account_name = acc_doc.to_dict().get("account_name", "")
+        fill_ctx = {**person, "company_name": account_name}
 
         blocks = [
-            EmailBlock(
+            DeliverableBlock(
                 block_type=b.get("block_type", ""),
                 reason_for_inclusion=b.get("reason_for_inclusion", ""),
                 associated_asset_ids=b.get("associated_asset_ids", []),
-                block_text=_fill(b.get("block_text", ""), contact),
+                block_text=_fill(b.get("block_text", ""), fill_ctx),
             )
             for b in pattern.get("blocks", [])
         ]
-        email_id = f"email_{uuid.uuid4().hex[:12]}"
-        email = ComposedEmail(
-            email_id=email_id,
-            contact_id=contact_id,
-            event_id=contact.get("source_event_id"),
+        deliverable_id = f"dlv_{uuid.uuid4().hex[:12]}"
+        deliverable = Deliverable(
+            deliverable_id=deliverable_id,
+            space_id=person.get("space_id", ""),
             run_id=run_id,
-            subject=_fill(pattern.get("subject", ""), contact),
+            person_id=person_id,
+            snapshot_id=snapshot_id,
+            pattern_id=pattern_key,
+            format="EMAIL",
+            bucket=bucket,
+            subject=_fill(pattern.get("subject", ""), fill_ctx),
             blocks=blocks,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        db.collection(f"marketing_runs/{run_id}/emails").document(email_id).set(email.model_dump())
+        db.collection(f"marketing_runs/{run_id}/deliverables").document(deliverable_id).set(
+            deliverable.model_dump()
+        )
         done += 1
 
     db.collection("marketing_runs").document(run_id).update(
-        {"status": "done", "done": done, "email_count": done}
+        {"status": "done", "done": done, "deliverable_count": done}
     )
     logger.info("assembly completed: run_id=%s segment=%s done=%d", run_id, segment.segment_id, done)
     return done
-
-
-def _find_contact(db: Any, contact_id: str) -> dict | None:
-    """全イベントのバッチからコンタクトを検索する（db はスペース前置済み）。"""
-    events = db.collection("events").get()
-    for ev in events:
-        # batches/{bid} は実体化されない幽霊ドキュメントのため list_documents() で列挙する
-        # （get_event_contacts と同じ理由）。
-        batches = db.collection(f"events/{ev.id}/batches").list_documents()
-        for batch in batches:
-            doc = db.document(
-                f"events/{ev.id}/batches/{batch.id}/contacts/{contact_id}"
-            ).get()
-            if doc.exists:
-                return doc.to_dict()
-    return None

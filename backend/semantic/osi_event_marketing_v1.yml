@@ -1,0 +1,378 @@
+# =============================================================================
+# osi_event_marketing_v1.yml
+#
+# OSI v1.0 準拠 — BtoB イベントマーケティングのセマンティックレイヤー（概念モデル）
+#
+# このファイルは「設計の単一の思想源（概念モデル）」である。ランタイムではロードしない。
+# ここから backend/ontology.py（Pydantic）と Firestore の物理レイアウトを *手で* 導出し、
+# 整合はレビューと（任意の）整合テストで担保する。詳細は docs/SEMANTIC_LAYER.md。
+#
+# 5 コアコンポーネント: datasets / dimensions / metrics / relationships / context
+#
+# 設計原則:
+#   - ファクト・コンステレーション（星座型）: 5 個のマスタ系 dataset を、用途ごとに
+#     分割した複数の fact dataset が取り囲む。Event は 5 マスタの 1 つにすぎない
+#     （旧「Event-Centric」は撤回。docs/ADR.md ADR-008）。
+#   - 物理層と意味層の分離: 物理は `physical:` に Firestore コレクション名を宣言。
+#     name / description / context（= AI 向けプロンプト）からは技術用語を排除する。
+#   - metrics / relationships はセマンティック宣言のみ: Firestore は SQL JOIN /
+#     count_distinct を実行しないため、これらは「AI への意味の手がかり」。実集計・
+#     類似度計算は決定論 Python・エージェントのツールが担う。
+#   - 意味的な近さはベクトルで表現する（課題の1級化は撤回。ADR-008）: persons /
+#     events / contents / products は監査可能な要約テキスト appeal_summary と、その
+#     埋め込み appeal_vector を持つ。「この人に意味的に近いコンテンツ/製品/イベント」を
+#     コサイン類似度（決定論 Python の総当たり）で引き当て、CEP 駆動の案内を行う。
+#     固定ラベルの課題マスタ・課題ブリッジは作らない。
+#   - Auditable AI: AI 判断由来のレコードは reason を必須にする（Optional 不可）。
+#     ベクトルの一致根拠は、双方の appeal_summary（人が読めるテキスト）で説明する。
+#
+# 日英規約: 識別子（dataset/dimension/metric の name, enum キー）は英語、
+#           ユーザー向けラベルと enum の値・context は日本語。
+# =============================================================================
+version: "1.0"
+
+datasets:
+  # ===========================================================================
+  # I. マスタ系 dataset（5 個。いずれも対等な基底。Event 中心ではない）
+  #    persons / events / contents / products は appeal_summary（監査可能な要約）と
+  #    appeal_vector（その埋め込み）を持ち、意味的近接で結びつく。
+  # ===========================================================================
+
+  # --- 1. accounts（企業・組織）-------------------------------------------------
+  - name: accounts
+    physical: {collection: accounts, id: account_id}
+    description: "企業や組織の基本情報"
+    context: "AIへの指示: 業種や企業規模でセグメントを切る際に使う。person の所属先（勤務先）であり、ABM の単位。"
+    identifiers:
+      - {name: account_id, type: primary}
+    dimensions:
+      - {name: account_name,  type: categorical, description: "企業・組織名"}
+      - {name: industry_type, type: categorical, description: "業種（例: 製造業 / IT / 金融）"}
+      - {name: company_size,  type: categorical, description: "従業員規模（例: 1-50 / 51-300 / 301+）"}
+
+  # --- 2. persons（個人・担当者）-----------------------------------------------
+  - name: persons
+    physical: {collection: persons, id: person_id}
+    description: "顧客・見込み客の個人（担当者）の情報。いわゆるハウスリストの1人"
+    context: "AIへの指示: 誰がアクションしたか／どの企業に属すかの起点。旧 Contact を正規化した実体で、企業情報は account へ、興味製品は product_interests へ、参加イベントは event_attendances へ分離した。課題・関心は固定ラベルではなく appeal_summary / appeal_vector（意味ベクトル）で表す。"
+    identifiers:
+      - {name: person_id,  type: primary}
+      - {name: account_id, type: foreign}     # → accounts
+    dimensions:
+      - {name: name,        type: categorical, description: "氏名"}
+      - {name: department,  type: categorical, description: "部署"}
+      - {name: job_title,   type: categorical, description: "役職"}
+      - name: stage
+        type: categorical
+        description: "顧客の段階"
+        context: "'LEAD' / 'MQL' / 'SQL' / 'CUSTOMER' / 'EXCLUDED' の値をとる。EXCLUDED は配信対象外。"
+      - name: engagement_level
+        type: categorical
+        description: "リード段階での温度感"
+        context: "'アポ獲得済み' / 'アポなし・感度高' / '通常リード' の値をとる。stage='LEAD' のときのみ意味を持つ。"
+      - name: appeal_summary
+        type: text
+        description: "その人に何が訴求するか／抱える文脈・ニーズの要約文（監査可能テキスト）"
+        context: "AIへの指示: ヒアリング内容・名刺メモ・過去の行動ログ・興味製品から生成する。固定の課題ラベルの代わりに、この自由文がその人の関心・悩みを表す。content/product/event との一致根拠は、双方の appeal_summary を並べて説明する。"
+      - name: appeal_vector
+        type: vector
+        description: "appeal_summary を埋め込みモデルで数値化したベクトル（派生フィールド）"
+        context: "AIへの指示: これは appeal_summary から導出される内部表現で、AI に直接見せない。contents/products/events の appeal_vector とのコサイン類似度（決定論 Python の総当たり）で『意味的に近いもの』を引く。"
+    metrics:
+      - name: house_list_size
+        type: count_distinct
+        sql: "{{ datasets.persons.person_id }}"
+        description: "ハウスリストの人数（ユニーク）"
+        context: "AIへの指示: 配信母数を聞かれたらこれを使う。stage='EXCLUDED' を除く絞り込みは別途 filter で行う。"
+
+  # --- 3. events（イベント: 展示会・セミナー等）---------------------------------
+  - name: events
+    physical: {collection: events, id: event_id}
+    description: "主催・管理する展示会・セミナー・イベントの情報と、その実績指標"
+    context: "AIへの指示: イベントの集客・歩留まり・費用対効果を見る単位。実績（来場・アポ・費用・NPS 等）は本 dataset の metrics として参照する。"
+    identifiers:
+      - {name: event_id, type: primary}
+    dimensions:
+      - {name: event_name,  type: categorical, description: "イベント名"}
+      - name: event_type
+        type: categorical
+        description: "イベント種別"
+        context: "'展示会' / 'セミナー' / 'プライベートイベント' の値をとる。"
+      - name: event_status
+        type: categorical
+        description: "開催ステータス"
+        context: "'計画中' / '開催中' / '終了' の値をとる。"
+      - {name: event_date, type: time,        description: "開催日（ISO YYYY-MM-DD）"}
+      - {name: venue,      type: categorical, description: "会場"}
+      - name: appeal_summary
+        type: text
+        description: "このイベント／セミナーが提供する価値・訴求ポイントの要約文（監査可能テキスト）"
+        context: "AIへの指示: イベントの説明・登壇内容・対象テーマから生成する。person の appeal_summary と意味的に近いイベントを案内する判断に使う。"
+      - name: appeal_vector
+        type: vector
+        description: "appeal_summary を埋め込みモデルで数値化したベクトル（派生フィールド）"
+        context: "AIへの指示: appeal_summary から導出される内部表現で、AI に直接見せない。persons.appeal_vector とのコサイン類似度で『この人に合うイベント』を引く。"
+    # 旧 EventKPI / SurveyResponse / CostItem(集計) はここに metrics として畳み込む。
+    # 物理的にはイベントレコード（および kpi/survey サブドキュメント）の measure 列を指す。
+    metrics:
+      - {name: total_visitors,      type: sum,   sql: "{{ datasets.events.total_visitors_to_booth }}", description: "ブース来場者数"}
+      - {name: contacts_collected,  type: sum,   sql: "{{ datasets.events.total_contacts_collected }}", description: "名刺獲得数"}
+      - {name: appointments_booked, type: sum,   sql: "{{ datasets.events.appointments_booked }}",      description: "アポ獲得数"}
+      - {name: demo_sessions,       type: sum,   sql: "{{ datasets.events.demo_sessions_held }}",        description: "デモ実施数"}
+      - {name: email_open_rate,     type: avg,   sql: "{{ datasets.events.follow_email_open_rate }}",    description: "フォローメール開封率（0.0–1.0）"}
+      - {name: email_reply_rate,    type: avg,   sql: "{{ datasets.events.follow_email_reply_rate }}",   description: "フォローメール返信率（0.0–1.0）"}
+      - {name: pipeline_value,      type: sum,   sql: "{{ datasets.events.pipeline_value_jpy }}",        description: "創出パイプライン金額（JPY）"}
+      - {name: closed_revenue_3m,   type: sum,   sql: "{{ datasets.events.closed_revenue_3m_jpy }}",     description: "3か月以内成約売上（JPY）"}
+      - {name: nps_score,           type: avg,   sql: "{{ datasets.events.nps_score }}",                 description: "NPS（-100〜100）"}
+      - {name: total_cost,          type: sum,   sql: "{{ datasets.events.total_cost_jpy }}",            description: "総費用（JPY）"}
+      - name: cost_per_acquisition
+        type: ratio
+        numerator: total_cost
+        denominator: contacts_collected
+        description: "名刺1件あたり費用（CPA, JPY）"
+        context: "AIへの指示: 'CPA' や '費用対効果' を聞かれたらこれを使う。"
+    # 注: アンケート自由記述や費用明細（費目1行ごと）が必要になった場合は、
+    #     survey_verbatims / event_costs を独立 fact dataset として将来追加する。
+
+  # --- 4. products（自社プロダクト・ソリューション）-----------------------------
+  - name: products
+    physical: {collection: products, id: product_id}
+    description: "自社が提供する製品・ソリューションの情報"
+    context: "AIへの指示: どの製品が誰に注目されているか、どんな悩みに応えるかの起点。提示してよい機能・効果はこの dataset と contents に帰結する範囲に限る（捏造禁止 / Static Core）。person の関心との適合は appeal_vector の類似度で測る。"
+    identifiers:
+      - {name: product_id, type: primary}
+    dimensions:
+      - {name: product_name,     type: categorical, description: "製品名（例: プロダクトA）"}
+      - {name: product_category, type: categorical, description: "製品群"}
+      - name: appeal_summary
+        type: text
+        description: "この製品が解決する悩み・提供価値・訴求ポイントの要約文（監査可能テキスト）"
+        context: "AIへの指示: 製品説明・主な効果・想定ユースケースから生成する。person の appeal_summary と意味的に近い製品を案内する判断に使う。Static Core を超える機能の捏造は禁止。"
+      - name: appeal_vector
+        type: vector
+        description: "appeal_summary を埋め込みモデルで数値化したベクトル（派生フィールド）"
+        context: "AIへの指示: appeal_summary から導出される内部表現で、AI に直接見せない。persons.appeal_vector とのコサイン類似度で『この人に合う製品』を引く。"
+
+  # --- 5. contents（マーケティング素材）---------------------------------------
+  - name: contents
+    physical: {collection: contents, id: content_id}
+    description: "メール等で案内するマーケティング素材（ホワイトペーパー・導入事例・過去ウェビナーのアーカイブ・募集中セミナー等）"
+    context: "AIへの指示: 顧客の関心・悩みに応える『案内できる素材』のカタログ。person の appeal_vector と意味的に近い content を選んで案内する。提示してよい機能・効果はここに帰結する範囲に限る（Static Core）。"
+    identifiers:
+      - {name: content_id, type: primary}
+      - {name: linked_event_id, type: foreign}   # → events（募集中セミナー等を Event と任意リンク）
+    dimensions:
+      - {name: content_name, type: categorical, description: "素材名・タイトル"}
+      - name: content_type
+        type: categorical
+        description: "素材種別"
+        context: "'資料・ホワイトペーパー' / '導入事例' / 'ウェビナーアーカイブ' / '未来のセミナー（募集中）' / '未来のイベント（募集中）' の値をとる。"
+      - {name: url, type: categorical, description: "素材の URL"}
+      - name: appeal_summary
+        type: text
+        description: "この素材がどんな悩みに応えるか・提供価値の要約文（監査可能テキスト）"
+        context: "AIへの指示: 素材のタイトル・概要・対象テーマから生成する。person の appeal_summary と意味的に近い素材を案内する判断に使う。"
+      - name: appeal_vector
+        type: vector
+        description: "appeal_summary を埋め込みモデルで数値化したベクトル（派生フィールド）"
+        context: "AIへの指示: appeal_summary から導出される内部表現で、AI に直接見せない。persons.appeal_vector とのコサイン類似度で『この人に合う素材』を引く。"
+
+  # 注: 旧 challenges（顧客課題 = CEP）マスタは撤回した（ADR-008）。顧客の課題・関心は
+  #     固定ラベルのマスタ＋多対多ブリッジではなく、各マスタの appeal_summary /
+  #     appeal_vector（意味ベクトル）と、その類似度（relationships の semantic_affinity）で
+  #     表現する。理由: ブリッジ肥大とパターンマッチ限定を避け、課題に収まらない関心・
+  #     文脈まで連続的に扱うため。
+
+  # ===========================================================================
+  # II. 行動・関連 dataset（fact。用途ごとに分割。今後さらに増える前提）
+  # ===========================================================================
+
+  # --- 行動ログ A: イベント参加状況（person × event）---------------------------
+  - name: event_attendances
+    physical: {collection: event_attendances, id: attendance_id}
+    description: "顧客のイベントに対する申し込み・参加の履歴"
+    context: "AIへの指示: イベントの集客状況・参加者の歩留まりを計算する際に使う。1人が1イベントに複数アクション（申し込み→参加）を持ち得る。"
+    identifiers:
+      - {name: attendance_id, type: primary}
+      - {name: person_id, type: foreign}      # → persons
+      - {name: event_id,  type: foreign}      # → events
+    dimensions:
+      - name: action_type
+        type: categorical
+        description: "アクション種別"
+        context: "'申し込み' / '参加' / 'アンケート高評価' の値をとる。"
+    metrics:
+      - name: unique_registrations
+        type: count_distinct
+        sql: "{{ datasets.event_attendances.person_id }}"
+        description: "申し込み人数（ユニーク）"
+        filter: "action_type = '申し込み'"
+      - name: unique_attendees
+        type: count_distinct
+        sql: "{{ datasets.event_attendances.person_id }}"
+        description: "実際の参加人数（ユニーク）"
+        filter: "action_type = '参加'"
+
+  # --- 行動ログ B: 製品への興味・商談状況（person × product）-------------------
+  - name: product_interests
+    physical: {collection: product_interests, id: interest_id}
+    description: "顧客が特定の製品に対して示した興味・商談の履歴"
+    context: "AIへの指示: どの製品が誰に注目されているかを分析する際に使う。"
+    identifiers:
+      - {name: interest_id, type: primary}
+      - {name: person_id,  type: foreign}     # → persons
+      - {name: product_id, type: foreign}     # → products
+    dimensions:
+      - name: interest_status
+        type: categorical
+        description: "現在のステータス"
+        context: "'興味あり' / 'デモ実施済み' / 'キャンセル' などの値をとる。"
+    metrics:
+      - name: valid_product_interests
+        type: count_distinct
+        sql: "{{ datasets.product_interests.person_id }}"
+        description: "キャンセルを除外した、製品に興味を持つ有効な顧客数"
+        filter: "interest_status != 'キャンセル'"
+
+  # 注: 旧 person_challenges / product_challenges / content_challenges ブリッジは撤回した
+  #     （ADR-008）。「person の関心 → 合う製品 / 素材 / イベント」のマルチホップ案内は、
+  #     固定ラベルの多対多ブリッジではなく appeal_vector のコサイン類似度（決定論 Python）で
+  #     行う。relationships の semantic_affinity を参照。
+
+  # ===========================================================================
+  # III. 出力・運用 dataset（エージェントの成果物・稼働ログ）
+  #     セグメントは「動的定義 → 施策時点の静的スナップショット（版）→ メンバー」の3層。
+  #     成果物は format を持つ deliverables（メールは一形態）。雛形は segment×bucket×format。
+  # ===========================================================================
+
+  # --- 動的セグメント（フィルタ定義: 軸・バケット・criteria）-------------------
+  - name: segments
+    physical: {collection: segments, id: segment_id}
+    description: "施策ごとに顧客を切り分ける分類軸（軸・バケット・割り当て基準）の定義。これ自体は動的な定義であり、実際のメンバーは施策時点の snapshot で凍結する"
+    context: "AIへの指示: 個別対応は『少数のセグメントに切る → スナップショットでメンバーを凍結 → バケット別にパターン生成 → 決定論的に組み立て』で行う（原則7）。segments は動的な定義（フィルタ条件）であって、確定メンバーではない。"
+    identifiers:
+      - {name: segment_id, type: primary}
+    dimensions:
+      - {name: name,    type: categorical, description: "施策名"}
+      - {name: purpose, type: categorical, description: "施策の目的"}
+
+  # --- 静的スナップショット（施策時点で凍結したメンバーシップの版）-------------
+  - name: segment_snapshots
+    physical: {collection: "segments/{segment_id}/snapshots", id: snapshot_id}
+    description: "ある動的セグメントを施策時点で確定（凍結）したメンバーシップのバージョン。1つの segment に対し複数の snapshot（施策実行ごとの版）が積み重なる"
+    context: "AIへの指示: 動的セグメント（フィルタ）に対し、施策時点で『誰が対象だったか』を確定した静的な版。版は複数保持し、過去施策の対象を後から再現できる。各 marketing_run はどの snapshot を使ったかを参照する。"
+    identifiers:
+      - {name: snapshot_id, type: primary}
+      - {name: segment_id,  type: foreign}    # → segments
+    dimensions:
+      - {name: version,    type: categorical, description: "版（連番またはラベル）"}
+      - {name: created_at, type: time,        description: "凍結日時"}
+      - {name: by_bucket,  type: categorical, description: "バケット別人数の集計（保存サマリ）"}
+
+  - name: segment_assignments
+    physical: {collection: "segments/{segment_id}/snapshots/{snapshot_id}/assignments", id: person_id}
+    description: "あるスナップショットにおける各顧客の所属バケットと根拠（凍結されたメンバー1人）"
+    context: "AIへの指示: 分類は決定論 Python（＋必要時のみ軽量 AI）で行い、各割り当てに reason を残す。assignments は snapshot に属し、版ごとに独立して凍結される。"
+    identifiers:
+      - {name: person_id,   type: foreign}    # → persons（= ドキュメントID）
+      - {name: snapshot_id, type: foreign}    # → segment_snapshots
+      - {name: segment_id,  type: foreign}    # → segments（denormalize）
+    dimensions:
+      - {name: bucket, type: categorical, description: "所属バケット（多軸なら直積セル）"}
+    audit: {reason: required}
+
+  # --- 雛形（テンプレート: segment × bucket × format 単位の生成パターン）-------
+  - name: deliverable_patterns
+    physical: {collection: "segments/{segment_id}/patterns", id: "{bucket}__{format}"}
+    description: "セグメントのバケット別・成果物形式別の生成パターン（雛形）。人手でレビュー・編集できる"
+    context: "AIへの指示: バケットごと・format ごとに1つの雛形を生成する（generate_patterns）。同じバケットでも format（メール/トークスクリプト/提案資料）が違えば別の雛形。Static Core を超える機能の捏造は禁止。雛形は人が編集でき、その後に決定論組み立てで各 person の成果物へ展開する。"
+    identifiers:
+      - {name: segment_id, type: foreign}     # → segments
+    dimensions:
+      - {name: bucket, type: categorical, description: "対象バケット"}
+      - name: format
+        type: categorical
+        description: "成果物の形式"
+        context: "'EMAIL' / 'TALK_SCRIPT' / 'PROPOSAL' などの値をとる。今後増える前提。"
+
+  # --- 個別カスタマイズ成果物（person 単位。メールは一形態）-------------------
+  - name: deliverables
+    physical: {collection: "marketing_runs/{run_id}/deliverables", id: deliverable_id}
+    description: "構成判断を経て生成された、person 単位の個別カスタマイズ成果物（メール・トークスクリプト・提案資料 等）"
+    context: "AIへの指示: 各成果物は決定論的に組み立てる（LLM ゼロ）。format で種別を表し、対応する deliverable_pattern（雛形）から person 向けに展開する。ブロックの採用根拠 reason_for_inclusion を必須で持つ。成果物は person 単位で保存し、所属セグメント/バケットは snapshot 経由で辿る。"
+    identifiers:
+      - {name: deliverable_id, type: primary}
+      - {name: person_id,   type: foreign}    # → persons
+      - {name: run_id,      type: foreign}    # → marketing_runs
+      - {name: snapshot_id, type: foreign}    # → segment_snapshots
+      - {name: pattern_id,  type: foreign}    # → deliverable_patterns（どの雛形から展開したか）
+      - {name: event_id,    type: foreign}    # → events（任意）
+    dimensions:
+      - name: format
+        type: categorical
+        description: "成果物の形式"
+        context: "'EMAIL' / 'TALK_SCRIPT' / 'PROPOSAL' などの値をとる。"
+      - {name: bucket, type: categorical, description: "由来バケット（denormalize）"}
+    audit: {reason_for_inclusion: required}   # 各 DeliverableBlock に対して
+
+  - name: marketing_runs
+    physical: {collection: marketing_runs, id: run_id}
+    description: "施策（個別カスタマイズ成果物の生成）の実行単位"
+    context: "AIへの指示: 1回の施策実行。どの segment のどの snapshot を対象に、どの format の成果物を生成したかを束ねる。"
+    identifiers:
+      - {name: run_id,      type: primary}
+      - {name: segment_id,  type: foreign}    # → segments
+      - {name: snapshot_id, type: foreign}    # → segment_snapshots（使用した版）
+
+  # --- 取り込みジョブ記録（DataIntegrationAgent の稼働ログ）-------------------
+  - name: integration_jobs
+    physical: {collection: integration_jobs, id: job_id}
+    description: "データ取り込みエージェント（DataIntegrationAgent）の1バッチ処理の稼働ログ。列マッピング・抽出・決定論加工の判定根拠・スキップ・サマリを束ねる"
+    context: "AIへの指示: これは『データの来歴』そのものではなく、取り込みエージェントの稼働記録（ジョブログ）である。個々のデータの出自は各レコードの source_job_id / source_file_id から逆引きする。created_entity_ids に当該ジョブが生成したエンティティIDを dataset 名キーで保持する。"
+    identifiers:
+      - {name: job_id, type: primary}         # = batch_id
+    audit: {reason: required}                 # TransformDecision.reason
+
+  # 注: 各 master/fact レコードは source_job_id（= integration_jobs.job_id）と source_file_id を
+  #     inline フィールドとして持ち、来歴は独立オブジェクトではなく各データに紐づく（ユーザー指摘）。
+
+# =============================================================================
+# 知識グラフ（リレーションシップ）— セマンティック宣言のみ（物理 JOIN は行わない）
+# =============================================================================
+relationships:
+  # マスタ間
+  - {name: person_belongs_to_account, left_dataset: persons,  right_dataset: accounts, sql: "{{ left_dataset.account_id }} = {{ right_dataset.account_id }}"}
+
+  # イベント参加ログ
+  - {name: attendance_to_person, left_dataset: event_attendances, right_dataset: persons, sql: "{{ left_dataset.person_id }} = {{ right_dataset.person_id }}"}
+  - {name: attendance_to_event,  left_dataset: event_attendances, right_dataset: events,  sql: "{{ left_dataset.event_id }} = {{ right_dataset.event_id }}"}
+
+  # 製品興味ログ
+  - {name: interest_to_person,  left_dataset: product_interests, right_dataset: persons,  sql: "{{ left_dataset.person_id }} = {{ right_dataset.person_id }}"}
+  - {name: interest_to_product, left_dataset: product_interests, right_dataset: products, sql: "{{ left_dataset.product_id }} = {{ right_dataset.product_id }}"}
+
+  # コンテンツとイベント
+  - {name: content_to_event, left_dataset: contents, right_dataset: events, sql: "{{ left_dataset.linked_event_id }} = {{ right_dataset.event_id }}"}
+
+  # 意味的近接（旧 課題グラフの代替）— FK の等値 JOIN ではなく、appeal_vector 間の
+  # コサイン類似度で結ぶ。物理 JOIN もベクトルインデックスも使わず、決定論 Python の
+  # 総当たり（backend/semantic_search.find_similar）で計算する宣言上の関係。
+  - name: semantic_affinity
+    kind: vector_similarity
+    left_dataset: persons
+    left_field: appeal_vector
+    right_datasets: [contents, products, events]
+    right_field: appeal_vector
+    measure: cosine
+    context: "AIへの指示: 『この人に合うコンテンツ/製品/イベント』を求めるときに使う意味的な近さ。person.appeal_vector と各 offer 側の appeal_vector のコサイン類似度上位を取る。一致根拠は双方の appeal_summary で説明する（Auditable AI）。"
+
+# =============================================================================
+# データセットを跨ぐ高度なビジネス指標
+# =============================================================================
+metrics:
+  - name: event_attendance_rate
+    description: "イベントの参加率（歩留まり）"
+    context: "AIへの指示: 'イベントの参加率' や '歩留まり' と聞かれたらこの指標を返す。"
+    type: ratio
+    numerator: event_attendances.unique_attendees
+    denominator: event_attendances.unique_registrations
