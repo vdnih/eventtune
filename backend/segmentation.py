@@ -23,18 +23,13 @@ from google.genai import types
 from pydantic import BaseModel
 
 from metering import record_llm_response
-from ontology import ProductCode, Segment, SegmentAssignment, SegmentSnapshot
+from ontology import Segment, SegmentAssignment, SegmentSnapshot
 from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
 _MODEL = "gemini-3.1-flash-lite"
 _BATCH_SIZE = 20
-
-_PRODUCT_ID_TO_CODE = {
-    "product_a": ProductCode.PRODUCT_A.value,
-    "product_b": ProductCode.PRODUCT_B.value,
-}
 
 
 def _now_iso() -> str:
@@ -67,10 +62,24 @@ def _iter_persons(space: SpaceContext, event_id: Optional[str] = None) -> Iterat
                 yield data
 
 
-def _get_product_interests(space: SpaceContext, person_id: str) -> list[str]:
-    """person_id に紐づく product_id リストを返す（ProductInterest から）。"""
+def _get_product_interests(space: SpaceContext, person_id: str) -> tuple[list[str], list[str]]:
+    """person_id に紐づく (product_id リスト, product_name リスト) を返す。
+
+    製品名は products マスタ（データ駆動）から解決する。旧 ProductCode のハードコード
+    マッピングは撤去し、取り込みで生成された Product.product_name を参照する。
+    """
     docs = space.col("product_interests").where("person_id", "==", person_id).stream()
-    return [d.to_dict().get("product_id", "") for d in docs if d.to_dict()]
+    product_ids = [d.to_dict().get("product_id", "") for d in docs if d.to_dict()]
+    names: list[str] = []
+    for pid in product_ids:
+        if not pid:
+            continue
+        pdoc = space.doc(f"products/{pid}").get()
+        if pdoc.exists:
+            name = (pdoc.to_dict() or {}).get("product_name", "")
+            if name:
+                names.append(name)
+    return product_ids, names
 
 
 # ── 決定論的割り当て ──────────────────────────────────────────────────────────
@@ -90,8 +99,7 @@ def _deterministic_bucket(
         return None
 
     person_id = person.get("person_id", "")
-    product_ids = _get_product_interests(space, person_id)
-    product_names = [_PRODUCT_ID_TO_CODE.get(pid, pid) for pid in product_ids]
+    product_ids, product_names = _get_product_interests(space, person_id)
     signals = {"product_ids": ", ".join(product_ids)}
 
     for value in axis.values:

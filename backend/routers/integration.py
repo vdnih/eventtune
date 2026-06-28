@@ -1,14 +1,15 @@
 """
 Data Integration Router — /api/integration
 
-ファイルアップロード・イベント提案・バッチ処理の3エンドポイントを提供する。
+ファイルアップロード・取り込みプラン提案・バッチ処理のエンドポイントを提供する。
+docs/INGESTION_MAPPING.md に従い、イベント割り当てではなく「ファイル→オントロジー分解」を行う。
 
-  POST /api/integration/suggest-event  → AI がファイル内容を読みイベント候補を返す
-  POST /api/integration/batches        → file_event_map 付きで実際の取り込みを開始
+  POST /api/integration/plan           → AI がファイル内容を読み分解プラン（種別＋リンク案）を返す
+  POST /api/integration/batches        → hint 付きで実際の取り込みを開始
   GET  /api/integration/batches        → バッチ一覧
   GET  /api/integration/batches/{id}   → バッチ状態
   GET  /api/integration/batches/{id}/report   → 加工レポート
-  GET  /api/integration/batches/{id}/contacts → 取り込み済みコンタクト
+  GET  /api/integration/batches/{id}/contacts → 取り込み済み Person
 """
 
 import json
@@ -44,86 +45,82 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── suggest-event ─────────────────────────────────────────────────────────────
+# ── 取り込みプラン提案 ──────────────────────────────────────────────────────────
 
-class _ProposedEvent(BaseModel):
+class _ProposedLink(BaseModel):
+    kind: str = ""        # "event" | "account" | "product"
     name: str = ""
-    event_date: str | None = None
-    event_type: str | None = None
+    existing: bool = False  # 既存マスタに一致するか
 
 
-class _FileSuggestion(BaseModel):
+class _FilePlan(BaseModel):
     filename: str
-    event_id: str | None = None
-    event_name: str | None = None
-    event_date: str | None = None
-    confidence: float = 0.0
-    is_new_event: bool = False
-    is_multi_event: bool = False
-    # 新規（1件）/複数（N件）の場合に提示する仮タイトル候補。既存一致時は空。
-    proposed_events: list[_ProposedEvent] = []
+    detected_entity_types: list[str] = []  # persons/accounts/events/products/contents/cost_items
+    proposed_links: list[_ProposedLink] = []
+    notes: str = ""
 
 
-class _SuggestResponse(BaseModel):
-    suggestions: list[_FileSuggestion]
+class _PlanResponse(BaseModel):
+    files: list[_FilePlan]
 
 
-@router.post("/suggest-event")
-async def suggest_event(
+def _load_master_names(space: SpaceContext) -> dict[str, list[str]]:
+    """既存マスタ名（events/accounts/products）を取得し、リンク照合のヒントにする。"""
+    out: dict[str, list[str]] = {"events": [], "accounts": [], "products": []}
+    for col, field in (("events", "name"), ("accounts", "account_name"), ("products", "product_name")):
+        try:
+            for doc in space.col(col).get():
+                name = (doc.to_dict() or {}).get(field, "")
+                if name:
+                    out[col].append(name)
+        except Exception:
+            pass
+    return out
+
+
+@router.post("/plan")
+async def plan_ingestion(
     files: list[UploadFile] = File(...),
+    hint: str | None = Form(None),
     space: SpaceContext = Depends(get_space_context),
 ):
-    """ファイルを受け取り、AIが既存イベントとの照合結果を返す（データは保存しない）。"""
-    # ファイルプレビューを構築（テキスト系は先頭500文字、バイナリはファイル名のみ）
+    """ファイルを受け取り、AI が分解プラン（エンティティ種別＋リンク案）を返す（保存しない）。"""
     file_previews = []
     for f in files:
         content = await f.read()
         filename = f.filename or "upload"
         try:
-            preview = content[:600].decode("utf-8", errors="replace")
+            preview = content[:800].decode("utf-8", errors="replace")
         except Exception:
             preview = ""
         file_previews.append({"filename": filename, "preview": preview})
 
-    # 既存イベント一覧を取得
-    events_snap = space.col("events").get()
-    events_list = []
-    for doc in events_snap:
-        d = doc.to_dict()
-        events_list.append({
-            "event_id": d.get("event_id", doc.id),
-            "name": d.get("name", ""),
-            "event_date": d.get("event_date", ""),
-            "event_type": d.get("event_type", ""),
-        })
-    events_list.sort(key=lambda e: e.get("event_date", ""), reverse=True)
+    masters = _load_master_names(space)
+    hint_block = f"\n\n【ユーザーのヒント】\n{hint.strip()}\n" if (hint or "").strip() else ""
 
     prompt = f"""\
-あなたはイベントマーケティングデータの専門家です。
-アップロードされたファイルのリスト（ファイル名と先頭コンテンツ）を読み、
-既存イベント一覧と照合して各ファイルが属するイベントを判定してください。
+あなたはイベントマーケティングデータの統合専門家です。
+アップロードされたファイル（ファイル名と先頭コンテンツ）を読み、各ファイルがオントロジーの
+どのエンティティを含むか、どのマスタにリンクするかを判定してください。イベントは複数マスタの
+1つにすぎません（ファイルを単一イベントに割り当てる発想はしないこと）。
 
-【既存イベント一覧】
-{json.dumps(events_list, ensure_ascii=False)}
+【オントロジーのエンティティ種別】
+persons（人物）, accounts（企業）, events（イベント）, products（製品）, contents（素材）, cost_items（費用）
+※1ファイルに複数種別が含まれることがある（例: 参加者リスト = persons ＋ accounts ＋ events へのリンク）
 
-【アップロードファイル（ファイル名と先頭コンテンツ）】
+【既存マスタ名（リンク照合用）】
+events: {json.dumps(masters["events"], ensure_ascii=False)}
+accounts: {json.dumps(masters["accounts"], ensure_ascii=False)}
+products: {json.dumps(masters["products"], ensure_ascii=False)}
+{hint_block}
+【アップロードファイル】
 {json.dumps(file_previews, ensure_ascii=False)}
 
-各ファイルについて以下を判定してください:
-- event_id: 最も適切な既存イベントの event_id（見つからない場合は null）
-- event_name: 対応するイベント名（null の場合は null）
-- event_date: 対応するイベント開催日（null の場合は null）
-- confidence: 一致の確信度 0.0〜1.0
-- is_new_event: true = 新しいイベントとして取り込むべき（既存イベントに対応しない）
-- is_multi_event: true = このファイルには複数のイベントのデータが含まれる可能性がある
-- proposed_events: 新規作成すべきイベントの仮タイトル候補リスト。各要素は {{name, event_date, event_type}}。
-    - is_new_event が true（単一の新規イベント）→ proposed_events は **1件**。ファイル内容から推定した自然で具体的なイベント名を name に入れる。
-    - is_multi_event が true（複数イベントに分割）→ proposed_events は **分割される件数ぶん（複数件）**。各イベントの名前・日付・種別を入れる。
-    - 既存イベントに一致する場合 → proposed_events は **空リスト**。
-  name は具体的に（例「2025春 ○○展示会」）。event_date は YYYY-MM-DD、不明なら null。
-  event_type は「展示会」「セミナー」「プライベートイベント」のいずれか、不明なら null。
-
-既存イベントが1件もない場合はすべて is_new_event: true にし、proposed_events に推定名を1件入れてください。
+各ファイルについて判定:
+- detected_entity_types: 含まれるエンティティ種別のリスト
+- proposed_links: このファイルのデータが紐づくマスタ案。各要素 {{kind: event|account|product, name: 名称, existing: 既存マスタ名に一致するか}}。
+  行ごとに異なる場合や列で判別できる場合も、代表的なリンク先を挙げる。リンクが無ければ空配列。
+- notes: 判定の補足（曖昧な点、ヒントの反映など）を簡潔に
 """
 
     with metered(space):
@@ -132,39 +129,21 @@ async def suggest_event(
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=_SuggestResponse,
+                response_schema=_PlanResponse,
             ),
         )
     record_llm_response(space, _MODEL, response)
-    result = _SuggestResponse.model_validate_json(response.text)
-    return {"suggestions": [s.model_dump() for s in result.suggestions]}
+    result = _PlanResponse.model_validate_json(response.text)
+    return {"files": [f.model_dump() for f in result.files]}
 
 
 # ── バッチ処理 ─────────────────────────────────────────────────────────────────
-
-def _normalize_event_map(raw: dict) -> dict[str, list[str]]:
-    """file_event_map を {filename: [event_id, ...]} 形式に正規化する。
-
-    後方互換: 値が str なら [str]、null/空なら [] （AI が生成）、list なら空要素を除去。
-    """
-    normalized: dict[str, list[str]] = {}
-    for filename, value in raw.items():
-        if value is None or value == "":
-            normalized[filename] = []
-        elif isinstance(value, str):
-            normalized[filename] = [value]
-        elif isinstance(value, list):
-            normalized[filename] = [v for v in value if v]
-        else:
-            normalized[filename] = []
-    return normalized
-
 
 async def _run_integration(
     space: SpaceContext,
     batch_id: str,
     files: list[tuple[str, bytes]],
-    file_event_map: dict[str, list[str]],
+    hint: str | None,
 ) -> None:
     from agents.data_integration_agent import process_batch
 
@@ -172,7 +151,7 @@ async def _run_integration(
     try:
         scoped.collection("integration_jobs").document(batch_id).update({"status": "processing"})
         with metered(space):
-            results = await process_batch(files, batch_id, scoped, file_event_map, space=space)
+            results = await process_batch(files, batch_id, scoped, hint=hint, space=space)
 
         merged: dict[str, int] = {}
         for r in results:
@@ -184,25 +163,16 @@ async def _run_integration(
         batch_status = "done" if any_ok else "error"
         child_job_ids = [r.job_id for r in results if r.job_id]
 
-        all_event_ids: list[str] = []
-        for r in results:
-            all_event_ids.extend(r.generated_event_ids)
-        for ids in file_event_map.values():
-            all_event_ids.extend(ids)
-        event_ids = list(dict.fromkeys(all_event_ids))
-
         scoped.collection("integration_jobs").document(batch_id).update({
             "status": batch_status,
             "files": [r.to_dict() for r in results],
             "created_entities": merged,
-            "event_ids": event_ids,
-            "event_id": event_ids[0] if event_ids else None,
             "child_job_ids": child_job_ids,
             "partial": any_ok and any_err,
         })
         logger.info(
-            "integration done: batch_id=%s status=%s created=%s event_ids=%s",
-            batch_id, batch_status, merged, event_ids,
+            "integration done: batch_id=%s status=%s created=%s",
+            batch_id, batch_status, merged,
         )
 
     except Exception as e:
@@ -218,14 +188,10 @@ async def _run_integration(
 
 @router.get("/batches")
 async def list_batches(
-    event_id: str | None = None,
     space: SpaceContext = Depends(get_space_context),
 ):
-    """データ統合ジョブの一覧を返す。event_id が指定された場合は絞り込む。"""
-    if event_id:
-        docs = space.col("integration_jobs").where("event_ids", "array_contains", event_id).get()
-    else:
-        docs = space.col("integration_jobs").get()
+    """データ統合ジョブの一覧を返す。"""
+    docs = space.col("integration_jobs").get()
     batches = [d.to_dict() for d in docs]
     batches.sort(key=lambda b: b.get("created_at", ""), reverse=True)
     return {"batches": batches, "count": len(batches)}
@@ -235,55 +201,37 @@ async def list_batches(
 async def start_integration(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-    file_event_map: str | None = Form(None),
+    hint: str | None = Form(None),
     space: SpaceContext = Depends(get_space_context),
 ):
     """複数ファイルをアップロードしデータ統合バッチを開始する。
 
-    file_event_map は JSON文字列で {"<index>": event_id | [event_id, ...] | null, ...} 形式。
-    キーはアップロード順のインデックス（同名ファイルでも衝突しない）。
-    値が空/null のファイルはコンテンツから AI がイベントを生成/解決する。
-    複数 event_id を渡すと、そのファイルのデータを複数の既存イベントへ振り分ける。
+    hint はユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正）。全ファイル共通。
+    取り込みエージェントがファイル内容を読み、オントロジーへ分解・リンク解決する。
     """
-    raw_map: dict = {}
-    if file_event_map:
-        try:
-            raw_map = json.loads(file_event_map)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="file_event_map が不正な JSON です")
-    norm_map = _normalize_event_map(raw_map)
-
-    # 空ファイルをスキップしつつ、元インデックスの割り当てを詰め直したインデックスへ再マップする
-    # （process_batch は loaded の並び順インデックスで参照するため整合させる）。
     loaded: list[tuple[str, bytes]] = []
-    parsed_map: dict[str, list[str]] = {}
-    for orig_idx, f in enumerate(files):
+    for f in files:
         content = await f.read()
         if not content:
             continue
-        new_idx = len(loaded)
         loaded.append((f.filename or "upload", content))
-        parsed_map[str(new_idx)] = norm_map.get(str(orig_idx), [])
 
     if not loaded:
         raise HTTPException(status_code=400, detail="有効なファイルがありません")
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     filenames = [name for name, _ in loaded]
-    all_event_ids = list(dict.fromkeys(eid for ids in parsed_map.values() for eid in ids))
 
     space.col("integration_jobs").document(batch_id).set({
         "batch_id": batch_id,
         "filenames": filenames,
         "files": [{"filename": name, "status": "queued"} for name in filenames],
-        "file_event_map": parsed_map,
-        "event_ids": all_event_ids,
-        "event_id": all_event_ids[0] if all_event_ids else None,
+        "hint": (hint or "").strip(),
         "status": "queued",
         "created_at": _now_iso(),
     })
 
-    background_tasks.add_task(_run_integration, space, batch_id, loaded, parsed_map)
+    background_tasks.add_task(_run_integration, space, batch_id, loaded, (hint or "").strip())
 
     return {"batch_id": batch_id, "filenames": filenames}
 
@@ -303,8 +251,7 @@ async def get_batch_status(
         "status": data.get("status"),
         "filenames": data.get("filenames", []),
         "files": data.get("files", []),
-        "event_id": data.get("event_id"),
-        "event_ids": data.get("event_ids", []),
+        "hint": data.get("hint", ""),
         "created_entities": data.get("created_entities", {}),
         "partial": data.get("partial", False),
         "error": data.get("error"),
@@ -345,7 +292,6 @@ async def get_batch_report(
         "batch_id": batch_id,
         "status": status,
         "cross_file_summary": {
-            "event_ids": batch.get("event_ids", []),
             "files": batch.get("files", []),
             "partial": batch.get("partial", False),
         },
@@ -357,10 +303,10 @@ async def get_batch_report(
 def _format_job_report(job: dict) -> dict:
     return {
         "source": {
-            "filename": job.get("source_filename"),
-            "source_type": job.get("source_type"),
+            "filename": (job.get("filenames") or [None])[0],
             "batch_id": job.get("batch_id"),
             "created_at": job.get("created_at"),
+            "hint": job.get("hint", ""),
         },
         "stage1_ai": {
             "column_mapping": job.get("column_mapping"),
@@ -370,6 +316,7 @@ def _format_job_report(job: dict) -> dict:
             "transformations": job.get("transformations", []),
             "skipped_records": job.get("skipped_records", []),
         },
+        "resolved_links": job.get("resolved_links", []),
         "summary": job.get("transformation_summary"),
         "created_entities": job.get("created_entities", {}),
     }
@@ -385,7 +332,6 @@ async def get_batch_contacts(
     if not batch_doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
 
-    # child_job_ids に含まれる各ジョブで作成された Person を source_job_id で引く
     data = batch_doc.to_dict()
     child_job_ids: list[str] = data.get("child_job_ids") or []
     target_ids = set(child_job_ids) | {batch_id}

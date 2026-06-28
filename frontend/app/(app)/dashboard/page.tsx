@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { API_BASE, authFetch, authHeaders } from "@/lib/api";
 import { useSpace } from "@/lib/space-context";
 import { DeliverableCard } from "@/components/features/agent/DeliverableCard";
-import { Loader2, Send, Upload, Wrench, X, Check, FileText, Trash2, Plus } from "lucide-react";
+import { Loader2, Send, Upload, Wrench, X, Check, FileText } from "lucide-react";
 
 // ── 型定義 ──────────────────────────────────────────────────────────────────
 
@@ -34,49 +34,38 @@ interface DeliverableData {
   engagement_level?: string;
 }
 
+// AIが生成して実行した Python コードとその結果（利用者が検証できるよう可視化する）
+interface CodeBlock {
+  code: string;
+  output?: string;
+  outcome?: string;
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   toolCalls?: ToolCallEvent[];
+  codeBlocks?: CodeBlock[];
   deliverables?: DeliverableData[];
   runId?: string;
   loading?: boolean;
 }
 
-interface EventSummary {
-  event_id: string;
+
+// 取り込みプラン（POST /api/integration/plan のレスポンス）
+interface ProposedLink {
+  kind: string;       // "event" | "account" | "product"
   name: string;
-  event_type: string;
-  event_date: string;
-  status: string;
+  existing: boolean;  // 既存マスタに一致するか
 }
 
-interface ProposedEvent {
-  name: string;
-  event_date: string | null;
-  event_type: string | null;
-}
-
-interface FileSuggestion {
+interface FilePlan {
   filename: string;
-  event_id: string | null;
-  event_name: string | null;
-  event_date: string | null;
-  confidence: number;
-  is_new_event: boolean;
-  is_multi_event: boolean;
-  proposed_events: ProposedEvent[];
+  detected_entity_types: string[];
+  proposed_links: ProposedLink[];
+  notes: string;
 }
-
-interface DraftEvent {
-  id: string;
-  name: string;
-  event_date: string | null;
-  event_type: string | null;
-}
-
-type FilePlans = Record<string, string[]>;
 
 interface FileMeta {
   name: string;
@@ -104,45 +93,6 @@ async function readFileMeta(file: File): Promise<FileMeta> {
     }
   }
   return { name: file.name, size: file.size, type: file.type, lastModified: file.lastModified, preview };
-}
-
-function newDraftId(): string {
-  return `draft_${crypto.randomUUID().slice(0, 8)}`;
-}
-
-function buildInitialState(suggestions: FileSuggestion[]): {
-  draftEvents: DraftEvent[];
-  plans: FilePlans;
-} {
-  const draftEvents: DraftEvent[] = [];
-  const draftByName = new Map<string, string>();
-  const plans: FilePlans = {};
-
-  function ensureDraft(p: ProposedEvent): string {
-    const name = (p.name ?? "").trim();
-    if (name) {
-      const existing = draftByName.get(name);
-      if (existing) return existing;
-    }
-    const id = newDraftId();
-    draftEvents.push({ id, name, event_date: p.event_date ?? null, event_type: p.event_type ?? null });
-    if (name) draftByName.set(name, id);
-    return id;
-  }
-
-  suggestions.forEach((s, i) => {
-    const key = String(i);
-    if (!s.is_new_event && !s.is_multi_event && s.event_id) {
-      plans[key] = [s.event_id];
-      return;
-    }
-    const proposals: ProposedEvent[] =
-      s.proposed_events && s.proposed_events.length > 0
-        ? s.proposed_events
-        : [{ name: s.event_name ?? "", event_date: s.event_date, event_type: null }];
-    plans[key] = proposals.map((p) => ensureDraft(p));
-  });
-  return { draftEvents, plans };
 }
 
 function renderMarkdown(text: string): string {
@@ -194,42 +144,71 @@ function ToolCallIndicator({ toolCalls }: { toolCalls: ToolCallEvent[] }) {
   );
 }
 
+// ── CodeExecutionPanel ────────────────────────────────────────────────────────
+// AIが書いて実行した Python コードと実行結果を表示し、利用者が分析内容を検証できるようにする。
+
+function CodeExecutionPanel({ blocks }: { blocks: CodeBlock[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-2 text-xs border border-sky-100 bg-sky-50 rounded-lg overflow-hidden">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 px-3 py-1.5 w-full text-left text-sky-700 hover:bg-sky-100 transition"
+      >
+        <FileText className="w-3 h-3" />
+        <span>AIが実行したコード（{blocks.length}）</span>
+        <span className="ml-auto text-sky-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-2 space-y-2">
+          {blocks.map((b, i) => (
+            <div key={i} className="space-y-1">
+              <pre className="max-h-60 overflow-auto rounded-lg bg-gray-900 text-gray-100 text-[11px] leading-relaxed font-mono p-3 whitespace-pre-wrap break-all">
+                {b.code}
+              </pre>
+              {(b.output !== undefined) && (
+                <pre className="max-h-48 overflow-auto rounded-lg bg-gray-100 text-gray-700 text-[11px] leading-relaxed font-mono p-3 whitespace-pre-wrap break-all border border-gray-200">
+                  {b.output ? b.output : "(出力なし)"}
+                </pre>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── UploadConfirmModal ────────────────────────────────────────────────────────
 
+const LINK_KIND_LABEL: Record<string, string> = {
+  event: "イベント",
+  account: "企業",
+  product: "製品",
+};
+
 function UploadConfirmModal({
-  suggestions,
+  plan,
   fileMetas,
-  draftEvents,
-  plans,
+  hint,
   uploading,
-  onEditDraftName,
-  onAddDraft,
-  onRemoveDraft,
-  onSetFileTargets,
+  replanning,
+  onHintChange,
+  onReplan,
   onConfirmUpload,
   onCancelUpload,
 }: {
-  suggestions: FileSuggestion[];
+  plan: FilePlan[];
   fileMetas: FileMeta[];
-  draftEvents: DraftEvent[];
-  plans: FilePlans;
+  hint: string;
   uploading: boolean;
-  onEditDraftName: (draftId: string, name: string) => void;
-  onAddDraft: () => string;
-  onRemoveDraft: (draftId: string) => void;
-  onSetFileTargets: (key: string, targetIds: string[]) => void;
+  replanning: boolean;
+  onHintChange: (value: string) => void;
+  onReplan: () => void;
   onConfirmUpload: () => void;
   onCancelUpload: () => void;
 }) {
-  const [events, setEvents] = useState<EventSummary[]>([]);
   const [openPreviews, setOpenPreviews] = useState<Set<string>>(new Set());
-
-  useEffect(() => {
-    authFetch("/api/events")
-      .then((r) => r.json())
-      .then((d) => setEvents(d.events ?? []))
-      .catch(() => setEvents([]));
-  }, []);
 
   function togglePreview(key: string) {
     setOpenPreviews((prev) => {
@@ -239,94 +218,28 @@ function UploadConfirmModal({
     });
   }
 
-  const draftName = (id: string) => draftEvents.find((d) => d.id === id)?.name?.trim() || "（名称未設定）";
-  const eventName = (id: string) => {
-    const ev = events.find((e) => e.event_id === id);
-    return ev ? `${ev.name} (${ev.event_date})` : id;
-  };
-  const isDraft = (id: string) => id.startsWith("draft_");
-  const labelFor = (id: string) => (isDraft(id) ? `🆕 ${draftName(id)}` : eventName(id));
-
-  function targetsOf(key: string): string[] {
-    return plans[key] ?? [];
-  }
-  function addTarget(key: string, id: string) {
-    const cur = targetsOf(key);
-    if (cur.includes(id)) return;
-    onSetFileTargets(key, [...cur, id]);
-  }
-  function removeTarget(key: string, id: string) {
-    onSetFileTargets(key, targetsOf(key).filter((t) => t !== id));
-  }
-  function onAssignSelect(key: string, value: string) {
-    if (!value) return;
-    if (value === "__new__") {
-      const id = onAddDraft();
-      addTarget(key, id);
-      return;
-    }
-    addTarget(key, value);
-  }
-
-  function badgeFor(key: string): { badgeClass: string; badgeText: string } {
-    const targets = targetsOf(key);
-    if (targets.length === 0)
-      return { badgeClass: "bg-gray-100 text-gray-500 border border-gray-200", badgeText: "未割り当て" };
-    if (targets.length > 1)
-      return { badgeClass: "bg-amber-50 text-amber-600 border border-amber-200", badgeText: `⚠️ ${targets.length}件に分割` };
-    return isDraft(targets[0])
-      ? { badgeClass: "bg-green-50 text-green-600 border border-green-200", badgeText: "🆕 新規" }
-      : { badgeClass: "bg-blue-50 text-blue-600 border border-blue-200", badgeText: "既存に紐づけ" };
-  }
+  const busy = uploading || replanning;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[90vh]">
         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
           <div>
-            <h2 className="text-base font-semibold text-gray-900">アップロード確認</h2>
+            <h2 className="text-base font-semibold text-gray-900">取り込み内容の確認</h2>
             <p className="text-xs text-gray-500 mt-0.5">
-              新規イベントの仮タイトルを編集し、各ファイルをどのイベントに紐づけるか選んでください。
+              ファイルの内容を解析しました。分解先とリンクを確認し、必要ならチャットで補足してください。
             </p>
           </div>
-          <button onClick={onCancelUpload} disabled={uploading} className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition disabled:opacity-50">
+          <button onClick={onCancelUpload} disabled={busy} className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition disabled:opacity-50">
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        <div className="px-6 py-3 bg-gray-50 border-b border-gray-100 space-y-1.5">
-          <p className="text-xs font-medium text-gray-600">新規イベント（仮）</p>
-          {draftEvents.length === 0 && (
-            <p className="text-[11px] text-gray-400">新規イベントはありません。各ファイルで「新規イベントを作成」を選ぶと追加されます。</p>
-          )}
-          {draftEvents.map((d) => (
-            <div key={d.id} className="flex items-center gap-2">
-              <span className="text-[11px] shrink-0">🆕</span>
-              <input
-                type="text"
-                value={d.name}
-                placeholder="イベント名（仮）"
-                onChange={(e) => onEditDraftName(d.id, e.target.value)}
-                className="flex-1 text-xs rounded-lg border border-gray-200 px-2.5 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-300"
-              />
-              {d.event_date && <span className="text-[11px] text-gray-400 shrink-0">{d.event_date}</span>}
-              <button onClick={() => onRemoveDraft(d.id)} className="p-1 rounded text-gray-400 hover:text-red-500 hover:bg-red-50 transition shrink-0" title="この新規イベントを削除">
-                <Trash2 className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          ))}
-          <button onClick={() => onAddDraft()} className="flex items-center gap-1 text-[11px] text-indigo-600 hover:text-indigo-700 transition pt-0.5">
-            <Plus className="w-3 h-3" /> 新規イベントを追加
-          </button>
-        </div>
-
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
-          {suggestions.map((s, i) => {
+          {plan.map((fp, i) => {
             const key = String(i);
             const meta = fileMetas[i];
-            const name = meta?.name ?? s.filename;
-            const targets = targetsOf(key);
-            const { badgeClass, badgeText } = badgeFor(key);
+            const name = meta?.name ?? fp.filename;
             const previewOpen = openPreviews.has(key);
             const modified = meta ? new Date(meta.lastModified).toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "short" }) : null;
             return (
@@ -344,8 +257,33 @@ function UploadConfirmModal({
                       </p>
                     )}
                   </div>
-                  <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium shrink-0 ${badgeClass}`}>{badgeText}</span>
                 </div>
+
+                {/* 分解先エンティティ種別 */}
+                <div className="pl-7 flex flex-wrap items-center gap-1.5">
+                  {fp.detected_entity_types.length === 0 ? (
+                    <span className="text-[11px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 border border-gray-200">種別未判定</span>
+                  ) : (
+                    fp.detected_entity_types.map((t) => (
+                      <span key={t} className="text-[11px] px-2 py-0.5 rounded-full font-medium bg-indigo-50 text-indigo-600 border border-indigo-200">{t}</span>
+                    ))
+                  )}
+                </div>
+
+                {/* リンク案 */}
+                {fp.proposed_links.length > 0 && (
+                  <div className="pl-7 flex flex-wrap items-center gap-1.5">
+                    {fp.proposed_links.map((lk, j) => (
+                      <span key={j} className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-lg bg-white border border-gray-200 text-gray-700" title={lk.name}>
+                        <span className="text-gray-400">{LINK_KIND_LABEL[lk.kind] ?? lk.kind}:</span>
+                        <span className="truncate max-w-[180px]">{lk.name}</span>
+                        <span className={lk.existing ? "text-blue-500" : "text-green-600"}>{lk.existing ? "既存" : "新規"}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {fp.notes && <p className="pl-7 text-[11px] text-gray-500">💡 {fp.notes}</p>}
 
                 <div className="pl-7">
                   <button onClick={() => togglePreview(key)} className="text-[11px] text-indigo-600 hover:text-indigo-700 transition">
@@ -357,51 +295,42 @@ function UploadConfirmModal({
                     </pre>
                   )}
                 </div>
-
-                <div className="pl-7 flex flex-wrap items-center gap-1.5">
-                  {targets.map((id) => (
-                    <span key={id} className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-lg bg-white border border-gray-200 text-gray-700">
-                      <span className="truncate max-w-[200px]" title={labelFor(id)}>{labelFor(id)}</span>
-                      <button onClick={() => removeTarget(key, id)} className="text-gray-400 hover:text-red-500 transition" title="割り当てを外す">
-                        <X className="w-3 h-3" />
-                      </button>
-                    </span>
-                  ))}
-                  <select
-                    value=""
-                    onChange={(e) => onAssignSelect(key, e.target.value)}
-                    className="text-[11px] rounded-lg border border-dashed border-gray-300 px-2 py-1 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-indigo-300"
-                  >
-                    <option value="">＋ イベントを割り当て…</option>
-                    <option value="__new__">🆕 新規イベントを作成</option>
-                    {draftEvents.length > 0 && (
-                      <optgroup label="新規イベント（仮）">
-                        {draftEvents.filter((d) => !targets.includes(d.id)).map((d) => (
-                          <option key={d.id} value={d.id}>🆕 {d.name.trim() || "（名称未設定）"}</option>
-                        ))}
-                      </optgroup>
-                    )}
-                    {events.length > 0 && (
-                      <optgroup label="既存イベント">
-                        {events.filter((ev) => !targets.includes(ev.event_id)).map((ev) => (
-                          <option key={ev.event_id} value={ev.event_id}>{ev.name} ({ev.event_date})</option>
-                        ))}
-                      </optgroup>
-                    )}
-                  </select>
-                </div>
               </div>
             );
           })}
         </div>
 
-        <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-between gap-3">
-          <p className="text-xs text-gray-400">{suggestions.length}件のファイル</p>
+        {/* チャットヒント */}
+        <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 space-y-1.5">
+          <p className="text-xs font-medium text-gray-600">チャットで補足（任意）</p>
           <div className="flex gap-2">
-            <button onClick={onCancelUpload} disabled={uploading} className="px-4 py-2 text-sm rounded-xl border border-gray-300 text-gray-600 hover:bg-gray-50 transition disabled:opacity-50">
+            <input
+              type="text"
+              value={hint}
+              placeholder="例: これは2025秋展示会の参加者リストです / これは製品マスタです"
+              onChange={(e) => onHintChange(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && hint.trim() && !busy) onReplan(); }}
+              disabled={busy}
+              className="flex-1 text-xs rounded-lg border border-gray-200 px-2.5 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-300 disabled:opacity-50"
+            />
+            <button
+              onClick={onReplan}
+              disabled={busy || !hint.trim()}
+              className="flex items-center gap-1 px-3 py-2 text-xs rounded-lg border border-gray-300 text-gray-600 hover:bg-white transition disabled:opacity-40"
+            >
+              {replanning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+              再解析
+            </button>
+          </div>
+        </div>
+
+        <div className="px-6 py-4 border-t border-gray-200 flex items-center justify-between gap-3">
+          <p className="text-xs text-gray-400">{plan.length}件のファイル</p>
+          <div className="flex gap-2">
+            <button onClick={onCancelUpload} disabled={busy} className="px-4 py-2 text-sm rounded-xl border border-gray-300 text-gray-600 hover:bg-gray-50 transition disabled:opacity-50">
               キャンセル
             </button>
-            <button onClick={onConfirmUpload} disabled={uploading} className="flex items-center gap-2 px-5 py-2 text-sm rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition disabled:opacity-50">
+            <button onClick={onConfirmUpload} disabled={busy} className="flex items-center gap-2 px-5 py-2 text-sm rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 transition disabled:opacity-50">
               {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
               {uploading ? "取り込み中..." : "まとめて取り込む"}
             </button>
@@ -418,11 +347,11 @@ export default function DashboardPage() {
   const { activeSpace } = useSpace();
   const [uploading, setUploading] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null);
-  const [suggestions, setSuggestions] = useState<FileSuggestion[] | null>(null);
-  const [plans, setPlans] = useState<FilePlans>({});
-  const [draftEvents, setDraftEvents] = useState<DraftEvent[]>([]);
+  const [plan, setPlan] = useState<FilePlan[] | null>(null);
+  const [hint, setHint] = useState("");
   const [fileMetas, setFileMetas] = useState<FileMeta[]>([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
+  const [replanning, setReplanning] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sessionId = useRef<string>(crypto.randomUUID());
@@ -450,42 +379,51 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // ── ファイルアップロード（2ステップ: 提案 → 確認 → 取り込み）──────────────
+  // ── ファイルアップロード（2ステップ: 分解プラン提案 → 確認 → 取り込み）─────────
+
+  async function fetchPlan(files: File[], hintText: string): Promise<FilePlan[]> {
+    const formData = new FormData();
+    files.forEach((f) => formData.append("files", f));
+    if (hintText.trim()) formData.append("hint", hintText.trim());
+    const res = await authFetch("/api/integration/plan", { method: "POST", body: formData });
+    if (!res.ok) throw new Error(`エラー ${res.status}`);
+    const data = await res.json();
+    return (data.files ?? []) as FilePlan[];
+  }
 
   async function handleFileSelect(files: File[]) {
     setPendingFiles(files);
+    setHint("");
     setSuggestLoading(true);
     setFileMetas(await Promise.all(files.map(readFileMeta)));
     try {
-      const formData = new FormData();
-      files.forEach((f) => formData.append("files", f));
-      const res = await authFetch("/api/integration/suggest-event", { method: "POST", body: formData });
-      if (!res.ok) throw new Error(`エラー ${res.status}`);
-      const data = await res.json();
-      const list: FileSuggestion[] = (data.suggestions ?? []).map((s: FileSuggestion) => ({
-        ...s,
-        proposed_events: s.proposed_events ?? [],
-      }));
-      setSuggestions(list);
-      const init = buildInitialState(list);
-      setDraftEvents(init.draftEvents);
-      setPlans(init.plans);
+      setPlan(await fetchPlan(files, ""));
     } catch {
-      const fallback: FileSuggestion[] = files.map((f) => ({
-        filename: f.name, event_id: null, event_name: null, event_date: null,
-        confidence: 0, is_new_event: true, is_multi_event: false, proposed_events: [],
-      }));
-      setSuggestions(fallback);
-      const init = buildInitialState(fallback);
-      setDraftEvents(init.draftEvents);
-      setPlans(init.plans);
+      // 解析に失敗しても確認画面は出す（ヒント＋取り込みは可能）
+      setPlan(files.map((f) => ({
+        filename: f.name, detected_entity_types: [], proposed_links: [],
+        notes: "内容の自動解析に失敗しました。ヒントで補足するか、そのまま取り込めます。",
+      })));
     } finally {
       setSuggestLoading(false);
     }
   }
 
+  // ヒントを反映してプランを再解析する
+  async function handleReplan() {
+    if (!pendingFiles) return;
+    setReplanning(true);
+    try {
+      setPlan(await fetchPlan(pendingFiles, hint));
+    } catch {
+      // プレビューは現状維持
+    } finally {
+      setReplanning(false);
+    }
+  }
+
   async function handleConfirmUpload() {
-    if (!pendingFiles || !suggestions) return;
+    if (!pendingFiles) return;
     setUploading(true);
 
     const label =
@@ -493,31 +431,9 @@ export default function DashboardPage() {
     addAssistantMessage(`${label}を取り込んでいます...`, [], undefined, true);
 
     try {
-      const today = new Date().toISOString().slice(0, 10);
-      const referenced = new Set(Object.values(plans).flat().filter((id) => id.startsWith("draft_")));
-      const draftToReal = new Map<string, string>();
-      for (const d of draftEvents) {
-        if (!referenced.has(d.id)) continue;
-        const name = d.name.trim() || `新規イベント ${today}`;
-        const date = d.event_date || today;
-        const type = d.event_type || "展示会";
-        draftToReal.set(d.id, await createEvent(name, date, type));
-      }
-
-      const fileEventMap: Record<string, string[]> = {};
-      pendingFiles.forEach((_, i) => {
-        const targets = plans[String(i)] ?? [];
-        const ids: string[] = [];
-        for (const id of targets) {
-          const resolved = id.startsWith("draft_") ? draftToReal.get(id) : id;
-          if (resolved && !ids.includes(resolved)) ids.push(resolved);
-        }
-        fileEventMap[String(i)] = ids;
-      });
-
       const formData = new FormData();
       pendingFiles.forEach((f) => formData.append("files", f));
-      formData.append("file_event_map", JSON.stringify(fileEventMap));
+      if (hint.trim()) formData.append("hint", hint.trim());
 
       const res = await authFetch("/api/integration/batches", { method: "POST", body: formData });
       if (!res.ok) {
@@ -527,9 +443,8 @@ export default function DashboardPage() {
       const { batch_id } = await res.json();
 
       setPendingFiles(null);
-      setSuggestions(null);
-      setPlans({});
-      setDraftEvents([]);
+      setPlan(null);
+      setHint("");
       setFileMetas([]);
       pollBatch(batch_id, label);
     } catch (e) {
@@ -540,21 +455,9 @@ export default function DashboardPage() {
 
   function handleCancelUpload() {
     setPendingFiles(null);
-    setSuggestions(null);
-    setPlans({});
-    setDraftEvents([]);
+    setPlan(null);
+    setHint("");
     setFileMetas([]);
-  }
-
-  async function createEvent(name: string, date: string, type: string): Promise<string> {
-    const res = await authFetch("/api/events", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, event_type: type, event_date: date, event_date_end: date }),
-    });
-    if (!res.ok) throw new Error(`イベント作成エラー ${res.status}`);
-    const newEvent = await res.json();
-    return newEvent.event_id;
   }
 
   function pollBatch(batchId: string, label: string) {
@@ -632,6 +535,7 @@ export default function DashboardPage() {
       let buffer = "";
       let accText = "";
       let toolCalls: ToolCallEvent[] = [];
+      let codeBlocks: CodeBlock[] = [];
       let toolRunId: string | null = null;
 
       while (true) {
@@ -667,9 +571,21 @@ export default function DashboardPage() {
             if (event.tool_name === "run_assembly" && typeof parsed.run_id === "string") {
               toolRunId = parsed.run_id as string;
             }
+          } else if (event.type === "code") {
+            codeBlocks = [...codeBlocks, { code: event.code as string }];
+            setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, codeBlocks, toolCalls, loading: true } : m));
+          } else if (event.type === "code_result") {
+            // 直近の未完了コードブロックに実行結果を紐づける
+            const lastIdx = codeBlocks.map((b) => b.output === undefined).lastIndexOf(true);
+            if (lastIdx >= 0) {
+              codeBlocks = codeBlocks.map((b, i) =>
+                i === lastIdx ? { ...b, output: (event.output as string) ?? "", outcome: event.outcome as string } : b
+              );
+              setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, codeBlocks, loading: true } : m));
+            }
           } else if (event.type === "text") {
             accText += event.text as string;
-            setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, content: accText, toolCalls, loading: true } : m));
+            setMessages((prev) => prev.map((m) => m.id === asstMsgId ? { ...m, content: accText, toolCalls, codeBlocks, loading: true } : m));
           } else if (event.type === "done") {
             const detectedRunId = toolRunId ?? extractRunId(accText);
             setMessages((prev) => prev.map((m) =>
@@ -774,28 +690,15 @@ export default function DashboardPage() {
 
   return (
     <div className="h-[calc(100vh-3.5rem)] flex flex-col overflow-hidden bg-white">
-      {suggestions !== null && (
+      {plan !== null && (
         <UploadConfirmModal
-          suggestions={suggestions}
+          plan={plan}
           fileMetas={fileMetas}
-          draftEvents={draftEvents}
-          plans={plans}
+          hint={hint}
           uploading={uploading}
-          onEditDraftName={(draftId, name) =>
-            setDraftEvents((prev) => prev.map((d) => (d.id === draftId ? { ...d, name } : d)))
-          }
-          onAddDraft={() => {
-            const id = newDraftId();
-            setDraftEvents((prev) => [...prev, { id, name: "", event_date: null, event_type: null }]);
-            return id;
-          }}
-          onRemoveDraft={(draftId) => {
-            setDraftEvents((prev) => prev.filter((d) => d.id !== draftId));
-            setPlans((prev) =>
-              Object.fromEntries(Object.entries(prev).map(([fn, ids]) => [fn, ids.filter((id) => id !== draftId)]))
-            );
-          }}
-          onSetFileTargets={(filename, targetIds) => setPlans((prev) => ({ ...prev, [filename]: targetIds }))}
+          replanning={replanning}
+          onHintChange={setHint}
+          onReplan={handleReplan}
           onConfirmUpload={handleConfirmUpload}
           onCancelUpload={handleCancelUpload}
         />
@@ -814,6 +717,10 @@ export default function DashboardPage() {
             >
               {msg.role === "assistant" && msg.toolCalls && msg.toolCalls.length > 0 && (
                 <ToolCallIndicator toolCalls={msg.toolCalls} />
+              )}
+
+              {msg.role === "assistant" && msg.codeBlocks && msg.codeBlocks.length > 0 && (
+                <CodeExecutionPanel blocks={msg.codeBlocks} />
               )}
 
               {msg.loading && !msg.content && <Loader2 className="w-4 h-4 animate-spin text-gray-400" />}

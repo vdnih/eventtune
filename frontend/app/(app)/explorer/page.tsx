@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { ChevronRight, GitBranch, Loader2 } from "lucide-react";
 import { useSpace } from "@/lib/space-context";
+import { authFetch } from "@/lib/api";
 import { DataTable } from "@/components/ui/DataTable";
 import { Drawer } from "@/components/ui/Drawer";
 import { formatDetail, isComplex, pickEntityId } from "@/components/ui/format";
@@ -37,29 +38,17 @@ export default function ExplorerPage() {
   const [lineage, setLineage] = useState<LineageNode[]>([]);
   const [loadingLineage, setLoadingLineage] = useState(false);
 
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
-
-  const fetchWithAuth = useCallback(
-    async (path: string) => {
-      const { auth } = await import("@/lib/firebase");
-      const token = await auth.currentUser?.getIdToken();
-      const res = await fetch(`${apiBase}${path}`, {
-        headers: {
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          ...(spaceId ? { "x-space-id": spaceId } : {}),
-        },
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return res.json();
-    },
-    [apiBase, spaceId]
-  );
+  const fetchJson = useCallback(async (path: string) => {
+    const res = await authFetch(path);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json();
+  }, []);
 
   // Load collection list
   useEffect(() => {
     if (!spaceId) return;
     setLoadingCols(true);
-    fetchWithAuth("/api/data/collections")
+    fetchJson("/api/data/collections")
       .then((data) => {
         const cols: Collection[] = data.collections ?? [];
         setCollections(cols);
@@ -67,7 +56,7 @@ export default function ExplorerPage() {
       })
       .catch(console.error)
       .finally(() => setLoadingCols(false));
-  }, [spaceId, fetchWithAuth]);
+  }, [spaceId, fetchJson]);
 
   // Load rows when active collection changes
   useEffect(() => {
@@ -75,11 +64,11 @@ export default function ExplorerPage() {
     setLoadingRows(true);
     setRows([]);
     setSelectedIndex(null);
-    fetchWithAuth(`/api/data/${activeKey}`)
+    fetchJson(`/api/data/${activeKey}`)
       .then((data) => setRows(data.rows ?? []))
       .catch(console.error)
       .finally(() => setLoadingRows(false));
-  }, [activeKey, spaceId, fetchWithAuth]);
+  }, [activeKey, spaceId, fetchJson]);
 
   const handleSelectRow = useCallback((index: number) => {
     setSelectedIndex((prev) => (prev === index ? null : index));
@@ -92,14 +81,14 @@ export default function ExplorerPage() {
     setDrawerOpen(true);
     setLoadingLineage(true);
     try {
-      const data = await fetchWithAuth(`/api/data/lineage/by-entity/${entityId}`);
+      const data = await fetchJson(`/api/data/lineage/by-entity/${entityId}`);
       setLineage(data.jobs ?? data.lineage ?? []);
     } catch {
       setLineage([]);
     } finally {
       setLoadingLineage(false);
     }
-  }, [selectedRow, fetchWithAuth]);
+  }, [selectedRow, fetchJson]);
 
   return (
     <div className="h-full flex overflow-hidden">

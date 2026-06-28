@@ -61,7 +61,11 @@ export function pickEntityId(row: Record<string, unknown>): string | null {
   return null;
 }
 
-/** 全行のキーの和集合を、出現順を保ちつつ列順として返す。 */
+/**
+ * 全行のキーの和集合を列順として返す。
+ * 全ビューで表示を統一するため、ID列を先頭・名前列を2番目に固定し、残りは出現順を保つ。
+ * モデル固有知識は持たず命名規則で判定する（ID=最初の `*_id`/`id`、名前=`name`→最初の `*_name`）。
+ */
 export function unionColumns(rows: Record<string, unknown>[]): string[] {
   const cols: string[] = [];
   const seen = new Set<string>();
@@ -73,5 +77,9 @@ export function unionColumns(rows: Record<string, unknown>[]): string[] {
       }
     }
   }
-  return cols;
+  const idCol = cols.find((c) => c === "id" || c.endsWith("_id"));
+  const nameCol = cols.find((c) => c === "name") ?? cols.find((c) => c.endsWith("_name"));
+  const lead = [idCol, nameCol].filter((c): c is string => !!c);
+  const rest = cols.filter((c) => !lead.includes(c));
+  return [...lead, ...rest];
 }

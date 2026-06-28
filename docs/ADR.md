@@ -256,5 +256,76 @@ Event は 5 マスタの 1 つにすぎず、唯一のルートではない。
 - 第2バッチで `ontology.py`・新規 `semantic_search.py`（埋め込み・総当たりコサイン・appeal 要約生成）・
   `ontology_mapper.py`・`data_integration_agent.py`・`marketing_agent.py`・`segmentation.py`・
   `routers/data.py`・フロント型を YAML に合わせて再実装する。
+  - 第2バッチのうち**取り込み層**（ファイル→オントロジー分解、Event-Centric な経路キーの撤去、
+    `suggest-event`/`file_event_map` の置換）の概念設計は [`INGESTION_MAPPING.md`](INGESTION_MAPPING.md)
+    に切り出し、実装前のレビューゲートとする（マッピング方式: 自動検出＋チャットヒント）。
 - 任意で YAML と Pydantic のドリフト検出 pytest（dev-only で PyYAML を導入）を追加する。
 - 費用明細・アンケート自由記述など、当面 metrics に畳んだ要素は需要が出た時点で fact dataset 化する。
+
+---
+
+## ADR-009: marketing_agent の自由データ分析を Code Interpreter（Agent Engine サンドボックス）で実現
+
+**ステータス**: 採用
+
+**背景**:
+`marketing_agent` の「振り返り・ROI・分布分析」は、定型化しきれない自由なデータ分析を含む。これを
+**LLM の応答として数値を出す**（ハルシネーションのリスク）でも、**人手で書いた固定の集計ツール**
+（ハードコード／柔軟性の欠如）でもなく、「**AI が分析用 Python を生成 → その実コードが計算 → 生成コードと
+結果をチャットに可視化して利用者が検証できる**」という Code Interpreter パターンで実現したい。
+
+当初実装は `BuiltInCodeExecutor`（Gemini サーバー側コード実行）＋ `get_space_data()` がローカル
+`/tmp/space_data` に書く Parquet という構成だったが、両者は**ファイルシステムを共有せず**生成コードが
+データを読めなかった。加えて Gemini 組み込み code_execution はカスタム関数ツールと併用不可
+（ADK 公式: "Single tool per agent"）で、`get_space_data` 等の関数ツールと共存できなかった。
+暫定の `UnsafeLocalCodeExecutor`（バックエンドプロセス内実行）は動くが、LLM 生成コードを
+サンドボックスなしで実行するため、Cloud Run コンテナのメタデータサーバ経由で GCP 認証情報・他テナント
+データに到達しうる。マルチテナント SaaS（ADR-002 の方向）では受け入れられない。
+
+**決定**:
+コード実行基盤を **Agent Platform / Agent Runtime の Code Execution Sandbox**（Google 管理の隔離環境）に置く。
+当初候補だった Vertex AI Extensions（`VertexAiCodeExecutor`）は **2026-05-26 廃止・2026-11-26 停止**のため不採用。
+サンドボックスの呼び出しは ADK の `code_executor`（CodeAct: モデルに ```python フェンスを書かせ ADK が抽出実行）
+ではなく、**`run_python_code(code)` 関数ツール**から `sandboxes.execute_code` を直接叩く方式にする。
+
+主要な設計判断:
+1. **デプロイは Cloud Run のまま、Agent Engine はマネージドサービスとして外部利用**。バックエンドは
+   多機能 FastAPI Web アプリ（ADR-002）であり、エージェント専用ランタイムである Agent Engine には載せない。
+   公式に「コード実行サンドボックスはエージェントを Agent Runtime にデプロイしなくても利用可」と明記。
+   **Agent Engine（ReasoningEngine）インスタンスを 1 つ作成**し、①コード実行サンドボックスの親、
+   ②セッションストア、の 2 役を兼ねる（コードはデプロイしない）。
+2. **セッションは `InMemorySessionService` → `VertexAiSessionService`**。サンドボックスは
+   `tool_context.state['sandbox_name']` で参照を保持するため、Cloud Run のオートスケール/再起動を跨いで
+   消えないようマネージドセッションに永続させる。これによりステートフルなコード実行が本番でも機能する。
+3. **コード実行は `code_executor` ではなく `run_python_code` 関数ツール**（Google 移行ガイド Option 3 相当）。
+   理由は ADR 末尾「理由」を参照。サンドボックスは `get_space_data()` が `_ensure_sandbox()` でセッション毎に
+   作成し state に保存、`run_python_code` が再利用する（変数・ファイルが持続するステートフル実行）。
+4. **テナント隔離は構造的に成立**。ADK セッションは `user_id="{space_id}:{uid}"` で名前空間化済みで、
+   サンドボックスはセッション毎に作られるため、状態がテナント間で混線しない。
+5. **データ受け渡しは CSV を sandbox に直接投入**。`get_space_data()` が各 dataset を CSV(生 bytes)化し、
+   `sandboxes.execute_code` の `files` 引数で `persons.csv` 等として投入する。ファイルは file state として
+   後続の `run_python_code` でも残る（実機検証済み）。`appeal_vector`（埋め込み）は CSV で扱いづらく分析に
+   不要なので除外し、類似度は決定論 Python（`semantic_search.py`、ADR-008 判断5）が担う。
+6. **コードと実行結果をチャットに可視化**。`chat_stream` が `run_python_code` の tool_call/tool_response を
+   `code` / `code_result` イベントへ変換してフロントの「AIが実行したコード」パネルに表示する。
+   これが「利用者が分析内容を検証できる」という本パターンの肝。
+
+**理由**:
+- 固定ツール化も LLM 直接集計も避けつつ、透明で監査可能な分析（ADR-008 / Auditable AI 思想）を実現する。
+- Google 管理サンドボックスは唯一の本物の隔離境界で、コンテナ認証情報・他テナントデータへの到達を防ぐ。
+- Cloud Run + Agent Engine サービスの分離は公式推奨パターンで、現構成からの変更が最小。
+- ステートフルサンドボックスにより多段分析（分布把握→軸設計）で変数が持続し、再ロード不要で自然に書ける。
+- **`code_executor`（CodeAct）でなく関数ツールにした理由**: 実運用で gemini-3.1-flash-lite がフェンスブロックを
+  書かず、存在しないコード実行ツールを呼ぼうとして失敗した（モデルの自然な本能は「コード実行＝ツール呼び出し」）。
+  関数ツールはこの本能に沿い、プロンプトでフェンス記法を矯正する必要がない。さらに ADK 2.2.0 と
+  aiplatform 1.158.0 の間にあった input_files のキー/型不一致（`contents`↔`content`・base64↔bytes）への
+  プロキシシムも、自分で `execute_code` を正しいキー(`content`)＋生 bytes で呼ぶことで不要になり、配線が単純化した。
+
+**結果 / 将来課題**:
+- Agent Platform API 有効化、実行 SA に `roles/aiplatform.user`、`scripts/provision_agent_engine.py` で
+  Engine を 1 度作成し `.env`（`AGENT_ENGINE_*`）に設定する運用が必要。リージョンは us-central1 等
+  （Gemini 呼び出しの global とは分離）。
+- 課金: Code Execution / Sessions は 2026-01-28 から従量課金（無料枠あり）。
+- サンドボックスは 14 日無使用で状態消失。失効時は `run_python_code` がエラーを返し、`get_space_data()` の
+  再実行（サンドボックス再作成＋CSV 再投入）を促す。
+- チャート（matplotlib 画像）を返す場合は出力ファイルの受け取り処理を足す（当面は数値分析中心で未対応）。

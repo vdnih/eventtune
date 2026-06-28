@@ -50,11 +50,12 @@ VIEWS: dict[str, tuple[str, Callable[[SpaceContext], Iterator[dict]]]] = {
     "events":             ("イベント",            _list_collection("events")),
     "persons":            ("ハウスリスト",        _list_collection("persons")),
     "accounts":           ("企業マスター",         _list_collection("accounts")),
+    "products":           ("製品マスター",         _list_collection("products")),
     "event_attendances":  ("イベント参加",         _list_collection("event_attendances")),
     "product_interests":  ("製品関心",            _list_collection("product_interests")),
     "contents":           ("コンテンツ",          _list_collection("contents")),
     "segments":           ("セグメント",          _list_collection("segments")),
-    "marketing_runs":     ("メール生成ジョブ",    _list_collection("marketing_runs")),
+    "marketing_runs":     ("生成ジョブ",          _list_collection("marketing_runs")),
     "deliverables":       ("生成成果物",          _list_deliverables),
 }
 

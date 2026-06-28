@@ -62,14 +62,6 @@ class ContactStage(str, Enum):
     EXCLUDED = "EXCLUDED"
 
 
-class ProductCode(str, Enum):
-    """製品コード Enum（名寄せ・キーワードマッチに使用）。
-    旧名 Product — ADR-008 で Product は BaseModel マスターに変更されたため改名。
-    """
-    PRODUCT_A = "プロダクトA"
-    PRODUCT_B = "プロダクトB"
-
-
 # ── マスターデータ ─────────────────────────────────────────────────────────────
 
 class Account(BaseModel):
@@ -154,21 +146,26 @@ class EventStatus(str, Enum):
 
 
 class Event(BaseModel):
-    """イベント。KPI・NPS 集計値を畳み込み（旧 EventKPI / SurveyResponse を統合）。"""
+    """イベント。KPI・NPS 集計値を畳み込み（旧 EventKPI / SurveyResponse を統合）。
+
+    取り込みでは参加者ファイル等から「イベント名」だけで参照（リンク）されることがある。
+    その場合 identity フィールドのみのスタブとして書き込まれ、後から概要ファイル等で
+    詳細が merge される。スタブが read 側で valid となるよう必須スカラーに既定値を持つ。
+    """
     event_id: str
     space_id: str = ""
     name: str
-    event_type: EventType
-    status: EventStatus
-    venue: str
-    event_date: str
-    event_date_end: str
+    event_type: EventType = EventType.TRADE_SHOW
+    status: EventStatus = EventStatus.COMPLETED
+    venue: str = ""
+    event_date: str = ""
+    event_date_end: str = ""
     booth_number: Optional[str] = None
     total_budget: float = 0.0
     target_contact_count: int = 0
     description: str = ""
-    created_at: str
-    updated_at: str
+    created_at: str = ""
+    updated_at: str = ""
     # KPI（旧 EventKPI から畳み込み）
     total_visitors_to_booth: Optional[int] = None
     total_contacts_collected: Optional[int] = None
@@ -306,7 +303,12 @@ class ColumnMappingResult(BaseModel):
     entity_type: str
     column_map: dict[str, str]
     unmapped_columns: List[str] = []
-    event_routing_column: Optional[str] = None
+    # 行ごとに異なるリンク先（マスタ）を識別する列。{kind: カラム名}。
+    # kind は "event" | "account" | "product"。旧 event_routing_column を一般化したもの。
+    link_columns: dict[str, str] = {}
+    # ファイル全体に適用するリンク先（行に列が無いとき）。{kind: マスタ名}。
+    # ヒントやファイル文脈から AI が推定する（例 {"event": "2025秋展示会"}）。
+    default_links: dict[str, str] = {}
 
 
 class DocumentExtractionResult(BaseModel):
@@ -350,10 +352,12 @@ class IntegrationJob(BaseModel):
     job_id: str
     space_id: str
     filenames: List[str] = []
-    file_event_map: dict = {}
+    # ユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正に使う）。
+    hint: str = ""
     status: str = "queued"  # "queued" | "running" | "done" | "error"
     created_entities: dict[str, int] = {}
-    event_ids: List[str] = []
+    # このジョブで解決・生成したリンク先マスタの要約 [{kind, name, id}]。
+    resolved_links: List[dict] = []
     column_mapping: Optional[ColumnMappingResult] = None
     raw_extraction: Optional[dict] = None
     transformations: List[EntityTransformation] = []
@@ -362,121 +366,3 @@ class IntegrationJob(BaseModel):
     partial: bool = False
     error: Optional[str] = None
     created_at: str = ""
-
-
-# ── 廃止モデル（後方互換のため残存、新規コードでは使わないこと）────────────────
-
-class EngagementCounts(BaseModel):
-    """廃止: Event.appointments_booked 等に畳み込み済み。"""
-    appointment_booked: int
-    high_intent: int
-    nurturing: int
-
-
-class EventKPI(BaseModel):
-    """廃止: Event モデルに KPI フィールドを畳み込み済み。"""
-    kpi_id: str
-    event_id: str
-    total_visitors_to_booth: int
-    total_contacts_collected: int
-    contacts_by_engagement: EngagementCounts
-    appointments_booked: int
-    demo_sessions_held: int
-    follow_email_open_rate: float
-    follow_email_reply_rate: float
-    pipeline_value_jpy: float
-    closed_deals_3m: int
-    closed_revenue_3m_jpy: float
-    created_at: str
-
-
-class SatisfactionCategory(str, Enum):
-    """廃止: SurveyResponse ごと廃止予定。"""
-    BOOTH_DESIGN    = "ブースデザイン"
-    PRODUCT_DEMO    = "製品デモ"
-    STAFF_RESPONSE  = "スタッフ対応"
-    CONTENT_QUALITY = "コンテンツ品質"
-    OVERALL         = "総合満足度"
-
-
-class SatisfactionScore(BaseModel):
-    """廃止: SurveyResponse ごと廃止予定。"""
-    category: SatisfactionCategory
-    avg_score: float
-    response_count: int
-
-
-class SurveyResponse(BaseModel):
-    """廃止: 集計値は Event モデルに畳み込み済み。"""
-    survey_id: str
-    event_id: str
-    total_responses: int
-    nps_score: float
-    nps_promoters: int
-    nps_passives: int
-    nps_detractors: int
-    satisfaction_scores: List[SatisfactionScore]
-    verbatim_positives: List[str]
-    verbatim_negatives: List[str]
-    verbatim_suggestions: List[str]
-    created_at: str
-
-
-class Contact(BaseModel):
-    """廃止: Person + Account + EventAttendance + ProductInterest に分解済み。"""
-    contact_id: str
-    name: str
-    company_name: str
-    department: str
-    job_title: str
-    email: Optional[str] = None
-    stage: ContactStage = ContactStage.LEAD
-    engagement_level: Optional[EngagementLevel] = None
-    interested_products: List[ProductCode] = []
-    extracted_challenge: str = ""
-    notes: str = ""
-    source_event_id: Optional[str] = None
-
-
-class EmailBlock(BaseModel):
-    """廃止: DeliverableBlock に改名済み。"""
-    block_type: str
-    reason_for_inclusion: str
-    associated_asset_ids: List[str] = []
-    block_text: str
-
-
-class ComposedEmail(BaseModel):
-    """廃止: Deliverable に汎用化済み。"""
-    email_id: str
-    contact_id: str
-    event_id: Optional[str] = None
-    run_id: str
-    subject: str
-    blocks: List[EmailBlock]
-    created_at: str
-
-
-class ContentAsset(BaseModel):
-    """廃止: Content に改名・拡張済み。"""
-    asset_id: str
-    content_type: ContentType
-    name: str
-    description: str
-    url: str
-    linked_event_id: Optional[str] = None
-
-
-class DataLineage(BaseModel):
-    """廃止: IntegrationJob に統合済み。"""
-    lineage_id: str
-    source_filename: str
-    source_type: str
-    batch_id: str
-    column_mapping: Optional[ColumnMappingResult] = None
-    raw_extraction: Optional[dict] = None
-    created_entity_ids: dict[str, List[str]] = {}
-    transformations: List[EntityTransformation] = []
-    skipped_records: List[SkippedRecord] = []
-    transformation_summary: Optional[TransformationSummary] = None
-    created_at: str

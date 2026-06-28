@@ -18,22 +18,23 @@ build_agent(db) で構築する。詳細は docs/PHILOSOPHY_AND_NAMING.md。
 
 import json
 import logging
-import os
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
 
 import pandas as pd
+import vertexai
 from google import genai
 from google.adk.agents import Agent
-from google.adk.code_executors.built_in_code_executor import BuiltInCodeExecutor
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import VertexAiSessionService
 from google.adk.tools import ToolContext
 from google.genai import types
 from pydantic import BaseModel
+from vertexai import types as vai_types
 
+from config import get_settings
 from metering import metered, record_compute, record_llm, record_llm_response
 from ontology import (
     Deliverable,
@@ -48,7 +49,6 @@ from space_data import load_space_data
 logger = logging.getLogger(__name__)
 
 _MODEL = "gemini-3.1-flash-lite"
-_DATA_DIR = "/tmp/space_data"
 
 
 def _normalize_buckets(buckets: Any) -> list[str] | dict:
@@ -119,47 +119,61 @@ _SYSTEM_PROMPT = """\
 プロのマーケターとして、ユーザーの曖昧な意図を読み解き、進め方をあなた自身が組み立てて
 遂行してください。手順は固定されていません。状況に応じてツールを組み合わせてください。
 結果は分かりやすい日本語で、判断の根拠とともに報告してください。
+手元のデータで価値を出すことを最優先にし、欲しい数値が無いことを理由に分析を放棄しないこと。
 
-ROI計算が必要な場合の公式:
+ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / appointments_booked / total_budget）が
+**入力済みのときに限り**算出する（無ければ算出せず、未入力である旨を注記するだけにとどめる）。公式:
   roi_pipeline = (pipeline_value_jpy / total_cost_jpy) × 100 (%)
   cost_per_contact = total_cost_jpy / total_contacts_collected
   cost_per_appointment = total_cost_jpy / appointments_booked
 
-【データ分析 — get_space_data + コード実行】
-データを分析するときは以下の手順で:
+【データ分析 — get_space_data + run_python_code】
+分析は必ず「run_python_code ツールで Python を実行し、その出力（実データの計算結果）に基づいて」行うこと。
+数値を推測・暗算で答えてはならない。手順:
+
 1. get_space_data() を呼ぶ（セッション内で1回だけでよい）
-   → スキーマと件数が返る。Parquet ファイルが /tmp/space_data/ に書き出される。
+   → スキーマ・件数と、サンドボックスに配置された CSV ファイル名一覧が返る。
 
-2. コード実行ブロックで Parquet を pandas として読み込む:
+2. run_python_code(code) ツールを呼んで分析する。CSV は作業ディレクトリにあるので pd.read_csv で読む。例:
 
-   import pandas as pd
-   DATA_DIR = "/tmp/space_data"
-   persons           = pd.read_parquet(f"{DATA_DIR}/persons.parquet")
-   events            = pd.read_parquet(f"{DATA_DIR}/events.parquet")
-   event_attendances = pd.read_parquet(f"{DATA_DIR}/event_attendances.parquet")
-   product_interests = pd.read_parquet(f"{DATA_DIR}/product_interests.parquet")
-   accounts          = pd.read_parquet(f"{DATA_DIR}/accounts.parquet")
-   products          = pd.read_parquet(f"{DATA_DIR}/products.parquet")
-   contents          = pd.read_parquet(f"{DATA_DIR}/contents.parquet")
+   run_python_code(code="persons = pd.read_csv('persons.csv'); print(persons.columns.tolist())")
 
-3. numpy (import numpy as np), pandas (import pandas as pd) が利用可能。
-4. コサイン類似度（appeal_vector 列の比較）:
-   import numpy as np
-   def cosine(a, b):
-       a, b = np.array(a), np.array(b)
-       return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+   他に events.csv / event_attendances.csv / product_interests.csv / accounts.csv / products.csv /
+   contents.csv がある。get_space_data 実行後は pandas が pd、numpy が np として import 済みで使える。
+   scipy 等それ以外を使うときは自分で import する（pip install は不可）。
 
-5. Parquet はセッション中ディスクに残るため再ロード不要。
-   get_space_data() を再呼び出しすれば最新データに更新される。
+【run_python_code の作法（重要）】
+- コードの実行は必ず run_python_code ツールで行う。run_python_code 以外に「コードを実行するツール」は無い。
+- ステートフル: 変数・import・読み込んだファイルはセッション内で持続する。前回 run_python_code で定義した
+  変数や import は次の呼び出しでもそのまま使える。再初期化・再読込・再 import は不要。
+- 出力は必ず print() する（標準出力に出した内容だけが結果として返る）。
+  例: print(df.shape) / print(f"{roi=}") のように、確認したい値を明示的に出力する。
+- データの中身を勝手に仮定しない。列名・型・欠損は df.head() や df.columns で実際に確認してから使う。
+- 各フィールドの型は get_space_data() の返り値の schema を参照する。
 
-各フィールドの型は get_space_data() の返り値の schema フィールドを参照すること。
+【分析・振り返りの進め方（重要）— 1テーブルで早合点しない】
+1. まず俯瞰する: 1つの CSV だけ見て結論を出さない。関係する全データセットの件数・主要列・非欠損状況を
+   確認してから分析に入る。
+2. ファクトテーブルを横断する（Firestore は JOIN しないので pandas で結合・集計する）。具体例:
+   - イベントの**実参加者数** = event_attendances を event_id で件数集計
+     （例: event_attendances[event_attendances.event_id == X].shape[0]）。events の KPI 列ではなくここから出す。
+   - 参加者の属性分布 = event_attendances → persons（→ accounts）を person_id/account_id で merge し、
+     contact_stage / engagement_level / 業種・企業規模で集計。
+   - 関心製品の分布 = product_interests を product_id・イベント別に集計。
+   - 予算・目標名刺数・定性メモ = events の total_budget / target_contact_count / description。
+3. **欠損は「止まる理由」ではなく「注記」**: ある数値列（KPI 等）が NaN でも分析を放棄しない。
+   まず出せる要約を必ず提示し、そのうえで「○○は未入力のため算出不可。入力すれば算出可能」と添える。
+   いきなり「データが無いので振り返れません／入力してください／定性ヒアリングしましょう」に切り替えない。
+4. 「イベントの振り返り」の既定アウトプット例:
+   概要（名称/種別/会場/会期/予算/目標名刺数）＋ 実参加者数（attendances）＋ 参加者の属性・関心の分布
+   ＋ description の定性要点 ＋（KPI があれば）ROI、無ければ未入力項目の注記。
 
 【個別カスタマイズ（メール等）の進め方 — セグメント方式 + HIL】
 全コンタクトに1通ずつフル生成するのではなく、少数のセグメントに切り分け、セグメント単位で
 コンテンツのパターンを作り、各コンタクトのメールは決定論的に組み立てます（高速・低コスト）。
 
 あなたが自律的に進める標準の流れ（ただし各ゲートで必ず確認を取ること = Human-In-the-Loop）:
-  1. get_space_data() でデータをロードし、コード実行で Person の分布を把握して
+  1. get_space_data() でデータをロードし、run_python_code で Person の分布を把握して
      **適切なセグメント軸を自分で設計**する（例: 課題感 × 購買意欲）。
      → 「この軸で切り分けます。よろしいですか？」と提案し**承認を待つ**。
   2. 承認後に define_segment でセグメントを登録し、assign_segment で分類する。
@@ -206,6 +220,78 @@ def _build_schema_text() -> str:
     return "\n".join(lines)
 
 
+# ── Agent Engine コード実行サンドボックス ─────────────────────────────────────
+#
+# コード実行は ADK の code_executor（CodeAct）でなく run_python_code 関数ツールで行う。
+# サンドボックスは Agent Engine 上に「セッション毎に1つ」作り、tool_context.state に名前を保持して
+# 再利用する（変数・ファイルが持続するステートフル実行）。詳細は docs/ADR.md ADR-009。
+
+_vertex: vertexai.Client | None = None
+
+
+def _vertex_client() -> vertexai.Client:
+    global _vertex
+    if _vertex is None:
+        settings = get_settings()
+        _vertex = vertexai.Client(
+            project=settings.google_cloud_project,
+            location=settings.agent_runtime_location,
+        )
+    return _vertex
+
+
+def _ensure_sandbox(tool_context: ToolContext) -> str:
+    """セッション用のコード実行サンドボックスを確保し、resource name を返す。
+
+    既存（RUNNING）があれば再利用、無ければ Agent Engine 上に新規作成して state に保存する。
+    """
+    from google.api_core import exceptions as gapi_exc
+    from google.genai import errors as genai_errors
+
+    client = _vertex_client()
+    name = tool_context.state.get("sandbox_name")
+    if name:
+        try:
+            sb = client.agent_engines.sandboxes.get(name=name)
+            if sb is not None and getattr(sb, "state", None) == "STATE_RUNNING":
+                return name
+        except (gapi_exc.NotFound, genai_errors.ClientError):
+            pass  # 失効 → 作り直す
+
+    settings = get_settings()
+    op = client.agent_engines.sandboxes.create(
+        spec={"code_execution_environment": {}},
+        name=settings.agent_engine_resource_name,
+        config=vai_types.CreateAgentEngineSandboxConfig(
+            display_name="marketing_agent_sandbox",
+            ttl="3600s",
+        ),
+    )
+    name = op.response.name
+    tool_context.state["sandbox_name"] = name
+    return name
+
+
+def _exec_in_sandbox(sandbox_name: str, code: str, files: list[dict] | None = None) -> tuple[str, str]:
+    """サンドボックスでコードを実行し (stdout, stderr) を返す。
+
+    files は [{"name","content"(bytes),"mimeType"}]。execute_code が読むのは 'content'（単数）＋生 bytes。
+    """
+    input_data: dict[str, Any] = {"code": code}
+    if files:
+        input_data["files"] = files
+    resp = _vertex_client().agent_engines.sandboxes.execute_code(
+        name=sandbox_name, input_data=input_data
+    )
+    stdout, stderr = "", ""
+    for out in resp.outputs:
+        attrs = getattr(getattr(out, "metadata", None), "attributes", None)
+        if out.mime_type == "application/json" and (attrs is None or "file_name" not in attrs):
+            j = json.loads(out.data.decode("utf-8"))
+            stdout, stderr = j.get("msg_out", ""), j.get("msg_err", "")
+    return stdout, stderr
+
+
 # ── ツール定義（スペース束縛ファクトリ） ──────────────────────────────────────
 #
 # db は space.ScopedClient（spaces/{space_id}/ で前置済み）。各ツールは db を closure で
@@ -217,17 +303,16 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
     def get_space_data(tool_context: ToolContext) -> str:
         """
-        スペースの全データを Firestore からロードし、Parquet ファイルとして書き出す。
-        分析コードを書く前に必ず呼ぶこと。同一セッションでは1回で十分。
+        スペースの全データを Firestore からロードし、コード実行サンドボックスへ CSV として投入する。
+        分析（run_python_code）の前に必ず1回呼ぶこと。
 
-        Parquet ファイルは /tmp/space_data/ に書き出される。
-        コード実行で pd.read_parquet(f"{DATA_DIR}/{name}.parquet") として読み込む。
+        各データセットは "{name}.csv"（persons.csv 等）としてサンドボックスの作業ディレクトリに置かれ、
+        以降の run_python_code から pd.read_csv("persons.csv") で読める（ファイルはセッション内で持続）。
 
         Returns:
-            { loaded, data_dir, counts, schema }
+            { loaded, files, counts, schema }
         """
         data = load_space_data(space)
-        os.makedirs(_DATA_DIR, exist_ok=True)
 
         datasets: dict[str, list] = {
             "events": data.events,
@@ -240,19 +325,74 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             "segments": data.segments,
         }
         counts: dict[str, int] = {}
+        files: list[dict] = []
         for name, items in datasets.items():
-            df = pd.DataFrame([m.model_dump() for m in items]) if items else pd.DataFrame()
-            df.to_parquet(f"{_DATA_DIR}/{name}.parquet", index=False)
             counts[name] = len(items)
+            df = pd.DataFrame([m.model_dump() for m in items]) if items else pd.DataFrame()
+            # appeal_vector（埋め込み）は CSV で文字列化して扱いづらく、分析には不要なので落とす。
+            # 類似度計算は semantic_search.py（決定論 Python）が担う。
+            if "appeal_vector" in df.columns:
+                df = df.drop(columns=["appeal_vector"])
+            files.append({
+                "name": f"{name}.csv",
+                "content": df.to_csv(index=False).encode("utf-8"),
+                "mimeType": "text/csv",
+            })
 
-        tool_context.state["data_dir"] = _DATA_DIR
+        sandbox = _ensure_sandbox(tool_context)
+        # ファイルをサンドボックスへ投入し、pandas/numpy を pre-import する。
+        # サンドボックスはステートフルなので、ここでの import とファイルは後続 run_python_code でも残る
+        # （= モデルは pd / np を import なしで使える）。
+        setup = (
+            "import pandas as pd\n"
+            "import numpy as np\n"
+            "import os\n"
+            "print(sorted(p for p in os.listdir('.') if p.endswith('.csv')))"
+        )
+        _, stderr = _exec_in_sandbox(sandbox, setup, files=files)
+        if stderr:
+            logger.warning("get_space_data upload stderr: %s", stderr)
         tool_context.state["data_loaded"] = True
 
         schema = _build_schema_text()
         return json.dumps(
-            {"loaded": True, "data_dir": _DATA_DIR, "counts": counts, "schema": schema},
+            {"loaded": True, "files": [f["name"] for f in files], "counts": counts, "schema": schema},
             ensure_ascii=False,
         )
+
+    def run_python_code(code: str, tool_context: ToolContext) -> str:
+        """
+        Python コードをコード実行サンドボックスで実行し、標準出力を返す。データ分析はこのツールで行う。
+
+        - 事前に get_space_data() を呼ぶこと（persons.csv 等が作業ディレクトリに配置される）。
+        - pandas/numpy/scipy/matplotlib は import 済みで利用可能（pip install は不可）。
+        - 結果は必ず print() すること（標準出力だけが返る）。
+        - ステートフル: 変数・import・ファイルはセッション内で持続する（再読込・再定義は不要）。
+
+        Args:
+            code: 実行する Python コード。
+
+        Returns:
+            { stdout, stderr } の JSON 文字列。
+        """
+        from google.api_core import exceptions as gapi_exc
+        from google.genai import errors as genai_errors
+
+        sandbox = tool_context.state.get("sandbox_name")
+        if not sandbox:
+            return json.dumps(
+                {"error": "サンドボックス未初期化です。先に get_space_data() を呼んでください。"},
+                ensure_ascii=False,
+            )
+        try:
+            stdout, stderr = _exec_in_sandbox(sandbox, code)
+        except (gapi_exc.NotFound, genai_errors.ClientError):
+            tool_context.state.pop("sandbox_name", None)
+            return json.dumps(
+                {"error": "サンドボックスが失効しました。get_space_data() を再実行してください。"},
+                ensure_ascii=False,
+            )
+        return json.dumps({"stdout": stdout, "stderr": stderr}, ensure_ascii=False)
 
     def save_report(event_id: str, report_type: str, content: str) -> str:
         """
@@ -418,6 +558,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
     return [
         get_space_data,
+        run_python_code,
         save_report,
         define_segment,
         assign_segment,
@@ -429,19 +570,30 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 # ── エージェント・ランナー構築 ────────────────────────────────────────────────
 
 def build_agent(db: Any, space: SpaceContext) -> Agent:
-    """スペース束縛ツールを持つ Agent をリクエストごとに構築する。"""
+    """スペース束縛ツールを持つ Agent をリクエストごとに構築する。
+
+    コード実行は ADK の code_executor ではなく run_python_code 関数ツールで行う（ADR-009）。
+    関数ツールはモデルが自然に呼べ、Agent Engine サンドボックス（隔離・ステートフル）を直接叩く。
+    """
     return Agent(
         name="marketing_agent",
         model=_MODEL,
         description="イベントマーケティングAIエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
         instruction=_SYSTEM_PROMPT,
         tools=make_tools(db, space),
-        code_executor=BuiltInCodeExecutor(),
     )
 
 
-_session_service = InMemorySessionService()
-_APP_NAME = "event_marketing_platform"
+# セッションは Agent Engine のマネージドセッションに保存する。Cloud Run のオートスケール/再起動を
+# 跨いで session.state（= サンドボックス名）が永続し、ステートフルなコード実行が本番でも機能する。
+# app_name は agent_engine_id に解決される（VertexAiSessionService._get_reasoning_engine_id）。
+_settings = get_settings()
+_session_service = VertexAiSessionService(
+    project=_settings.google_cloud_project,
+    location=_settings.agent_runtime_location,
+    agent_engine_id=_settings.agent_engine_id,
+)
+_APP_NAME = _settings.agent_engine_id
 
 
 def _accumulate_usage(event: Any, totals: dict[str, int]) -> None:
@@ -451,6 +603,17 @@ def _accumulate_usage(event: Any, totals: dict[str, int]) -> None:
         return
     totals["input"] += getattr(usage, "prompt_token_count", 0) or 0
     totals["output"] += getattr(usage, "candidates_token_count", 0) or 0
+
+
+def _parse_tool_response(resp: Any) -> dict:
+    """関数ツールの戻り値（ADK は文字列を {"result": ...} で包むことがある）を dict に正規化する。"""
+    inner = resp.get("result", resp) if isinstance(resp, dict) else resp
+    if isinstance(inner, str):
+        try:
+            return json.loads(inner)
+        except Exception:
+            return {"stdout": inner}
+    return inner if isinstance(inner, dict) else {"stdout": str(inner)}
 
 
 async def chat_stream(
@@ -463,7 +626,9 @@ async def chat_stream(
     MarketingAgent とのチャットを SSE 用のイベント辞書としてストリーミングする。
 
     Yields:
-        { type: "tool_call" | "text" | "done" | "error", ... }
+        { type: "tool_call" | "tool_result" | "code" | "code_result" | "text" | "done" | "error", ... }
+        - code:        AIが生成して実行した Python コード（{code}）
+        - code_result: その実行結果（{outcome, output}）
     """
     db = space.scoped_db()
     # ADKセッションキーをスペースで名前空間化し、スペース間のセッション混線を防ぐ
@@ -496,7 +661,7 @@ async def chat_stream(
             logger.warning("failed to load event context: event_id=%s", event_id)
         message_text = (
             f"[コンテキスト] ユーザーは現在「{event_name}」(event_id={event_id})を選択中です。"
-            "データを分析する場合は get_space_data() を呼んでからコード実行で絞り込んでください。\n\n"
+            "データを分析する場合は get_space_data() を呼んでから run_python_code で絞り込んでください。\n\n"
             f"ユーザーの質問: {message}"
         )
 
@@ -514,23 +679,37 @@ async def chat_stream(
             new_message=user_content,
         ):
             _accumulate_usage(event, usage_totals)
-            # ToolCall イベント
+            # ToolCall イベント。run_python_code は「AIが実行したコード」として可視化する。
             if event.get_function_calls():
                 for fc in event.get_function_calls():
-                    yield {
-                        "type": "tool_call",
-                        "tool_name": fc.name,
-                        "args": dict(fc.args) if fc.args else {},
-                    }
-            # ToolResponse イベント（run_id / segment_id 等の成果物をフロントへ）
+                    if fc.name == "run_python_code":
+                        yield {"type": "code", "code": (fc.args or {}).get("code", "")}
+                    else:
+                        yield {
+                            "type": "tool_call",
+                            "tool_name": fc.name,
+                            "args": dict(fc.args) if fc.args else {},
+                        }
+            # ToolResponse イベント。run_python_code の結果はコード実行結果として可視化する。
             elif event.get_function_responses():
                 for fr in event.get_function_responses():
-                    yield {
-                        "type": "tool_result",
-                        "tool_name": fr.name,
-                        "result": fr.response if isinstance(fr.response, dict) else {"value": fr.response},
-                    }
-            # テキスト応答
+                    if fr.name == "run_python_code":
+                        parsed = _parse_tool_response(fr.response)
+                        out = parsed.get("stdout") or parsed.get("error") or ""
+                        if parsed.get("stderr"):
+                            out = f"{out}\n{parsed['stderr']}" if out else parsed["stderr"]
+                        yield {
+                            "type": "code_result",
+                            "outcome": "ERROR" if (parsed.get("stderr") or parsed.get("error")) else "OK",
+                            "output": out,
+                        }
+                    else:
+                        yield {
+                            "type": "tool_result",
+                            "tool_name": fr.name,
+                            "result": fr.response if isinstance(fr.response, dict) else {"value": fr.response},
+                        }
+            # 最終テキスト応答
             elif event.is_final_response() and event.content and event.content.parts:
                 for part in event.content.parts:
                     if part.text:
