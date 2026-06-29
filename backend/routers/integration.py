@@ -144,6 +144,7 @@ async def _run_integration(
     batch_id: str,
     files: list[tuple[str, bytes]],
     hint: str | None,
+    event: str | None = None,
 ) -> None:
     from agents.data_integration_agent import process_batch
 
@@ -151,7 +152,8 @@ async def _run_integration(
     try:
         scoped.collection("integration_jobs").document(batch_id).update({"status": "processing"})
         with metered(space):
-            results = await process_batch(files, batch_id, scoped, hint=hint, space=space)
+            results = await process_batch(
+                files, batch_id, scoped, hint=hint, space=space, event=event)
 
         merged: dict[str, int] = {}
         for r in results:
@@ -191,11 +193,13 @@ async def start_integration(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     hint: str | None = Form(None),
+    event: str | None = Form(None),
     space: SpaceContext = Depends(get_space_context),
 ):
     """複数ファイルをアップロードしデータ統合バッチを開始する。
 
     hint はユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正）。全ファイル共通。
+    event は明示的な既定イベント名（行にイベントリンクが無いとき使う。hint より強いシグナル）。
     取り込みエージェントがファイル内容を読み、オントロジーへ分解・リンク解決する。
     """
     loaded: list[tuple[str, bytes]] = []
@@ -216,11 +220,13 @@ async def start_integration(
         "filenames": filenames,
         "files": [{"filename": name, "status": "queued"} for name in filenames],
         "hint": (hint or "").strip(),
+        "event": (event or "").strip(),
         "status": "queued",
         "created_at": _now_iso(),
     })
 
-    background_tasks.add_task(_run_integration, space, batch_id, loaded, (hint or "").strip())
+    background_tasks.add_task(
+        _run_integration, space, batch_id, loaded, (hint or "").strip(), (event or "").strip())
 
     return {"batch_id": batch_id, "filenames": filenames}
 

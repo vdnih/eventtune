@@ -407,3 +407,42 @@ PR#11/#12（ADR-008 OSI 移行 ＋ ADR-009 Code Interpreter）は、データモ
 - **「ドキュメントに書いた＝実装した」ではない**。思想ドキュメントは WRITE/READ 双方の配線が揃って初めて
   「実装済み」。生成だけして消費しない派生データ（ベクトル等）はデッドコード化しやすい。
 - **大型 PR の後は doc⇔impl 監査を 1 工程として設ける**。コミットメッセージの「削除した」は実態と乖離し得る。
+
+---
+
+## ADR-011: 取り込みの依存順序化（観測→確定→結合→導出）と同一性の実在照合化
+
+**ステータス**: 採用（概念設計フェーズ。実装は本 ADR と [INGESTION_MAPPING.md](INGESTION_MAPPING.md) のレビュー後）
+
+**背景**:
+取り込み後の JOIN が成立しない不具合（`event_attendances.event_id` がどの `events` にも一致しない、`contents.linked_event_id` が常に空）を調査した結果、症状の奥に**取り込みの概念モデルの誤り**があった。
+
+1. **参照の向きと発見の向きの混同**: `event_attendance → person/event` という FK は「マスタが先」に見えるが、この業務で **Person マスタは入力として与えられない**。与えられるのは「イベントで会った記録（参加者行）」で、Person はその観測を重複排除して導出する**派生ディメンション**（DWH の late-arriving / inferred dimension）。参照の向き（FK）と生成・発見の向き（マスタは観測から conform される）が逆であることが、「データ上は person が先・実務では接客が先」という矛盾の正体。
+2. **粒度の取り違え**: 参加者リスト1行の自然な粒度は person ではなく「接客（encounter）＝観測」。現行 `_decompose_person`（行→Person を主役に分解）はこれを person 粒度と混同していた。
+3. **順序非依存の演出が脆い**: ADR-008 以降、リンクを `stable_id(名前)` ＋ `_write_link_stubs`（inferred member の仮メンバー生成）で順序非依存に見せていた。しかし自然キー（名前ハッシュ）が表記揺れで割れ、後から実体と突き合わせ統合する工程も無いため分裂する。`_build_content` はそもそもリンク解決を呼ばず contents→event が常に未解決だった。
+4. **ファイル到着順 ≠ 依存順** なのに、各ファイルを独立・並列処理しており依存順序を内部に持たない。
+
+**決定**:
+ターゲットのスキーマ（OSI 5マスタ＋ファクト、ADR-008）は維持する。**誤っていたのは取り込みの概念モデル**であり、これを以下へ再設計する。詳細な概念設計は [INGESTION_MAPPING.md](INGESTION_MAPPING.md)。
+
+1. **多段パイプライン「観測 → 確定(conform) → 結合(bind) → 導出(derive)」**。`process_batch` をバッチ横断の多段にし、依存順（マスタ確定 → ファクト結合 → person 集約）を内部に持つ。
+2. **観測(observation)の明示**: ファイルの各行を、列分解の前に **JSON object の行ブロック（`{元列: 値}`、ロスレス）** として捕捉する概念を導入。これが接客の観測＝ファクトの源泉。**一過性**（永続コレクションは作らず OSI 5マスタにも足さない。取り込みは「プロセス」であり OSI の構成要素ではない＝INGESTION_MAPPING の方針を踏襲）。
+3. **全エンティティ UUID 主キー ＋ 検索ベースの find-or-create**: `stable_id`（名前ハッシュ）方式を全廃。重複排除も参照解決も「スペース内の実在エンティティを natural key（events=名前 / accounts=会社名 / products=製品名 / persons=email→氏名×会社）で検索し、ヒットすれば既存 UUID を再利用、無ければ採番」に一本化する。照合は NFKC＋全空白除去＋lower で正規化し、外れたら曖昧一致でフォールバックして根拠を job ログに残す。`_write_link_stubs` は撤去。データ量が小さい前提で各種別をメモリに読み O(N) 照合で足りる。
+   - UUID 化の含意: 名前→ID の計算ショートカットが消えるため、参照は必ず確定済みマスタへの検索で解決される。これが多段の依存順を構造的に強制し、`event_id` 分裂・contents→event 未解決・stub 分裂を一掃する。
+4. **接客事実を EventAttendance へ**: `owner_staff`（接客担当）/`challenge_note`（課題感）/`memo`（所感・要望・注意）を `event_attendances` に追加。旧 `Person.notes`（行→Person に集約していた接客メモ）は廃止。
+5. **Person.appeal_summary はロールアップ導出**: その人の全 `event_attendances`（各回の接客担当・課題感・メモ）＋興味製品を集約して、取り込みの導出フェーズで `appeal_summary` / `appeal_vector` を生成する（ファイル単位生成をやめる）。
+
+**理由**:
+- 参照の向きと発見の向きを分離し、観測（staging）と確定（conform）を明示することで、実務の作業順とデータモデルの整合が両立する（矛盾は概念の欠落から来ていた）。
+- 「実在マスタへの検索 find-or-create」に一本化すると、person 名寄せ・event/account/product 解決・contents→event を**単一機構**で扱え、stub と安定IDの二重管理・表記揺れ分裂が根絶される。
+- UUID 主キーは名前変更に強く、ID 計算の脆さを排す。小規模データなら検索コストは許容（ADR-008 の「集計は Python・総当たり」方針と一貫）。
+
+**結果 / 将来課題**:
+- グリーンフィールド方針（ADR-008）に従い、既存 Firestore データは破棄して入れ直す（移行スクリプトは作らない）。
+- 観測(observation)は当面**永続しない**。後から名寄せをやり直したい／生データ監査が要る要件が出たら、landing コレクション（例 `source_records`）へ昇格する（その時点で再 ADR）。
+- 未解決リンク（検索しても該当マスタが無い）時の挙動（スキップ／保留／ユーザー確認）は INGESTION_MAPPING で確定する。
+- 本 ADR と INGESTION_MAPPING の改稿を**レビューゲート**とし、承認後に実装（`data_integration_agent`／`ontology_mapper`／`semantic_search`／`routers/integration`＋フロント／`segmentation`）へ進む。
+
+**横展開できる学び**:
+- **症状（FKが入らない）の修正前に、参照の向きと生成・発見の向きを分けて捉える**。マスタが観測から導出される（inferred dimension）ドメインでは、FK の向きと取り込みの順序は逆になり得る。
+- **「順序非依存に見せる」設計（安定ID＋stub）は、自然キーの正規化が完全でない限り破綻する**。小規模なら素直に依存順で多段処理し、実在への検索で解決する方が堅い。
