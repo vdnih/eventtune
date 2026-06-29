@@ -34,9 +34,14 @@ import firebase_admin
 from firebase_admin import firestore
 
 # backend/ をインポートパスに追加して config を再利用
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _BACKEND_DIR)
 
-from config import get_settings  # noqa: E402
+from config import Settings  # noqa: E402
+
+# .env は backend/ 直下にある。Settings は env_file を CWD 基準で探すため、
+# scripts/ など別ディレクトリから実行しても読めるよう絶対パスを明示する。
+_ENV_PATH = os.path.join(_BACKEND_DIR, ".env")
 
 # 削除対象。取り込み・解釈の産物のみ。members / usage / threads は意図的に含めない。
 INGESTION_COLLECTIONS = [
@@ -85,7 +90,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    settings = get_settings()
+    settings = Settings(_env_file=_ENV_PATH)
     firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id})
     db = firestore.client()
 

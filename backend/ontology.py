@@ -87,8 +87,10 @@ class Person(BaseModel):
     job_title: str = ""
     stage: ContactStage = ContactStage.LEAD
     engagement_level: Optional[EngagementLevel] = None
+    # 接客事実（課題感・メモ）は EventAttendance へ移譲（ADR-011）。本人の関心・文脈は
+    # appeal_summary に全 attendance を集約してロールアップ生成する。
+    # extracted_challenge は後方互換のため残置するが、取り込みでは populate しない。
     extracted_challenge: str = ""
-    notes: str = ""
     appeal_summary: str = ""
     appeal_vector: List[float] = []
     source_job_id: Optional[str] = None
@@ -109,12 +111,19 @@ class Product(BaseModel):
 # ── ファクトデータ ─────────────────────────────────────────────────────────────
 
 class EventAttendance(BaseModel):
-    """イベント参加ファクト（Person × Event の多対多）。"""
+    """イベント参加ファクト（Person × Event の多対多）。
+
+    接客(encounter)時の事実をここに保持する（ADR-011）: 接客担当・課題感・所感メモ。
+    Person.appeal_summary はこれら全 attendance を集約して導出される。
+    """
     attendance_id: str
     space_id: str
     person_id: str
     event_id: str
     action_type: str = "参加"  # "申し込み" | "参加" | "アンケート高評価"
+    owner_staff: str = ""      # 接客担当者
+    challenge_note: str = ""   # その接客で把握した課題感
+    memo: str = ""             # 所感・要望・注意などの自由メモ
     source_job_id: Optional[str] = None
     created_at: str = ""
 

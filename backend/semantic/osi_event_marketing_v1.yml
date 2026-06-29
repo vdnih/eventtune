@@ -54,7 +54,7 @@ datasets:
   - name: persons
     physical: {collection: persons, id: person_id}
     description: "顧客・見込み客の個人（担当者）の情報。いわゆるハウスリストの1人"
-    context: "AIへの指示: 誰がアクションしたか／どの企業に属すかの起点。旧 Contact を正規化した実体で、企業情報は account へ、興味製品は product_interests へ、参加イベントは event_attendances へ分離した。課題・関心は固定ラベルではなく appeal_summary / appeal_vector（意味ベクトル）で表す。"
+    context: "AIへの指示: 誰がアクションしたか／どの企業に属すかの起点。旧 Contact を正規化した実体で、企業情報は account へ、興味製品は product_interests へ、参加イベントは event_attendances へ分離した。課題・関心は固定ラベルではなく appeal_summary / appeal_vector（意味ベクトル）で表す。【取り込み上の位置づけ】person は『源泉マスタ』ではなく、イベント接客の観測（event_attendances）を email/氏名×会社で重複排除して conform する派生ディメンション（ADR-011 / INGESTION_MAPPING.md）。"
     identifiers:
       - {name: person_id,  type: primary}
       - {name: account_id, type: foreign}     # → accounts
@@ -73,7 +73,7 @@ datasets:
       - name: appeal_summary
         type: text
         description: "その人に何が訴求するか／抱える文脈・ニーズの要約文（監査可能テキスト）"
-        context: "AIへの指示: ヒアリング内容・名刺メモ・過去の行動ログ・興味製品から生成する。固定の課題ラベルの代わりに、この自由文がその人の関心・悩みを表す。content/product/event との一致根拠は、双方の appeal_summary を並べて説明する。"
+        context: "AIへの指示: その人の全 event_attendances（各回の接客担当・課題感・メモ）と興味製品を集約して生成する派生フィールド（取り込みの導出フェーズ。ADR-011）。固定の課題ラベルの代わりに、この自由文がその人の関心・悩みを表す。content/product/event との一致根拠は、双方の appeal_summary を並べて説明する。"
       - name: appeal_vector
         type: vector
         description: "appeal_summary を埋め込みモデルで数値化したベクトル（派生フィールド）"
@@ -165,6 +165,7 @@ datasets:
     identifiers:
       - {name: content_id, type: primary}
       - {name: linked_event_id, type: foreign}   # → events（募集中セミナー等を Event と任意リンク）
+        # 取り込み時はイベント“名”を確定済み events へ検索照合して解決する（ADR-011。名前→IDの計算はしない）。
     dimensions:
       - {name: content_name, type: categorical, description: "素材名・タイトル"}
       - name: content_type
@@ -194,8 +195,8 @@ datasets:
   # --- 行動ログ A: イベント参加状況（person × event）---------------------------
   - name: event_attendances
     physical: {collection: event_attendances, id: attendance_id}
-    description: "顧客のイベントに対する申し込み・参加の履歴"
-    context: "AIへの指示: イベントの集客状況・参加者の歩留まりを計算する際に使う。1人が1イベントに複数アクション（申し込み→参加）を持ち得る。"
+    description: "顧客のイベントでの接客（encounter）の事実。申し込み・参加の履歴に加え、その回の接客担当・課題感・所感メモを保持する"
+    context: "AIへの指示: イベントの集客状況・参加者の歩留まりを計算する際に使う。1人が1イベントに複数アクション（申し込み→参加）を持ち得る。本 fact は『その人をそのイベントでどう接客し、何を聞き取ったか』という観測（事実）であり、persons.appeal_summary はこの観測群を集約して導出される（取り込みの詳細は INGESTION_MAPPING.md。ADR-011）。"
     identifiers:
       - {name: attendance_id, type: primary}
       - {name: person_id, type: foreign}      # → persons
@@ -205,6 +206,12 @@ datasets:
         type: categorical
         description: "アクション種別"
         context: "'申し込み' / '参加' / 'アンケート高評価' の値をとる。"
+      - {name: owner_staff,    type: categorical, description: "接客担当（この回に対応したスタッフ）"}
+      - name: challenge_note
+        type: text
+        description: "この接客で聞き取った相手の課題感・関心（その回の事実）"
+        context: "AIへの指示: 固定ラベルではなく自由文。person 単位の関心像は、この回ごとの challenge_note/memo を集約した persons.appeal_summary が表す。"
+      - {name: memo, type: text, description: "所感・要望・注意などの接客メモ（その回の事実）"}
     metrics:
       - name: unique_registrations
         type: count_distinct

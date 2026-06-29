@@ -202,9 +202,11 @@ function UploadConfirmModal({
   plan,
   fileMetas,
   hint,
+  eventName,
   uploading,
   replanning,
   onHintChange,
+  onEventNameChange,
   onReplan,
   onConfirmUpload,
   onCancelUpload,
@@ -212,9 +214,11 @@ function UploadConfirmModal({
   plan: FilePlan[];
   fileMetas: FileMeta[];
   hint: string;
+  eventName: string;
   uploading: boolean;
   replanning: boolean;
   onHintChange: (value: string) => void;
+  onEventNameChange: (value: string) => void;
   onReplan: () => void;
   onConfirmUpload: () => void;
   onCancelUpload: () => void;
@@ -311,6 +315,19 @@ function UploadConfirmModal({
           })}
         </div>
 
+        {/* 既定イベント名（任意・行にイベントリンクが無いとき使う） */}
+        <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 space-y-1.5">
+          <p className="text-xs font-medium text-gray-600">既定のイベント（任意）</p>
+          <input
+            type="text"
+            value={eventName}
+            placeholder="例: 2025秋展示会（参加者リストの行にイベント列が無いとき紐付け先になります）"
+            onChange={(e) => onEventNameChange(e.target.value)}
+            disabled={busy}
+            className="w-full text-xs rounded-lg border border-gray-200 px-2.5 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-indigo-300 disabled:opacity-50"
+          />
+        </div>
+
         {/* チャットヒント */}
         <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 space-y-1.5">
           <p className="text-xs font-medium text-gray-600">チャットで補足（任意）</p>
@@ -360,6 +377,7 @@ export default function DashboardPage() {
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null);
   const [plan, setPlan] = useState<FilePlan[] | null>(null);
   const [hint, setHint] = useState("");
+  const [eventName, setEventName] = useState("");
   const [fileMetas, setFileMetas] = useState<FileMeta[]>([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
   const [replanning, setReplanning] = useState(false);
@@ -401,6 +419,7 @@ export default function DashboardPage() {
   async function handleFileSelect(files: File[]) {
     setPendingFiles(files);
     setHint("");
+    setEventName("");
     setSuggestLoading(true);
     setFileMetas(await Promise.all(files.map(readFileMeta)));
     try {
@@ -441,6 +460,7 @@ export default function DashboardPage() {
       const formData = new FormData();
       pendingFiles.forEach((f) => formData.append("files", f));
       if (hint.trim()) formData.append("hint", hint.trim());
+      if (eventName.trim()) formData.append("event", eventName.trim());
 
       const res = await authFetch("/api/integration/batches", { method: "POST", body: formData });
       if (!res.ok) {
@@ -452,6 +472,7 @@ export default function DashboardPage() {
       setPendingFiles(null);
       setPlan(null);
       setHint("");
+      setEventName("");
       setFileMetas([]);
       pollBatch(batch_id, label);
     } catch (e) {
@@ -464,6 +485,7 @@ export default function DashboardPage() {
     setPendingFiles(null);
     setPlan(null);
     setHint("");
+    setEventName("");
     setFileMetas([]);
   }
 
@@ -751,9 +773,11 @@ export default function DashboardPage() {
           plan={plan}
           fileMetas={fileMetas}
           hint={hint}
+          eventName={eventName}
           uploading={uploading}
           replanning={replanning}
           onHintChange={setHint}
+          onEventNameChange={setEventName}
           onReplan={handleReplan}
           onConfirmUpload={handleConfirmUpload}
           onCancelUpload={handleCancelUpload}

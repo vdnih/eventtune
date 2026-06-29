@@ -184,7 +184,6 @@ def _classify_batch(
             "job_title": p.get("job_title", ""),
             "engagement_level": p.get("engagement_level"),
             "appeal_summary": p.get("appeal_summary", ""),
-            "notes": p.get("notes", ""),
             "vector_top_bucket": ranks.get(p.get("person_id", ""), ("", 0.0))[0],
         }
         for p in persons
