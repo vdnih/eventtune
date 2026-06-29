@@ -704,6 +704,27 @@ def _parse_tool_response(resp: Any) -> dict:
     return inner if isinstance(inner, dict) else {"stdout": str(inner)}
 
 
+async def ensure_session(session_id: str | None, space: SpaceContext) -> str:
+    """Agent Engine セッションを用意し、確定した session_id（= thread_id）を返す。
+
+    Agent Engine の session_id はサーバ採番のため独自IDは渡せない。
+    - 既存IDあり → resume（get_session で存在確認、無ければ新規採番）
+    - ID未指定   → 新規セッションを採番
+    """
+    # ADKセッションキーをスペースで名前空間化し、スペース間のセッション混線を防ぐ
+    session_user_id = f"{space.space_id}:{space.uid}"
+    if session_id:
+        session = await _session_service.get_session(
+            app_name=_APP_NAME, user_id=session_user_id, session_id=session_id
+        )
+        if session is not None:
+            return session.id
+    session = await _session_service.create_session(
+        app_name=_APP_NAME, user_id=session_user_id  # session_id 未指定 → サーバ採番
+    )
+    return session.id
+
+
 async def chat_stream(
     message: str,
     session_id: str,
@@ -719,7 +740,8 @@ async def chat_stream(
         - code_result: その実行結果（{outcome, output}）
     """
     db = space.scoped_db()
-    # ADKセッションキーをスペースで名前空間化し、スペース間のセッション混線を防ぐ
+    # ADKセッションキーをスペースで名前空間化し、スペース間のセッション混線を防ぐ。
+    # セッション自体は呼び出し元が ensure_session() で用意済み（session_id は確定済みのサーバ採番ID）。
     session_user_id = f"{space.space_id}:{space.uid}"
 
     runner = Runner(
@@ -727,15 +749,6 @@ async def chat_stream(
         app_name=_APP_NAME,
         session_service=_session_service,
     )
-
-    # セッション初期化（既存があれば再利用、無ければ作成）
-    session = await _session_service.get_session(
-        app_name=_APP_NAME, user_id=session_user_id, session_id=session_id
-    )
-    if session is None:
-        session = await _session_service.create_session(
-            app_name=_APP_NAME, user_id=session_user_id, session_id=session_id
-        )
 
     # 選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
     message_text = message
