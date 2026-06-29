@@ -3,6 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { API_BASE, authFetch, authHeaders } from "@/lib/api";
 import { useSpace } from "@/lib/space-context";
+import { useThreads } from "@/hooks/useThreads";
+import { getThreadMessages } from "@/lib/threads";
+import { ThreadSidebar } from "@/components/features/agent/ThreadSidebar";
 import { DeliverableCard } from "@/components/features/agent/DeliverableCard";
 import { Loader2, Send, Upload, Wrench, X, Check, FileText } from "lucide-react";
 
@@ -51,6 +54,14 @@ interface ChatMessage {
   runId?: string;
   loading?: boolean;
 }
+
+// 新規チャットの初期表示（新規作成時のリセットにも再利用する）
+const INITIAL_MESSAGE: ChatMessage = {
+  id: "init",
+  role: "assistant",
+  content:
+    "こんにちは。AIエージェントです。\n\nファイルをアップロードしてデータを取り込むか、チャットで指示をお送りください。\n\n例: 「2025秋の展示会の振り返りをして」「顧客ごとのフォローアップ案を作って」「プロダクトAへの関心が高いリストを分析して」",
+};
 
 
 // 取り込みプラン（POST /api/integration/plan のレスポンス）
@@ -354,15 +365,11 @@ export default function DashboardPage() {
   const [replanning, setReplanning] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const sessionId = useRef<string>(crypto.randomUUID());
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "init",
-      role: "assistant",
-      content:
-        "こんにちは。AIエージェントです。\n\nファイルをアップロードしてデータを取り込むか、チャットで指示をお送りください。\n\n例: 「2025秋の展示会の振り返りをして」「顧客ごとのフォローアップ案を作って」「プロダクトAへの関心が高いリストを分析して」",
-    },
-  ]);
+  // 空文字 = 新規チャット（session_id 未確定）。最初の送信でサーバが採番して確定する。
+  const sessionId = useRef<string>("");
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const { threads, reload: reloadThreads, rename: renameThread, remove: removeThread } = useThreads();
+  const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -517,7 +524,7 @@ export default function DashboardPage() {
       const res = await fetch(`${API_BASE}/api/marketing/chat`, {
         method: "POST",
         headers: await authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
-        body: JSON.stringify({ message: text, session_id: sessionId.current }),
+        body: JSON.stringify({ message: text, session_id: sessionId.current || null }),
       });
 
       if (!res.ok) {
@@ -526,7 +533,10 @@ export default function DashboardPage() {
       }
 
       const newSessionId = res.headers.get("X-Session-Id");
-      if (newSessionId) sessionId.current = newSessionId;
+      if (newSessionId) {
+        sessionId.current = newSessionId;
+        setActiveThreadId(newSessionId);
+      }
 
       const reader = res.body?.getReader();
       if (!reader) throw new Error("ストリームを読み込めません");
@@ -607,7 +617,39 @@ export default function DashboardPage() {
       ));
     } finally {
       setSending(false);
+      // タイトル付きスレッドを左ペインに反映（新規作成・updated_at 更新の両方）
+      reloadThreads();
     }
+  }
+
+  // ── スレッド（会話）切替 ──────────────────────────────────────────────────
+
+  function handleNewChat() {
+    if (sending) return;
+    sessionId.current = "";
+    setActiveThreadId(null);
+    setMessages([INITIAL_MESSAGE]);
+  }
+
+  async function handleSelectThread(threadId: string) {
+    if (sending || threadId === activeThreadId) return;
+    const stored = await getThreadMessages(threadId);
+    const restored: ChatMessage[] = stored.map((m) => ({
+      id: crypto.randomUUID(),
+      role: m.role,
+      content: m.content,
+      toolCalls: m.tool_calls,
+      codeBlocks: m.code_blocks,
+      runId: m.run_id ?? undefined,
+      loading: false,
+    }));
+    sessionId.current = threadId;
+    setActiveThreadId(threadId);
+    setMessages(restored.length > 0 ? restored : [INITIAL_MESSAGE]);
+    // 成果物（deliverables）は runId から再取得して復元する
+    restored.forEach((m) => {
+      if (m.runId) loadRunDeliverables(m.id, m.runId);
+    });
   }
 
   // ── 成果物ポーリング ──────────────────────────────────────────────────────
@@ -679,17 +721,31 @@ export default function DashboardPage() {
 
   // ── レンダリング ─────────────────────────────────────────────────────────
 
-  // activeSpace の変化でセッションをリセット
+  // activeSpace の変化で新規チャットへリセット（スレッド一覧は useThreads が再ロード）
   const prevSpaceId = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (activeSpace && prevSpaceId.current && prevSpaceId.current !== activeSpace.space_id) {
-      sessionId.current = crypto.randomUUID();
+      sessionId.current = "";
+      setActiveThreadId(null);
+      setMessages([INITIAL_MESSAGE]);
     }
     prevSpaceId.current = activeSpace?.space_id;
   }, [activeSpace]);
 
   return (
-    <div className="h-[calc(100vh-3.5rem)] flex flex-col overflow-hidden bg-white">
+    <div className="h-[calc(100vh-3.5rem)] flex overflow-hidden bg-white">
+      <ThreadSidebar
+        threads={threads}
+        activeThreadId={activeThreadId}
+        onSelect={handleSelectThread}
+        onNew={handleNewChat}
+        onRename={renameThread}
+        onDelete={(id) => {
+          removeThread(id);
+          if (id === activeThreadId) handleNewChat();
+        }}
+      />
+      <div className="flex-1 flex flex-col overflow-hidden">
       {plan !== null && (
         <UploadConfirmModal
           plan={plan}
@@ -811,6 +867,7 @@ export default function DashboardPage() {
             {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           </button>
         </form>
+      </div>
       </div>
     </div>
   );
