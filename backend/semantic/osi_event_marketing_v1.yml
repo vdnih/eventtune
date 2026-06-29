@@ -93,14 +93,14 @@ datasets:
     identifiers:
       - {name: event_id, type: primary}
     dimensions:
-      - {name: event_name,  type: categorical, description: "イベント名"}
+      - {name: name,        type: categorical, description: "イベント名（物理フィールド名は name）"}
       - name: event_type
         type: categorical
         description: "イベント種別"
         context: "'展示会' / 'セミナー' / 'プライベートイベント' の値をとる。"
-      - name: event_status
+      - name: status
         type: categorical
-        description: "開催ステータス"
+        description: "開催ステータス（物理フィールド名は status）"
         context: "'計画中' / '開催中' / '終了' の値をとる。"
       - {name: event_date, type: time,        description: "開催日（ISO YYYY-MM-DD）"}
       - {name: venue,      type: categorical, description: "会場"}
@@ -124,15 +124,19 @@ datasets:
       - {name: pipeline_value,      type: sum,   sql: "{{ datasets.events.pipeline_value_jpy }}",        description: "創出パイプライン金額（JPY）"}
       - {name: closed_revenue_3m,   type: sum,   sql: "{{ datasets.events.closed_revenue_3m_jpy }}",     description: "3か月以内成約売上（JPY）"}
       - {name: nps_score,           type: avg,   sql: "{{ datasets.events.nps_score }}",                 description: "NPS（-100〜100）"}
-      - {name: total_cost,          type: sum,   sql: "{{ datasets.events.total_cost_jpy }}",            description: "総費用（JPY）"}
+      - name: total_cost
+        type: sum
+        sql: "SUM(events/{event_id}/costs.amount_jpy)"
+        description: "総費用（JPY）"
+        context: "AIへの指示: Event 本体に total_cost_jpy 列は無い。費用は events/{event_id}/costs サブコレクション（CostItem.amount_jpy）の合計から算出する。"
       - name: cost_per_acquisition
         type: ratio
         numerator: total_cost
         denominator: contacts_collected
         description: "名刺1件あたり費用（CPA, JPY）"
         context: "AIへの指示: 'CPA' や '費用対効果' を聞かれたらこれを使う。"
-    # 注: アンケート自由記述や費用明細（費目1行ごと）が必要になった場合は、
-    #     survey_verbatims / event_costs を独立 fact dataset として将来追加する。
+    # 実装済み: 費用明細は events/{event_id}/costs（CostItem）に1行ごと保持する。
+    # 将来: アンケート自由記述（survey_verbatims）が必要になれば独立 fact dataset を追加する。
 
   # --- 4. products（自社プロダクト・ソリューション）-----------------------------
   - name: products
@@ -328,13 +332,14 @@ datasets:
   - name: integration_jobs
     physical: {collection: integration_jobs, id: job_id}
     description: "データ取り込みエージェント（DataIntegrationAgent）の1バッチ処理の稼働ログ。列マッピング・抽出・決定論加工の判定根拠・スキップ・サマリを束ねる"
-    context: "AIへの指示: これは『データの来歴』そのものではなく、取り込みエージェントの稼働記録（ジョブログ）である。個々のデータの出自は各レコードの source_job_id / source_file_id から逆引きする。created_entity_ids に当該ジョブが生成したエンティティIDを dataset 名キーで保持する。"
+    context: "AIへの指示: これは『データの来歴』そのものではなく、取り込みエージェントの稼働記録（ジョブログ）である。個々のデータの出自は各レコードの source_job_id から逆引きする。created_entities に当該ジョブが生成したエンティティの『件数』を Pydantic クラス名キー（'Person' / 'Account' 等）で保持する。"
     identifiers:
       - {name: job_id, type: primary}         # = batch_id
     audit: {reason: required}                 # TransformDecision.reason
 
-  # 注: 各 master/fact レコードは source_job_id（= integration_jobs.job_id）と source_file_id を
-  #     inline フィールドとして持ち、来歴は独立オブジェクトではなく各データに紐づく（ユーザー指摘）。
+  # 注: 各 master/fact レコードは source_job_id（= integration_jobs.job_id）を inline フィールド
+  #     として持ち、来歴は独立オブジェクトではなく各データに紐づく。ファイル単位の source_file_id は
+  #     導入せず、ジョブの filenames で代替する。
 
 # =============================================================================
 # 知識グラフ（リレーションシップ）— セマンティック宣言のみ（物理 JOIN は行わない）

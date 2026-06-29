@@ -39,10 +39,13 @@ from metering import metered, record_compute, record_llm, record_llm_response
 from ontology import (
     Deliverable,
     DeliverableBlock,
+    DeliverablePattern,
+    MarketingRun,
     Segment,
     SegmentAxis,
 )
 from segmentation import assign_contacts_to_segment
+from semantic_search import find_similar
 from space import SpaceContext
 from space_data import load_space_data
 
@@ -95,25 +98,39 @@ _SYSTEM_PROMPT = """\
 
 【プラットフォームの思想】
 このプラットフォームは、展示会・セミナー・イベントを中心に、カオスなマーケティングデータを
-オントロジーに統合し、AIエージェントがマーケティング活動を行うための基盤です。
+オントロジー（OSI セマンティックレイヤー）に統合し、AIエージェントがマーケティング活動を
+行うための基盤です。データは星座型（ファクト・コンステレーション）で、複数のマスタ（持続する
+実体）を、参加・関心といったファクト（出来事）が結びつける構造になっています。
 
 設計原則:
-- Event-Centric: すべてのデータは「どのイベントで」という文脈を持つ
 - Ontology-First: データは必ずオントロジーへのマッピングを経由する
+- Semantic Affinity: 「誰に何が合うか」は固定の課題ラベルではなく、各実体の appeal_summary
+  （関心・価値の自然文要約）と appeal_vector（その埋め込み）の意味的近接（コサイン類似度）で表す
 - Auditable AI: すべてのAI判断には根拠が必要。reason_for_inclusion は Optional 不可
 - Historical Intelligence: イベントをまたいだ蓄積・比較・学習が価値を持つ
 
 【オントロジーの定義】
-- Event: 展示会・セミナー・イベントの記録。KPI・費用を直接保持する
+マスタ（持続する実体。それぞれ appeal_summary / appeal_vector を持つ）:
 - Person: ハウスリストの人物（旧 Contact）。ContactStage と EngagementLevel を持つ
   - ContactStage: LEAD / MQL / SQL / CUSTOMER / EXCLUDED
   - EngagementLevel (stage=LEAD のとき有効): アポ獲得済み / アポなし・感度高 / 通常リード
 - Account: 企業マスター。Person に account_id で紐づく
-- EventAttendance: イベント × Person のファクトテーブル（誰がどのイベントに参加したか）
-- ProductInterest: 製品 × Person のファクトテーブル（誰がどの製品に関心を持つか）
+- Product: 製品マスター
 - Content: 推薦可能なコンテンツ（資料・事例・セミナー等）
-- Deliverable: AIが生成したメール等の成果物。DeliverableBlock のリストで構成
+- Event: 展示会・セミナー・イベントの記録。KPI・費用を直接保持する
+ファクト（マスタ同士を結ぶ出来事テーブル）:
+- EventAttendance: イベント × Person（誰がどのイベントに参加したか）
+- ProductInterest: 製品 × Person（誰がどの製品に関心を持つか）
+成果物:
+- Deliverable: AIが生成したメール等の成果物。format（EMAIL/TALK_SCRIPT/PROPOSAL）と
+  DeliverableBlock のリストで構成
   - DeliverableBlock.reason_for_inclusion: そのブロックを含めた理由（必須・非null）
+
+【意味検索 — find_relevant_for_person】
+「この人に合うコンテンツ/製品/イベント」を引くときは find_relevant_for_person(person_id, target)
+を使う（target = "contents" | "products" | "events"）。appeal_vector のコサイン近接で上位候補と
+その appeal_summary・類似スコアが返る。これを個別メールのコンテンツ選定やおすすめの根拠に使う。
+固定の課題ラベルで決め打ちせず、必ず意味的近接（と appeal_summary）に帰結させること。
 
 【あなたの役割】
 プロのマーケターとして、ユーザーの曖昧な意図を読み解き、進め方をあなた自身が組み立てて
@@ -394,6 +411,58 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             )
         return json.dumps({"stdout": stdout, "stderr": stderr}, ensure_ascii=False)
 
+    def find_relevant_for_person(person_id: str, target: str = "contents", top_k: int = 5) -> str:
+        """
+        指定 Person の appeal_vector に意味的に近い候補を上位 top_k 返す（コサイン類似度・決定論）。
+
+        固定の課題ラベルではなく、人物の関心・文脈の埋め込み（appeal_vector）と各マスタの
+        appeal_vector の近接で「この人に合うもの」を引く。個別メールのコンテンツ選定や、
+        おすすめ製品・次に案内すべきイベントの根拠出しに使う。
+
+        Args:
+            person_id: 対象 Person の ID
+            target: "contents" | "products" | "events" のいずれか（既定 contents）
+            top_k: 返す件数（既定 5）
+
+        Returns:
+            { person_id, target, results: [{id, name, appeal_summary, score}] } の JSON 文字列
+        """
+        cols = {
+            "contents": ("content_id", "content_name"),
+            "products": ("product_id", "product_name"),
+            "events":   ("event_id", "name"),
+        }
+        if target not in cols:
+            return json.dumps({"error": f"target は {list(cols)} のいずれか"}, ensure_ascii=False)
+
+        pdoc = db.collection("persons").document(person_id).get()
+        if not pdoc.exists:
+            return json.dumps({"error": f"person_id '{person_id}' not found"}, ensure_ascii=False)
+        pvec = (pdoc.to_dict() or {}).get("appeal_vector") or []
+        if not pvec:
+            return json.dumps(
+                {"error": "この Person には appeal_vector が無く意味検索できません（取り込み時に未生成）"},
+                ensure_ascii=False,
+            )
+
+        id_field, name_field = cols[target]
+        candidates = [(d.to_dict(), (d.to_dict() or {}).get("appeal_vector") or [])
+                      for d in db.collection(target).get()]
+        ranked = find_similar(pvec, candidates, top_k=top_k)
+        results = [
+            {
+                "id": item.get(id_field, ""),
+                "name": item.get(name_field, ""),
+                "appeal_summary": item.get("appeal_summary", ""),
+                "score": round(score, 4),
+            }
+            for item, score in ranked
+        ]
+        return json.dumps(
+            {"person_id": person_id, "target": target, "results": results},
+            ensure_ascii=False,
+        )
+
     def save_report(event_id: str, report_type: str, content: str) -> str:
         """
         分析レポートや戦略提案を Firestore に保存する。
@@ -484,6 +553,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         purpose: str = "",
         context: str = "",
         content_ids: list[str] = [],
+        output_format: str = "EMAIL",
     ) -> str:
         """
         バケットごとに1つずつコンテンツパターン（件名＋本文ブロック）を生成する（HILゲート②承認後）。
@@ -491,8 +561,13 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
         本文中の個人差分は {name} {company_name} {department} {job_title} のプレースホルダで表現する。
 
+        Args:
+            output_format: 成果物の形式。"EMAIL"（既定）/ "TALK_SCRIPT" / "PROPOSAL"。
+                           パターンは "{bucket}__{output_format}" をキーに保存し、同じ format を
+                           指定した run_assembly が参照する。
+
         Returns:
-            { segment_id, patterns: [{bucket, subject}], count }
+            { segment_id, format, patterns: [{bucket, pattern_id, subject}], count }
         """
         doc = db.collection("segments").document(segment_id).get()
         if not doc.exists:
@@ -509,34 +584,43 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         results = []
         with metered(space):
             for bucket in segment.buckets:
-                pattern = _generate_one_pattern(space, segment, bucket, eff_purpose, context, assets)
-                pattern_key = f"{bucket}__EMAIL"
-                db.collection(f"segments/{segment_id}/patterns").document(pattern_key).set(pattern)
-                results.append({"bucket": bucket, "pattern_key": pattern_key, "subject": pattern.get("subject", "")})
+                pattern = _generate_one_pattern(
+                    space, segment, bucket, eff_purpose, context, assets, output_format
+                )
+                db.collection(f"segments/{segment_id}/patterns").document(pattern.pattern_id).set(
+                    pattern.model_dump()
+                )
+                results.append({
+                    "bucket": bucket,
+                    "pattern_id": pattern.pattern_id,
+                    "subject": pattern.subject,
+                })
         return json.dumps(
-            {"segment_id": segment_id, "patterns": results, "count": len(results)},
+            {"segment_id": segment_id, "format": output_format, "patterns": results, "count": len(results)},
             ensure_ascii=False,
         )
 
-    def run_assembly(segment_id: str, snapshot_id: str = "") -> str:
+    def run_assembly(segment_id: str, snapshot_id: str = "", output_format: str = "EMAIL") -> str:
         """
-        セグメントの分類とパターンから、各 Person のメールを決定論的に組み立てる（HILゲート③の
+        セグメントの分類とパターンから、各 Person の成果物を決定論的に組み立てる（HILゲート③の
         明示承認後にのみ呼ぶ）。LLMは使わずプレースホルダ置換で組み立てるため高速。
         結果は marketing_runs に保存し、CSVは GET /api/marketing/runs/{run_id}/export で取得できる。
 
         Args:
             segment_id: 対象セグメント
             snapshot_id: 使用するスナップショット（省略時は最新）
+            output_format: 組み立てる形式。generate_patterns で生成した format と一致させること
+                           （既定 "EMAIL"）。パターンは "{bucket}__{output_format}" で引く。
 
         Returns:
-            { run_id, count, snapshot_id }
+            { run_id, count, snapshot_id, format }
         """
         doc = db.collection("segments").document(segment_id).get()
         if not doc.exists:
             return json.dumps({"error": f"segment_id '{segment_id}' not found"})
         segment = Segment.model_validate(doc.to_dict())
 
-        # パターン未生成チェック
+        # パターン未生成チェック（pattern_id = "{bucket}__{format}" をキーに保持）
         patterns = {
             p.id: p.to_dict()
             for p in db.collection(f"segments/{segment_id}/patterns").get()
@@ -553,12 +637,16 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             snapshot_id = snap_docs[0].id
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
-        count = _assemble_run(db, segment, patterns, run_id, snapshot_id)
-        return json.dumps({"run_id": run_id, "count": count, "snapshot_id": snapshot_id}, ensure_ascii=False)
+        count = _assemble_run(db, segment, patterns, run_id, snapshot_id, output_format)
+        return json.dumps(
+            {"run_id": run_id, "count": count, "snapshot_id": snapshot_id, "format": output_format},
+            ensure_ascii=False,
+        )
 
     return [
         get_space_data,
         run_python_code,
+        find_relevant_for_person,
         save_report,
         define_segment,
         assign_segment,
@@ -754,12 +842,18 @@ def _generate_one_pattern(
     purpose: str,
     context: str,
     assets: list[dict],
-) -> dict:
-    """1バケットぶんのコンテンツパターンを生成して dict で返す。"""
+    output_format: str = "EMAIL",
+) -> DeliverablePattern:
+    """1バケットぶんのコンテンツパターンを生成して DeliverablePattern で返す。"""
     assets_text = json.dumps(assets, ensure_ascii=False, indent=2) if assets else "（なし）"
+    format_label = {
+        "EMAIL": "メール",
+        "TALK_SCRIPT": "電話・商談トークスクリプト",
+        "PROPOSAL": "提案書",
+    }.get(output_format, "メール")
     system_prompt = f"""\
-あなたはプロのマーケターです。施策「{segment.name}」のために、あるセグメントへ送る
-メールの**ひな型（パターン）**を1つ作成してください。個々人に1通ずつではなく、この
+あなたはプロのマーケターです。施策「{segment.name}」のために、あるセグメントへ届ける
+{format_label}の**ひな型（パターン）**を1つ作成してください。個々人に1通ずつではなく、この
 セグメントに共通して使えるテンプレートを作ります。
 
 【施策の目的】
@@ -783,7 +877,7 @@ def _generate_one_pattern(
 - associated_asset_ids: 参照したコンテンツ資産の content_id を設定する。
 
 【ブランドの一貫性（必ず守る）】
-- 1機能フォーカス: このメールでは相手の課題に直結する「1つの機能（解決策）」のみを提示し、
+- 1機能フォーカス: この{format_label}では相手の課題に直結する「1つの機能（解決策）」のみを提示し、
   複数機能やプラットフォーム全体像を詰め込まない。
 - 捏造禁止: 提示する機能・効果は上記【参照するコンテンツ資産】に実在するものに限定する。
   資産に無い機能・誇張・本来と異なる用途を創作しない（解決策はマスターに帰結させる）。
@@ -801,12 +895,15 @@ def _generate_one_pattern(
     )
     record_llm_response(space, _MODEL, response)
     pattern = _PatternSchema.model_validate_json(response.text)
-    return {
-        "bucket": bucket,
-        "subject": pattern.subject,
-        "blocks": [b.model_dump() for b in pattern.blocks],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    return DeliverablePattern(
+        pattern_id=f"{bucket}__{output_format}",
+        segment_id=segment.segment_id,
+        bucket=bucket,
+        format=output_format,
+        subject=pattern.subject,
+        blocks=[DeliverableBlock(**b.model_dump()) for b in pattern.blocks],
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 # ── Stage 2b: 決定論的な組み立て（LLM不使用） ────────────────────────────────
@@ -825,6 +922,7 @@ def _assemble_run(
     patterns: dict[str, dict],
     run_id: str,
     snapshot_id: str,
+    output_format: str = "EMAIL",
 ) -> int:
     """割り当てとパターンから各 Person の Deliverable を組み立てて保存する。"""
     assignments = [
@@ -833,26 +931,28 @@ def _assemble_run(
             f"segments/{segment.segment_id}/snapshots/{snapshot_id}/assignments"
         ).get()
     ]
-    db.collection("marketing_runs").document(run_id).set({
-        "run_id": run_id,
-        "status": "running",
-        "segment_id": segment.segment_id,
-        "snapshot_id": snapshot_id,
-        "purpose": segment.purpose,
-        "total": len(assignments),
-        "done": 0,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    run = MarketingRun(
+        run_id=run_id,
+        status="running",
+        segment_id=segment.segment_id,
+        snapshot_id=snapshot_id,
+        purpose=segment.purpose,
+        total=len(assignments),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    db.collection("marketing_runs").document(run_id).set(run.model_dump())
 
     done = 0
     for asn in assignments:
         person_id = asn.get("person_id", "")
         bucket = asn.get("bucket", "")
-        # パターンキーは {bucket}__EMAIL 形式
-        pattern_key = f"{bucket}__EMAIL"
-        pattern = patterns.get(pattern_key) or patterns.get(bucket)
+        # パターンキーは "{bucket}__{format}" 規約（generate_patterns と一致）
+        pattern_key = f"{bucket}__{output_format}"
+        pattern = patterns.get(pattern_key)
         if not pattern:
-            logger.warning("no pattern for bucket '%s' (person %s)", bucket, person_id)
+            logger.warning(
+                "no pattern for key '%s' (person %s)", pattern_key, person_id
+            )
             continue
 
         person_doc = db.collection("persons").document(person_id).get()
@@ -884,7 +984,7 @@ def _assemble_run(
             person_id=person_id,
             snapshot_id=snapshot_id,
             pattern_id=pattern_key,
-            format="EMAIL",
+            format=pattern.get("format", output_format),
             bucket=bucket,
             subject=_fill(pattern.get("subject", ""), fill_ctx),
             blocks=blocks,

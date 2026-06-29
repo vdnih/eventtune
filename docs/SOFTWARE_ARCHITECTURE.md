@@ -1,275 +1,205 @@
 # ソフトウェアアーキテクチャ
 
+> 本ドキュメントは ADR-008（OSI セマンティックレイヤー / フラットスキーマ）と ADR-009
+> （Agent Engine サンドボックス型 Code Interpreter）以降の現行実装を反映する。設計思想の
+> 背景は docs/SEMANTIC_LAYER.md / docs/PHILOSOPHY_AND_NAMING.md / docs/ADR.md を参照。
+
 ## コア設計原則: Pydantic オントロジー（Single Source of Truth）
 
-`backend/ontology.py` がシステム全体の型定義の唯一の真実源。
-エージェントはすべてこの型に従ってデータの入出力を行う。
+`backend/ontology.py` がシステム全体の型定義の唯一の真実源。概念モデルの正典は
+`backend/semantic/osi_event_marketing_v1.yml`（OSI v1.0）で、ontology.py はその物理実装。
 
-```python
-# backend/ontology.py — 全モデルの定義場所
+データモデルは**星座型（ファクト・コンステレーション）**。持続する実体（マスタ）を、出来事
+（ファクト）が結びつける。固定の課題ラベルは持たず、各実体の `appeal_summary`（関心・価値の
+自然文要約）と `appeal_vector`（その埋め込み）の**意味的近接（コサイン類似度）**で「誰に何が
+合うか」を表す（Semantic Affinity）。
 
-class ProductSegment(str, Enum):
-    PRODUCT_A = "プロダクトA"
-    PRODUCT_B = "プロダクトB"
-
-class ContentType(str, Enum):
-    SEMINAR_UPCOMING = "未来のセミナー（募集中）"
-    EVENT_UPCOMING   = "未来のイベント（募集中）"
-    WHITE_PAPER      = "資料・ホワイトペーパー"
-    CASE_STUDY       = "導入事例"
-
-class LeadSegment(str, Enum):
-    APPOINTMENT_BOOKED = "アポ獲得済み"
-    HIGH_INTENT        = "アポなし・感度高"
-    NURTURING          = "通常リード"
-
-class BlockType(str, Enum):
-    GREETING              = "1_展示会のお礼と挨拶"
-    SCHEDULE_PROPOSAL     = "2_日程調整・候補日打診"
-    CASE_STUDY_INTRO      = "3_導入事例の紹介"
-    PRODUCT_MATERIAL_INTRO = "4_プロダクト資料・ホワイトペーパーの紹介"
-    SEMINAR_INTRO         = "5_未来の募集中のセミナー案内"
-    CLOSING               = "6_結びの挨拶"
-
-class StructuredLead(BaseModel):
-    name: str
-    company_name: str
-    department: str
-    job_title: str
-    segment: LeadSegment
-    interested_products: List[ProductSegment]
-    extracted_challenge: str
-
-class EmailBlock(BaseModel):
-    block_type: BlockType
-    reason_for_inclusion: str   # Chain-of-Thought: 必須フィールド
-    associated_content_ids: List[str] = []
-    block_text: str
-
-class TotalTailoredEmail(BaseModel):
-    subject: str
-    email_blocks: List[EmailBlock]
-
-class ContentItem(BaseModel):       # コンテンツライブラリ用
-    id: str
-    content_type: ContentType
-    name: str
-    description: str
-    url: str
 ```
+マスタ（各 appeal_summary / appeal_vector を持つ）:
+  Person       個人（旧 Contact を分解）。stage / engagement_level
+  Account      企業マスター（Person を account_id で束ねる）
+  Product      製品マスター
+  Content      推薦可能なコンテンツ（資料・事例・セミナー等。旧 ContentAsset）
+  Event        イベント。KPI・Survey 集計値を畳み込み保持（旧 EventKPI / SurveyResponse を統合）
+
+ファクト（マスタ同士を結ぶ多対多）:
+  EventAttendance   Person × Event（誰がどのイベントに参加したか）
+  ProductInterest   Person × Product（誰がどの製品に関心を持つか）
+
+セグメント / 成果物:
+  Segment / SegmentSnapshot / SegmentAssignment   施策の分類軸と版管理つき割り当て（根拠必須）
+  DeliverablePattern   バケット単位のひな型（pattern_id = "{bucket}__{format}"）
+  Deliverable          生成成果物（format: EMAIL / TALK_SCRIPT / PROPOSAL）
+  MarketingRun         組み立てジョブ
+
+来歴 / 取り込み:
+  IntegrationJob   取り込みジョブの稼働ログ（旧 integration_batches + data_lineage を統合）。
+                   各レコードは source_job_id でこのジョブへ逆引きできる。
+```
+
+全 LLM 呼び出しは **`gemini-3.1-flash-lite`**（埋め込みのみ `gemini-embedding-001`）。
 
 ---
 
 ## エージェント構成
 
-### 全体フロー
+チャット駆動。バッチ2段（取り込み→生成）ではなく、ユーザーとの対話の中でエージェントが
+自律的にツールを選んで進める。
 
-```
-ファイルアップロード
-      │
-      ▼
-POST /api/ingest
-      │
-      ▼  (BackgroundTask)
-Ingestion Agent
-  - Gemini 2.5 Flash + response_schema=_IngestionResponse
-  - 15行バッチで処理
-  - CSV列名を正規化・セグメント判定・製品マッピング
-  - StructuredLead[] → Firestore batches/{id}/leads/
-      │
-      ▼  (取り込み完了後、UIからトリガー)
-POST /api/execute
-      │
-      ▼  (BackgroundTask)
-Execution Agent
-  - Gemini 2.5 Flash + response_schema=TotalTailoredEmail
-  - 1リード1コール（2秒インターバル、429時は指数バックオフ）
-  - コンテンツライブラリをプロンプトに注入
-  - TotalTailoredEmail → Firestore emails/
-```
+### DataIntegrationAgent (`agents/data_integration_agent.py`)
 
-### Ingestion Agent (`agents/ingestion_agent.py`)
+カオスなファイル（CSV/Excel/PDF）をオントロジーへ分解・リンク解決して書き込む。
 
 | 項目 | 内容 |
 |------|------|
-| モデル | `gemini-2.5-flash` |
-| 入力 | `pd.DataFrame`（列名不統一・表記ゆれあり） |
-| 出力 | `List[StructuredLead]` + Firestore保存 |
-| バッチサイズ | 15行/コール |
-| Structured Output | `response_schema=_IngestionResponse`（`leads: list[StructuredLead]`） |
+| トリガー | `POST /api/integration/batches`（BackgroundTask） |
+| 段階 | ①列マッピング/抽出（`ColumnMappingResult` / `DocumentExtractionResult`）→ ②変換・リンク解決 → Firestore 書き込み |
+| リンク解決 | 行ごとの link_columns / ファイル全体の default_links で Event/Account/Product を解決（`ontology_mapper.py`） |
+| 意味レイヤー付与 | 取り込み時に persons/products/events/contents へ `appeal_summary`/`appeal_vector` を付与（`semantic_search.build_appeal`、`_apply_appeal`） |
+| 監査 | `IntegrationJob` に column_mapping / transformations / skipped_records / resolved_links を残す |
 
-**セグメント判定ロジック（プロンプト定義）**
+取り込みプランの事前提案は `POST /api/integration/plan`（`plans.py`）。
 
-| 判定シグナル | LeadSegment |
-|------------|-------------|
-| 判定=A + 温度感=高、またはメモに「面談希望」「アポ」 | `APPOINTMENT_BOOKED` |
-| 判定=B または 温度感=中〜高、資料請求・見積依頼 | `HIGH_INTENT` |
-| 判定=C、名刺交換のみ、温度感=低 | `NURTURING` |
+### MarketingAgent (`agents/marketing_agent.py`)
 
-**製品マッピングロジック（プロンプト定義）**
+単一・汎用のエージェント。システムプロンプトには思想・オントロジー・ツール一覧のみを書き、
+手順は固定しない。スペース束縛は `make_tools(db, space)` ファクトリで closure 捕捉する
+（ツール引数に space_id は存在せず、他スペースへ到達不能＝最小権限の構造的強制）。
 
-| キーワード | ProductSegment |
-|-----------|---------------|
-| スキルマップ、技能伝承、アーカイブ、育成 | `PRODUCT_A` |
-| 要員配置、シフト、シミュレーター、資格管理、安全講習 | `PRODUCT_B` |
+**ツール一覧（`make_tools`）**
 
-### Execution Agent (`agents/execution_agent.py`)
+| ツール | 用途 |
+|--------|------|
+| `get_space_data` | 全エンティティを Firestore→Pydantic→DataFrame→CSV にしてサンドボックスへ投入 |
+| `run_python_code` | LLM 生成 Python をサンドボックスで実行（分析の実体。ADR-009） |
+| `find_relevant_for_person` | Person の appeal_vector に意味的に近い contents/products/events を上位返す（コサイン類似度） |
+| `save_report` | 分析・戦略レポートを `events/{event_id}/reports` に保存 |
+| `define_segment` | 施策の分類軸（axes / buckets / criteria）を登録 |
+| `assign_segment` | Person をバケットへ分類しスナップショット保存（決定論＋意味的近接＋軽量LLM、根拠必須） |
+| `generate_patterns` | バケット単位でひな型を生成（pattern_id = `{bucket}__{format}`） |
+| `run_assembly` | 分類×パターンから各 Person の Deliverable を決定論的に組み立て |
 
-| 項目 | 内容 |
-|------|------|
-| モデル | `gemini-2.5-flash` |
-| 入力 | `StructuredLead`（Firestoreから取得） |
-| 出力 | `TotalTailoredEmail` + Firestore保存 |
-| CoT強制 | `reason_for_inclusion` は Pydantic `required` フィールド |
-| レート制御 | コール間2秒インターバル、429時は指数バックオフ（10s/20s/40s/80s、最大4回） |
+応答は SSE でストリーミング（`chat_stream`）。`run_python_code` の呼び出しと結果は
+`code` / `code_result` イベントとして可視化する。
 
-**ブロック選択ルール（セグメント別）**
+### Code Interpreter（ADR-009）
 
-| BlockType | APPOINTMENT_BOOKED | HIGH_INTENT | NURTURING |
-|-----------|:-----------------:|:-----------:|:---------:|
-| 展示会のお礼と挨拶 | 必須 | 必須 | 必須 |
-| 日程調整・候補日打診 | 必須 | 任意 | 含めない |
-| 導入事例の紹介 | 必須 | 必須 | 任意 |
-| プロダクト資料の紹介 | 任意 | 必須 | 必須 |
-| セミナー案内 | 任意 | 任意 | 必須 |
-| 結びの挨拶 | 必須 | 必須 | 必須 |
+コード実行は ADK の `code_executor`（CodeAct）ではなく **`run_python_code` 関数ツール**で行う。
+サンドボックスは Agent Engine 上にセッション毎に1つ作り（`sandboxes.create` / `execute_code`
+直叩き）、名前を `tool_context.state["sandbox_name"]` に保持して再利用する（変数・ファイルが
+持続するステートフル実行）。CSV はサンドボックスへ直接投入し、Parquet/ローカルファイルは使わない。
 
----
+### 意味検索・分類の決定論レイヤー
 
-## コンテンツライブラリ (`contents_library.py`)
+| モジュール | 役割 |
+|------------|------|
+| `semantic_search.py` | 埋め込み（embed_text / embed_text_sync）、appeal_summary 生成、cosine / find_similar（決定論・総当たり） |
+| `segmentation.py` | 構造化フィールドで自明な軸は決定論、残りは「appeal_vector ⇄ バケット代表ベクトルの近接」を一次候補に軽量LLMが appeal_summary で確認・確定。固定課題ラベルは主信号から退役 |
 
-`backend/contents_library.py` に15件の `ContentItem` を定義。`ContentType` へのマッピング：
-
-| id | ContentType |
-|----|------------|
-| seminar_01〜05 | `SEMINAR_UPCOMING` |
-| event_01〜05 | `EVENT_UPCOMING` |
-| doc_01, doc_02, doc_04, doc_05 | `WHITE_PAPER` |
-| doc_03（成功事例集） | `CASE_STUDY` |
-
-Execution Agent はこのライブラリをJSON形式でプロンプトに注入し、`EmailBlock.associated_content_ids` で参照IDを返す。
+セッションは `VertexAiSessionService`（Agent Engine マネージドセッション）に保存し、Cloud Run の
+オートスケール/再起動を跨いで session.state（サンドボックス名）を永続させる。
 
 ---
 
 ## FastAPI ルート一覧
 
-すべてのルートで `Authorization: Bearer {firebase_id_token}` が必須。
+すべてのルートで `Authorization: Bearer {firebase_id_token}` が必須。スペースは
+`X-Space-Id` 等のコンテキスト（`dependencies.get_space_context`）で束縛する。
 
 ```
-# Ingestion（取り込みパイプライン）
-POST   /api/ingest                          # CSV/Excelアップロード、Ingestion Agent起動
-GET    /api/batches/{batchId}               # バッチ状態・セグメント内訳
-GET    /api/batches/{batchId}/leads         # 取り込み済みリード一覧
+# Spaces（テナント / メンバー / 利用状況）— spaces.py
+POST   /api/spaces                              # スペース作成
+GET    /api/spaces                              # 自分が属するスペース一覧
+GET/PATCH/DELETE /api/spaces/{id}               # 取得 / 更新 / 削除
+GET/POST/PATCH/DELETE /api/spaces/{id}/members  # メンバー管理
+GET    /api/spaces/{id}/usage                   # 月次の利用実績
 
-# Execution（メール生成パイプライン）
-POST   /api/execute                         # メール生成ジョブ起動 {batch_id}
-GET    /api/execute/{batchId}/status        # 進捗確認（ポーリング用）
-GET    /api/execute/{batchId}/emails        # 生成済みメール一覧
-GET    /api/execute/{batchId}/download      # CSV一括ダウンロード
+# Integration（取り込み）— integration.py
+POST   /api/integration/plan                    # 取り込みプラン提案
+POST   /api/integration/batches                 # ファイルアップロード→取り込み開始（BackgroundTask）
+GET    /api/integration/batches/{id}            # バッチ処理状況
 
-# 旧エンドポイント（互換維持）
-POST   /api/generate                        # CSVアップロード → メッセージ1行生成
-GET    /api/jobs/{jobId}                    # ジョブ状態確認
-GET    /api/jobs/{jobId}/download           # CSV出力
+# Marketing（チャット / 成果物）— marketing.py
+POST   /api/marketing/chat                      # SSE チャット（MarketingAgent）
+GET    /api/marketing/runs/{id}                 # 組み立てジョブの状況
+GET    /api/marketing/runs/{id}/results         # 生成済み Deliverable 一覧
+GET    /api/marketing/runs/{id}/export          # CSV 一括エクスポート
 
-# ヘルスチェック
+# Events（最小）— events.py
+GET    /api/events                              # イベント一覧
+POST   /api/events                              # イベント作成
+
+# Data（汎用閲覧・読み取り専用）— data.py
+GET    /api/data/collections                    # 閲覧可能なビュー一覧（左メニュー用）
+GET    /api/data/{view_key}                     # ビューのドキュメント群（整形しない）
+GET    /api/data/lineage/by-entity/{entity_id}  # source_job_id から由来ジョブを逆引き
+
 GET    /health
 ```
 
----
-
-## Firestore データモデル
-
-### `batches/{batchId}`
-
-```json
-{
-  "filename": "manufacturing_dx_event_leads.csv",
-  "row_count": 40,
-  "status": "ingesting | done | error",
-  "lead_count": 40,
-  "created_at": "2026-06-12T00:00:00+00:00",
-  "execution_status": "running | done | error",
-  "execution_done": 40,
-  "email_count": 40,
-  "error": null
-}
-```
-
-### `batches/{batchId}/leads/{leadId}`
-
-```json
-{
-  "lead_id": "uuid",
-  "name": "田中 修一",
-  "company_name": "株式会社山田製作所",
-  "department": "生産技術部",
-  "job_title": "工場長",
-  "segment": "アポ獲得済み",
-  "interested_products": ["プロダクトA"],
-  "extracted_challenge": "熟練工の退職前に技能を動画でアーカイブしたい"
-}
-```
-
-### `emails/{emailId}`
-
-```json
-{
-  "email_id": "uuid",
-  "lead_id": "uuid",
-  "batch_id": "uuid",
-  "subject": "【山田製作所様】技能伝承デジタル化のご提案",
-  "blocks": [
-    {
-      "block_type": "1_展示会のお礼と挨拶",
-      "reason_for_inclusion": "アポ獲得済みリードへの冒頭挨拶として必須。展示会での商談を振り返りつつ感謝を伝える。",
-      "associated_content_ids": [],
-      "block_text": "先日はスマート工場EXPOにてお時間をいただき..."
-    }
-  ],
-  "created_at": "2026-06-12T00:00:00+00:00"
-}
-```
+データの**閲覧**は data.router に一本化した（オントロジー追加時は VIEWS に1行足すだけ）。
+データの**編集**はチャットの AI エージェントに委ねる。
 
 ---
 
-## ディレクトリ構成（詳細）
+## Firestore データモデル（マルチテナント）
+
+全データは `spaces/{space_id}/` 配下に置く（パスプレフィックス分離・AI 非依存のテナント束縛）。
+
+```
+spaces/{space_id}/
+  persons/{person_id}
+  accounts/{account_id}
+  products/{product_id}
+  contents/{content_id}
+  events/{event_id}
+      costs/{cost_id}          # 費用明細（CostItem）
+      reports/{report_id}      # save_report の出力
+  event_attendances/{attendance_id}
+  product_interests/{interest_id}
+  segments/{segment_id}
+      snapshots/{snapshot_id}
+          assignments/{person_id}   # SegmentAssignment（reason 必須）
+      patterns/{bucket}__{format}   # DeliverablePattern
+  marketing_runs/{run_id}
+      deliverables/{deliverable_id} # Deliverable
+  integration_jobs/{job_id}         # IntegrationJob（来歴の逆引き元）
+```
+
+各 master/fact レコードは `source_job_id`（= integration_jobs.job_id）を inline 保持し、
+そこから取り込みジョブへ O(1) で逆引きする（data.router の lineage）。
+
+---
+
+## ディレクトリ構成（要点）
 
 ```
 marketing-mail-generator/
 ├── frontend/
-│   ├── app/
-│   │   ├── layout.tsx
-│   │   ├── page.tsx                           # → /dashboard にリダイレクト
-│   │   ├── globals.css
-│   │   ├── (auth)/
-│   │   │   └── login/page.tsx                 # Google OAuth ログイン
-│   │   └── (app)/
-│   │       ├── layout.tsx                     # Firebase 認証ガード
-│   │       └── dashboard/page.tsx             # チャット駆動メインUI
+│   ├── app/(app)/
+│   │   ├── layout.tsx                  # 認証ガード + ヘッダ（エージェント / データ ナビ）
+│   │   ├── dashboard/page.tsx          # 全画面チャット UI（アップロードはチャット入力欄）
+│   │   ├── explorer/page.tsx           # 3ペイン汎用データブラウザ（/api/data/* 駆動）
+│   │   ├── spaces/new/page.tsx
+│   │   └── settings/{space,members,usage}/page.tsx
 │   ├── components/
-│   │   └── features/
-│   │       ├── upload/FileDropzone.tsx         # CSV/Excel ドロップ
-│   │       └── email/EmailBlockCard.tsx        # メールブロック表示 + CoT トグル
-│   └── lib/
-│       ├── firebase.ts
-│       └── utils.ts
+│   │   ├── ui/{DataTable,Drawer,format}.tsx   # モデル非依存・オントロジー安全
+│   │   └── features/agent/DeliverableCard.tsx # 汎用 AI 成果物カード
+│   └── lib/{firebase,api,space-context}.ts
 │
 └── backend/
-    ├── ontology.py                             # Pydantic SSoT（変更禁止原則）
-    ├── contents_library.py                     # ContentItem×15件
+    ├── ontology.py                     # Pydantic SSoT
+    ├── semantic/osi_event_marketing_v1.yml  # 概念モデルの正典（OSI v1.0）
+    ├── space.py / space_data.py        # テナント束縛 / 全エンティティのロード
+    ├── semantic_search.py              # 埋め込み・appeal_summary・cosine/find_similar
+    ├── segmentation.py                 # セグメント分類（決定論＋意味的近接＋軽量LLM）
     ├── agents/
-    │   ├── ingestion_agent.py                  # Ingestion Agent
-    │   ├── execution_agent.py                  # Execution Agent
-    │   └── message_generator.py               # 旧エージェント（互換維持）
-    ├── routers/
-    │   ├── ingest.py
-    │   ├── execute.py
-    │   └── generate.py                        # 旧エンドポイント（互換維持）
-    ├── main.py
-    ├── config.py
-    ├── dependencies.py                        # Firebase ID token 検証
-    ├── jobs.py                                # 旧ジョブ管理（互換維持）
+    │   ├── data_integration_agent.py   # 取り込み
+    │   ├── ontology_mapper.py          # リンク解決・マッピング
+    │   └── marketing_agent.py          # チャット・分析・生成（Code Interpreter）
+    ├── routers/{spaces,integration,marketing,events,data}.py
+    ├── scripts/provision_agent_engine.py   # Agent Engine の一回限り provision
+    ├── main.py / config.py / dependencies.py / metering.py / plans.py
     └── pyproject.toml
 ```
 
@@ -278,34 +208,16 @@ marketing-mail-generator/
 ## 主要フロントエンドコンポーネント
 
 ### `dashboard/page.tsx`
+全画面チャット。アップロードボタンはチャット入力エリアに統合し、`POST /api/integration/plan`
+で取り込みプランを提案 → `UploadConfirmModal` で確認 → `POST /api/integration/batches`。
+個別カスタマイズは SSE（`/api/marketing/chat`）でエージェントが進め、`run_assembly` 検出後に
+`/api/marketing/runs/{id}` をポーリングして成果物を `DeliverableCard` で表示する。
 
-チャット駆動のメインUI。状態遷移:
+### `explorer/page.tsx`
+3ペインの汎用データブラウザ。左=コレクションナビ（`/api/data/collections`）、中央=`DataTable`
+（`/api/data/{key}`）、右=詳細＋「由来を追う」（`/api/data/lineage/by-entity/{id}`）。
+`DataTable` / `Drawer` / `format` はモデル非依存で、オントロジー変更に追従不要。
 
-```
-idle → (ファイルドロップ) → ingesting → ingested
-                                            │
-                                     (「メールを生成して」)
-                                            ↓
-                                       executing → executed
-```
-
-チャットコマンドのディスパッチ:
-
-| 入力パターン | 動作 |
-|------------|------|
-| 「メール」「生成」「作成」 | `POST /api/execute` → ポーリング → EmailBlockCard表示 |
-| 「リード」「確認」「一覧」 | `GET /api/batches/{id}/leads` → チャットに一覧表示 |
-| 「ダウンロード」「CSV」 | `GET /api/execute/{id}/download` |
-| その他 | ヘルプメッセージ表示 |
-
-### `EmailBlockCard`
-
-- メール1件をブロック単位で折り畳み表示
-- 「AIの思考を見る」ボタンで `reason_for_inclusion`（CoT）をトグル
-- `associated_content_ids` をバッジ表示
-- セグメント別カラーバッジ
-
-### `FileDropzone`
-
-- `.csv` / `.xlsx` / `.xls` 対応
-- ファイル選択と同時に `POST /api/ingest` を自動実行（ボタン不要）
+### `DeliverableCard`
+生成成果物（メール等）を format 非依存で表示。ブロック単位の表示と
+`reason_for_inclusion`（Auditable AI の根拠）のトグルを持つ。

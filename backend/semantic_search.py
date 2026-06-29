@@ -70,6 +70,36 @@ async def embed_text(text: str, space: Optional[SpaceContext] = None) -> list[fl
         return []
 
 
+def embed_text_sync(text: str, space: Optional[SpaceContext] = None) -> list[float]:
+    """embed_text の同期版。空文字・失敗時は [] を返す。
+
+    segmentation 等の同期パス（バケット代表テキストの埋め込み）から使う。意味検索の
+    消費側（appeal_vector のコサイン近接）を駆動するために必要。
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        response = _get_client().models.embed_content(
+            model=_MODEL_EMBED,
+            contents=text,
+            config=types.EmbedContentConfig(
+                task_type="SEMANTIC_SIMILARITY",
+                output_dimensionality=_EMBED_DIM,
+            ),
+        )
+        if space is not None:
+            record_llm_response(space, _MODEL_EMBED, response)
+        embeddings = getattr(response, "embeddings", None) or []
+        if not embeddings:
+            return []
+        values = getattr(embeddings[0], "values", None) or []
+        return [float(v) for v in values]
+    except Exception:
+        logger.exception("embed_text_sync failed (text len=%d)", len(text))
+        return []
+
+
 # ── 類似度（決定論 Python 総当たり）────────────────────────────────────────────
 
 def cosine(a: list[float], b: list[float]) -> float:

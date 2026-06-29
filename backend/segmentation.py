@@ -7,7 +7,10 @@ Segmentation — 個別カスタマイズの第1段階（Person → バケット
 責務境界:
 - 構造化フィールド（ProductInterest / engagement_level / stage）だけで自明に決まる
   軸は決定論 Python で割り当てる（LLM 不使用）。
-- extracted_challenge / notes 等の意味判断が要る場合のみ軽量モデルで判別する。
+- 意味判断が要る場合は、まず appeal_vector（人物の関心・文脈の埋め込み）と各バケットの
+  代表ベクトルのコサイン近接（semantic_search.find_similar / 決定論 Python）で一次候補を
+  出し、軽量モデルがそれを appeal_summary に照らして確認・確定する。固定の課題ラベル
+  （旧 extracted_challenge）は主信号から退役。SEMANTIC_LAYER §3.5 / ADR-008 の撤回宣言に従う。
   トークン節約のため、複数 Person を1回の呼び出しでまとめて分類する。
 """
 
@@ -24,6 +27,7 @@ from pydantic import BaseModel
 
 from metering import record_llm_response
 from ontology import Segment, SegmentAssignment, SegmentSnapshot
+from semantic_search import embed_text_sync, find_similar
 from space import SpaceContext
 
 logger = logging.getLogger(__name__)
@@ -114,6 +118,34 @@ def _deterministic_bucket(
     return None
 
 
+# ── バケット代表ベクトル（意味的近接の参照側）────────────────────────────────
+
+def _bucket_reference_vectors(
+    space: SpaceContext, segment: Segment
+) -> dict[str, list[float]]:
+    """各バケットの代表テキストを埋め込み、{bucket: appeal_vector} を返す。
+
+    person.appeal_vector とのコサイン近接（find_similar）で意味的な一次候補を出すための
+    参照側。代表テキストは「施策目的＋バケット名＋割り当て基準」で構成する。
+    """
+    vectors: dict[str, list[float]] = {}
+    for bucket in segment.buckets:
+        ref = f"{segment.purpose}。対象セグメント: {bucket}。判定基準: {segment.criteria}"
+        vectors[bucket] = embed_text_sync(ref, space=space)
+    return vectors
+
+
+def _vector_rank(
+    person: dict, bucket_vectors: dict[str, list[float]]
+) -> tuple[str, float]:
+    """person.appeal_vector に最も近いバケットと類似度を返す（無ければ ("", 0.0)）。"""
+    pvec = person.get("appeal_vector") or []
+    if not pvec:
+        return "", 0.0
+    ranked = find_similar(pvec, list(bucket_vectors.items()), top_k=1)
+    return ranked[0] if ranked else ("", 0.0)
+
+
 # ── 軽量 LLM によるバッチ分類 ────────────────────────────────────────────────
 
 class _OneAssignment(BaseModel):
@@ -127,22 +159,33 @@ class _BatchResult(BaseModel):
 
 
 def _classify_batch(
-    space: SpaceContext, segment: Segment, persons: list[dict]
-) -> dict[str, tuple[str, str]]:
+    space: SpaceContext,
+    segment: Segment,
+    persons: list[dict],
+    bucket_vectors: dict[str, list[float]],
+) -> dict[str, tuple[str, str, dict[str, str]]]:
     """Person 群を1回の LLM 呼び出しでまとめてバケットへ分類する。
 
-    Returns: { person_id: (bucket, reason) }
+    意味的近接（appeal_vector ⇄ バケット代表ベクトル）の一次候補を vector_top_bucket として
+    モデルに渡し、モデルは appeal_summary を主信号にそれを確認・確定する。
+
+    Returns: { person_id: (bucket, reason, source_signals) }
     """
     axes_desc = "\n".join(
         f"- {ax.name}: {' / '.join(ax.values)}" for ax in segment.axes
     )
+    # 各 Person の意味的近接の一次候補（vector prior）を先に計算する
+    ranks: dict[str, tuple[str, float]] = {
+        p.get("person_id", ""): _vector_rank(p, bucket_vectors) for p in persons
+    }
     slim = [
         {
             "person_id": p.get("person_id", ""),
             "job_title": p.get("job_title", ""),
             "engagement_level": p.get("engagement_level"),
-            "extracted_challenge": p.get("extracted_challenge", ""),
+            "appeal_summary": p.get("appeal_summary", ""),
             "notes": p.get("notes", ""),
+            "vector_top_bucket": ranks.get(p.get("person_id", ""), ("", 0.0))[0],
         }
         for p in persons
     ]
@@ -158,7 +201,10 @@ def _classify_batch(
 【バケット一覧（必ずこの中から1つを選ぶ）】
 {chr(10).join(f"- {b}" for b in segment.buckets)}
 
-以下の各 Person を、最も適切なバケットへ分類してください。
+各 Person を、最も適切なバケットへ分類してください。
+判定は appeal_summary（その人の関心・悩み・文脈の要約）を主たる根拠とすること。
+vector_top_bucket は appeal_vector の意味的近接による参考候補（事前確率）です。妥当なら
+採用し、appeal_summary と矛盾する場合は appeal_summary を優先して上書きしてかまいません。
 bucket は必ず上記バケット一覧の文字列のいずれかと完全一致させること。
 reason は判定根拠を20〜40字で簡潔に。
 
@@ -177,13 +223,19 @@ reason は判定根拠を20〜40字で簡潔に。
     record_llm_response(space, _MODEL, response)
     result = _BatchResult.model_validate_json(response.text)
 
-    out: dict[str, tuple[str, str]] = {}
+    out: dict[str, tuple[str, str, dict[str, str]]] = {}
     valid = set(segment.buckets)
     fallback = segment.buckets[-1] if segment.buckets else "未分類"
+    pmap = {p.get("person_id", ""): p for p in persons}
     for a in result.assignments:
         bucket = a.bucket if a.bucket in valid else fallback
         reason = a.reason if a.bucket in valid else f"AI出力'{a.bucket}'が一覧外→既定"
-        out[a.person_id] = (bucket, reason)
+        vbucket, vscore = ranks.get(a.person_id, ("", 0.0))
+        signals = {
+            "appeal_summary": pmap.get(a.person_id, {}).get("appeal_summary", ""),
+            "vector_affinity": f"{vbucket}:{vscore:.3f}" if vbucket else "",
+        }
+        out[a.person_id] = (bucket, reason, signals)
     return out
 
 
@@ -225,18 +277,21 @@ def assign_contacts_to_segment(
         else:
             undecided.append(p)
 
-    # 2) 残りを軽量 LLM でバッチ分類
+    # 2) 残りを軽量 LLM でバッチ分類（意味的近接の一次候補を添えて）
     llm_persons = 0
+    bucket_vectors = _bucket_reference_vectors(space, segment) if undecided else {}
     for i in range(0, len(undecided), _BATCH_SIZE):
         chunk = undecided[i:i + _BATCH_SIZE]
         try:
-            decided = _classify_batch(space, segment, chunk)
+            decided = _classify_batch(space, segment, chunk, bucket_vectors)
         except Exception:
             logger.exception("segment batch classify failed: segment=%s", segment.segment_id)
             decided = {}
         for p in chunk:
             pid = p.get("person_id", "")
-            bucket, reason = decided.get(pid, (fallback, "分類失敗→既定バケット"))
+            bucket, reason, signals = decided.get(
+                pid, (fallback, "分類失敗→既定バケット", {"appeal_summary": p.get("appeal_summary", "")})
+            )
             assignments.append(SegmentAssignment(
                 person_id=pid,
                 segment_id=segment.segment_id,
@@ -244,7 +299,7 @@ def assign_contacts_to_segment(
                 space_id=space.space_id,
                 bucket=bucket,
                 reason=reason,
-                source_signals={"extracted_challenge": p.get("extracted_challenge", "")},
+                source_signals=signals,
             ))
             llm_persons += 1
 

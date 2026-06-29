@@ -186,17 +186,6 @@ async def _run_integration(
             pass
 
 
-@router.get("/batches")
-async def list_batches(
-    space: SpaceContext = Depends(get_space_context),
-):
-    """データ統合ジョブの一覧を返す。"""
-    docs = space.col("integration_jobs").get()
-    batches = [d.to_dict() for d in docs]
-    batches.sort(key=lambda b: b.get("created_at", ""), reverse=True)
-    return {"batches": batches, "count": len(batches)}
-
-
 @router.post("/batches", status_code=202)
 async def start_integration(
     background_tasks: BackgroundTasks,
@@ -258,87 +247,3 @@ async def get_batch_status(
     }
 
 
-@router.get("/batches/{batch_id}/report")
-async def get_batch_report(
-    batch_id: str,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """バッチの加工処理レポートを返す（Auditable AI）。"""
-    batch_doc = space.col("integration_jobs").document(batch_id).get()
-    if not batch_doc.exists:
-        raise HTTPException(status_code=404, detail="Batch not found")
-
-    batch = batch_doc.to_dict()
-    status = batch.get("status")
-    child_job_ids = batch.get("child_job_ids") or []
-
-    if status != "done" or not child_job_ids:
-        return {
-            "batch_id": batch_id,
-            "status": status,
-            "report": None,
-            "reports": [],
-            "detail": "レポートは処理完了後に利用できます" if status != "done" else "子ジョブが見つかりません",
-            "error": batch.get("error"),
-        }
-
-    reports = []
-    for jid in child_job_ids:
-        job_doc = space.col("integration_jobs").document(jid).get()
-        if job_doc.exists:
-            reports.append(_format_job_report(job_doc.to_dict()))
-
-    return {
-        "batch_id": batch_id,
-        "status": status,
-        "cross_file_summary": {
-            "files": batch.get("files", []),
-            "partial": batch.get("partial", False),
-        },
-        "reports": reports,
-        "report": reports[0] if reports else None,
-    }
-
-
-def _format_job_report(job: dict) -> dict:
-    return {
-        "source": {
-            "filename": (job.get("filenames") or [None])[0],
-            "batch_id": job.get("batch_id"),
-            "created_at": job.get("created_at"),
-            "hint": job.get("hint", ""),
-        },
-        "stage1_ai": {
-            "column_mapping": job.get("column_mapping"),
-            "raw_extraction": job.get("raw_extraction"),
-        },
-        "stage2_transformations": {
-            "transformations": job.get("transformations", []),
-            "skipped_records": job.get("skipped_records", []),
-        },
-        "resolved_links": job.get("resolved_links", []),
-        "summary": job.get("transformation_summary"),
-        "created_entities": job.get("created_entities", {}),
-    }
-
-
-@router.get("/batches/{batch_id}/contacts")
-async def get_batch_contacts(
-    batch_id: str,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """バッチで取り込まれた Person 一覧を返す（source_job_id で逆引き）。"""
-    batch_doc = space.col("integration_jobs").document(batch_id).get()
-    if not batch_doc.exists:
-        raise HTTPException(status_code=404, detail="Batch not found")
-
-    data = batch_doc.to_dict()
-    child_job_ids: list[str] = data.get("child_job_ids") or []
-    target_ids = set(child_job_ids) | {batch_id}
-
-    persons: list[dict] = []
-    for job_id in target_ids:
-        snap = space.col("persons").where("source_job_id", "==", job_id).get()
-        persons.extend(s.to_dict() for s in snap)
-
-    return {"contacts": persons, "count": len(persons)}
