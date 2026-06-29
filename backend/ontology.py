@@ -92,7 +92,6 @@ class Person(BaseModel):
     appeal_summary: str = ""
     appeal_vector: List[float] = []
     source_job_id: Optional[str] = None
-    source_file_id: Optional[str] = None
     created_at: str = ""
 
 
@@ -115,7 +114,7 @@ class EventAttendance(BaseModel):
     space_id: str
     person_id: str
     event_id: str
-    action_type: str = "参加"  # "申し込み" | "参加"
+    action_type: str = "参加"  # "申し込み" | "参加" | "アンケート高評価"
     source_job_id: Optional[str] = None
     created_at: str = ""
 
@@ -219,6 +218,7 @@ class ContentType(str, Enum):
     EVENT_UPCOMING   = "未来のイベント（募集中）"
     WHITE_PAPER      = "資料・ホワイトペーパー"
     CASE_STUDY       = "導入事例"
+    WEBINAR_ARCHIVE  = "ウェビナーアーカイブ"
 
 
 class Content(BaseModel):
@@ -281,6 +281,21 @@ class DeliverableBlock(BaseModel):
     associated_asset_ids: List[str] = []
 
 
+class DeliverablePattern(BaseModel):
+    """バケット単位のコンテンツパターン（成果物のひな型）。
+
+    pattern_id は "{bucket}__{format}" 規約。本文中の個人差分はプレースホルダで表現し、
+    組み立て（run_assembly）で決定論的に置換する。
+    """
+    pattern_id: str
+    segment_id: str = ""
+    bucket: str
+    format: str = "EMAIL"  # "EMAIL" | "TALK_SCRIPT" | "PROPOSAL"
+    subject: str = ""
+    blocks: List[DeliverableBlock] = []
+    created_at: str = ""
+
+
 class Deliverable(BaseModel):
     """生成成果物（メール / トークスクリプト / 提案書 など）。"""
     deliverable_id: str
@@ -294,6 +309,20 @@ class Deliverable(BaseModel):
     bucket: str = ""
     subject: Optional[str] = None
     blocks: List[DeliverableBlock] = []
+    created_at: str = ""
+
+
+class MarketingRun(BaseModel):
+    """個別カスタマイズの組み立てジョブ（marketing_runs/{run_id}）。"""
+    run_id: str
+    space_id: str = ""
+    status: str = "running"  # "running" | "done" | "error"
+    segment_id: str = ""
+    snapshot_id: str = ""
+    purpose: str = ""
+    total: int = 0
+    done: int = 0
+    deliverable_count: int = 0
     created_at: str = ""
 
 

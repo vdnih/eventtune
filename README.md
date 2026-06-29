@@ -13,8 +13,9 @@ AIが最適化する）という設計思想に基づく（[docs/MARKETING_PHILO
 
 1. **スペース**（テナント）を作成 — データ・課金はスペース単位で構造的に分離
 2. CSV / Excel やイベント概要・KPI・アンケートのテキストを**複数まとめてアップロード**
-3. **DataIntegrationAgent** が列名・表記ゆれを吸収し、来歴（DataLineage）付きで
-   オントロジー（`Event` / `Contact` / `EventKPI` / `SurveyResponse` / `CostItem` / `ContentAsset`）へ統合
+3. **DataIntegrationAgent** が列名・表記ゆれを吸収し、来歴（source_job_id）付きで OSI
+   オントロジー（マスタ `Person` / `Account` / `Product` / `Content` / `Event` ＋ ファクト
+   `EventAttendance` / `ProductInterest`。各マスタは appeal_summary / appeal_vector を持つ）へ統合
 4. チャットで **MarketingAgent** に指示（例: 「このイベントの参加者にお礼メールを」）
 5. **セグメント方式 + HIL** で個別対応 — AIが軸を設計 → 人が承認 → 分類 → バケット別パターン生成 →
    各メールは決定論的に組み立て（高速・低コスト）。各ブロックの `reason_for_inclusion`（AIの判断根拠）を確認・CSV出力
@@ -34,8 +35,8 @@ AIが最適化する）という設計思想に基づく（[docs/MARKETING_PHILO
 │   個別対応はセグメント方式: define_segment / assign_segment │
 │   / generate_patterns / run_assembly                      │
 ├──────────────────────────────────────────────────────────┤
-│  Layer 2: Event Ontology — Pydantic (SSoT) + Firestore    │
-│  ontology.py が全型定義の単一真実源（Event 中心）          │
+│  Layer 2: OSI Semantic Layer — Pydantic (SSoT) + Firestore│
+│  ontology.py が全型定義の単一真実源（星座型・appeal_vector）│
 ├──────────────────────────────────────────────────────────┤
 │  Layer 1: Data Integration (DataIntegrationAgent)         │
 │  パスA 表形式: run_schema_mapper / パスB 非構造化: run_document_extractor │
@@ -65,13 +66,14 @@ marketing-mail-generator/
 │   ├── app/
 │   │   ├── (auth)/login/
 │   │   └── (app)/
-│   │       ├── dashboard/             # チャット駆動メインUI
+│   │       ├── layout.tsx             # 認証ガード + ヘッダ（エージェント / データ ナビ）
+│   │       ├── dashboard/             # 全画面チャット駆動メインUI
+│   │       ├── explorer/             # 3ペイン汎用データブラウザ（/api/data/* 駆動）
 │   │       ├── spaces/new/            # スペース作成
 │   │       └── settings/{space,members,usage}/  # スペース設定・メンバー・使用量
-│   ├── components/features/
-│   │   ├── upload/FileDropzone.tsx
-│   │   ├── email/EmailBlockCard.tsx
-│   │   └── explorer/EventDataPanel.tsx
+│   ├── components/
+│   │   ├── ui/{DataTable,Drawer,format}.tsx     # モデル非依存の汎用UI
+│   │   └── features/agent/DeliverableCard.tsx   # 汎用 AI 成果物カード
 │   └── package.json
 ├── backend/                           # Python FastAPI
 │   ├── ontology.py                    # Pydantic SSoT（全型定義）
@@ -82,12 +84,13 @@ marketing-mail-generator/
 │   │   ├── data_integration_agent.py  # Layer1: CSV/Excel・テキスト → オントロジー
 │   │   ├── ontology_mapper.py         # ステージ2: 決定論的変換（AI不使用）
 │   │   └── marketing_agent.py         # Layer3: MarketingAgent（Agent + Tools）
+│   ├── semantic_search.py            # 埋め込み・appeal_summary・cosine/find_similar
 │   ├── routers/
 │   │   ├── spaces.py                  # /api/spaces
 │   │   ├── integration.py             # /api/integration（バッチ取り込み）
 │   │   ├── marketing.py               # /api/marketing（チャット・ラン）
-│   │   ├── segments.py                # /api/segments（成果物の閲覧・編集）
-│   │   └── events.py                  # /api/events（オントロジー直接参照）
+│   │   ├── events.py                  # /api/events（一覧・作成）
+│   │   └── data.py                    # /api/data（汎用閲覧・読み取り専用）
 │   ├── main.py
 │   ├── Dockerfile
 │   └── pyproject.toml

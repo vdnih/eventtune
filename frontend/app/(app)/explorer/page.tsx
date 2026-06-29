@@ -11,12 +11,11 @@ import { formatDetail, isComplex, pickEntityId } from "@/components/ui/format";
 interface Collection {
   key: string;
   label: string;
-  count: number;
 }
 
 interface LineageNode {
   job_id?: string;
-  source_filename?: string;
+  filenames?: string[];
   created_at?: string;
   [key: string]: unknown;
 }
@@ -82,7 +81,8 @@ export default function ExplorerPage() {
     setLoadingLineage(true);
     try {
       const data = await fetchJson(`/api/data/lineage/by-entity/${entityId}`);
-      setLineage(data.jobs ?? data.lineage ?? []);
+      // backend は単一の source job（{entity_id, job}）を返す。Drawer はリスト表示なので包む。
+      setLineage(data.job ? [data.job] : []);
     } catch {
       setLineage([]);
     } finally {
@@ -114,7 +114,6 @@ export default function ExplorerPage() {
                   }`}
                 >
                   <span className="truncate">{col.label}</span>
-                  <span className="text-xs text-gray-400 ml-1 shrink-0">{col.count}</span>
                 </button>
               </li>
             ))}
@@ -189,10 +188,10 @@ export default function ExplorerPage() {
           <ul className="space-y-3">
             {lineage.map((node, i) => (
               <li key={i} className="border border-gray-100 rounded-lg p-3 text-sm space-y-1">
-                {node.source_filename && (
+                {node.filenames && node.filenames.length > 0 && (
                   <div className="flex items-center gap-1.5 text-gray-700 font-medium">
                     <ChevronRight className="w-4 h-4 text-gray-400" />
-                    {node.source_filename}
+                    {node.filenames.join(", ")}
                   </div>
                 )}
                 {node.job_id && (

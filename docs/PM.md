@@ -1,5 +1,14 @@
 # プロジェクト管理ドキュメント
 
+> ⚠️ 本ドキュメントは**ハッカソン初期 MVP（商談後フォローアップメール生成ツール）時点の
+> 計画・チェックリスト**であり、現行プロダクトの仕様を表さない。プロダクトはその後、
+> イベントマーケのオントロジー統合プラットフォーム（マルチテナント SaaS・OSI セマンティック
+> レイヤー・チャット駆動 + Code Interpreter）へ発展した。現行の体験・API・画面・スコープは
+> [README.md](../README.md) / [SOFTWARE_ARCHITECTURE.md](SOFTWARE_ARCHITECTURE.md) /
+> [SEMANTIC_LAYER.md](SEMANTIC_LAYER.md) / [ADR.md](ADR.md) を参照。下記のチェックリストの
+> API 名（`/upload` `/generate` `/supplement` 等）・`onSnapshot` 進捗・メール特化 UI は
+> 現行実装と一致しない（マルチユーザー・課金・データ閲覧などは実装済み）。
+
 ## プロダクトビジョン
 
 ### ターゲットユーザー

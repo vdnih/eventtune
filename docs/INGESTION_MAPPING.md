@@ -119,14 +119,18 @@ ADR-008 で **Event-Centric は撤回**され、基底は **5 個の対等なマ
 
 ---
 
-## 7. 実装フェーズ（本概念の承認後）
+## 7. 実装フェーズ（ADR-008 第2バッチ — 実装済み）
 
-本書はレビューゲート。承認後に ADR-008 第2バッチの取り込み実装へ進む:
+本書のレビューゲートを経て、以下はすべて実装済み:
 
-- `semantic_search.py` 新設（埋め込み・総当たりコサイン・`generate_appeal_summary`）
-- `suggest-event` / `file_event_map` の撤去
-- `process_batch` / `ontology_mapper` / `data_integration_agent` を per-entity 分解＋Link Resolution へ再設計
-- フロント `UploadConfirmModal` をチャットヒント＋分解プレビューへ作り替え
+- ✅ `semantic_search.py` 新設（埋め込み・総当たりコサイン・`generate_appeal_summary`）。
+  さらに消費側（`find_similar` を使う `find_relevant_for_person` ツール／segmentation の意味的
+  近接分類）も配線済み（ADR-010）。
+- ✅ `suggest-event` / `file_event_map` の撤去
+- ✅ `process_batch` / `ontology_mapper` / `data_integration_agent` を per-entity 分解＋
+  Link Resolution へ再設計
+- ✅ フロント `UploadConfirmModal` をチャットヒント＋分解プレビューへ作り替え（取り込みは
+  `POST /api/integration/plan` → 確認 → `POST /api/integration/batches`）
 
 ---
 

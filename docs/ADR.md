@@ -348,3 +348,62 @@ Event は 5 マスタの 1 つにすぎず、唯一のルートではない。
   front door を Cloud Run に置く現構成が正しい。**全面移行（計算を Agent Engine Runtime に載せる）は不要**で、
   再評価トリガーは ①Cloud Run のオートスケール限界 ②最大 7 日の長時間ジョブ（`run_query_job`、2026-04-22
   以降作成のエージェント）必須化 ③可観測性/運用負荷の削減効果が改修コストを上回るとき。
+
+---
+
+## ADR-010: ドキュメント⇔実装の乖離是正 / 意味検索の消費側を配線 / 死蔵 API 削除
+
+**ステータス**: 採用
+
+**背景**:
+PR#11/#12（ADR-008 OSI 移行 ＋ ADR-009 Code Interpreter）は、データモデル全面再設計・フロント刷新・
+エージェント方式変更を一度に含む巨大変更だった。事後監査で、ドキュメントと実装に体系的な乖離が見つかった:
+- **思想が WRITE 側だけ実装されていた**: `appeal_summary`/`appeal_vector` は取り込み時に生成・保存される
+  のに、消費側（コサイン近接の引き当て）が未配線で `find_similar` はデッドコード。分類は撤回したはずの
+  固定ラベル `extracted_challenge` が主信号のままだった。
+- **プロンプトが旧モデルで凍結**: `marketing_agent._SYSTEM_PROMPT` が撤回済みの「Event-Centric 原則」を
+  宣言し、OSI／意味的近接に触れていなかった。
+- **PR 説明と実装の不一致**: 「削除した」とされた死蔵エンドポイント（events 7 本 / integration 3 本 /
+  segments router）が全て現存し、フロントから未使用のまま登録され続けていた。
+- **ドキュメントが PR に未追従**: SOFTWARE/INFRA は旧アーキ（ingestion/execution_agent・Gemini 2.x・
+  旧 API）のまま。PHILOSOPHY は廃止 8 ツールを現役列挙。`/api/data/*` がどこにも未記載。
+
+**決定**:
+「実装で得た学びは実装を正、未到達の思想は実装を思想に追いつかせ、撤回した旧概念は実装からも退役」
+という原則で一件ずつ整合させた。
+1. **意味検索の消費側を配線**: `find_relevant_for_person` ツールを新設（appeal_vector のコサイン近接）。
+   `segmentation` の主信号を `appeal_summary` ＋「バケット代表ベクトルとの近接（`find_similar`）」へ移し、
+   `extracted_challenge` を主信号から退役（フィールド自体は後方互換で残置）。同期埋め込み
+   `embed_text_sync` を追加。
+2. **プロンプト凍結解除**: `_SYSTEM_PROMPT` から Event-Centric を削除し、星座型・appeal_summary/
+   appeal_vector・Semantic Affinity・意味検索ツールを記述。
+3. **成果物の汎用化**: `DeliverablePattern` / `MarketingRun` を Pydantic 化。pattern_id 規約を
+   `{bucket}__{format}` に統一し（EMAIL ハードコードと組み立て時フォールバックを撤去）、format を
+   データ駆動に。
+4. **死蔵 API 削除**: events 7 本（detail/kpi/survey/costs/summary/update/delete）・integration 3 本
+   （batch list/report/contacts）・segments router を削除し `main.py` を整理。閲覧は `data.router` に一本化。
+5. **Explorer 契約修正**: `/api/data/collections` の件数表示をフロントから外し、lineage は backend が返す
+   単数 `job` にフロントを合わせた。
+6. **来歴の単純化**: 未 populate の `source_file_id` を退役し、ジョブ単位（`source_job_id` ＋ `filenames`）
+   に一本化。
+7. **ドキュメント全面同期**: SOFTWARE_ARCHITECTURE 全面改訂、INFRA（モデル名・Agent Engine・リージョン
+   2 系統・`aiplatform` 禁止ルール撤回）、PHILOSOPHY（ツール一覧）、SEMANTIC_LAYER / 正典 YAML
+   （命名・costs/reports・created_entities・ContentType の欠落値追加）、README/PM/INGESTION を更新。
+
+**理由**:
+- 巨大 PR では実装が先行し、思想（doc）が「宣言したが未配線」のまま残りやすい。放置すると次の実装が
+  撤回済み概念（extracted_challenge）の上に積み上がり乖離が固定化する。早期の棚卸しで真実源を一致させる。
+- 死蔵 API は攻撃面・認知負荷・「使われている」という誤認の温床。PR 説明との不一致は監査性を損なう。
+
+**結果 / 将来課題**:
+- セグメント分類は埋め込み I/O が増える（バケット代表ベクトルの生成）。スペースは小規模前提で総当たり
+  コサインのコストは許容。大規模化したら近似最近傍や事前計算へ。
+- マルチフォーマット（TALK_SCRIPT/PROPOSAL）は配線済みだがプロンプトテンプレは EMAIL 主体。各 format 専用の
+  生成プロンプト精緻化は将来課題。
+- segments router 削除でパターン/スナップショットの REST 介入窓口は無くなった（HIL はチャット内で実施）。
+  人間が成果物を直接編集する UI が必要になれば data.router 側に読み取りを足して再設計する。
+
+**横展開できる学び**:
+- **「ドキュメントに書いた＝実装した」ではない**。思想ドキュメントは WRITE/READ 双方の配線が揃って初めて
+  「実装済み」。生成だけして消費しない派生データ（ベクトル等）はデッドコード化しやすい。
+- **大型 PR の後は doc⇔impl 監査を 1 工程として設ける**。コミットメッセージの「削除した」は実態と乖離し得る。
