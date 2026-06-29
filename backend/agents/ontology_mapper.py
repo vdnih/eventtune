@@ -381,13 +381,13 @@ class OntologyMapper:
             name=name,
             event_type=event_type,
             status=status,
-            venue=raw.get("venue", ""),
-            event_date=raw.get("event_date", ""),
-            event_date_end=raw.get("event_date_end") or raw.get("event_date", ""),
+            venue=raw.get("venue") or "",
+            event_date=raw.get("event_date") or "",
+            event_date_end=raw.get("event_date_end") or raw.get("event_date") or "",
             booth_number=raw.get("booth_number") or None,
             total_budget=budget,
             target_contact_count=_to_int(raw.get("target_contact_count")),
-            description=raw.get("description", ""),
+            description=raw.get("description") or "",
             created_at=now,
             updated_at=now,
         )
@@ -421,8 +421,8 @@ class OntologyMapper:
             account_id=stable_account_id(space_id, name),
             space_id=space_id,
             account_name=name,
-            industry_type=raw.get("industry_type", ""),
-            company_size=raw.get("company_size", ""),
+            industry_type=raw.get("industry_type") or "",
+            company_size=raw.get("company_size") or "",
             created_at=_now_iso(),
         )
         transform = EntityTransformation(
@@ -441,7 +441,7 @@ class OntologyMapper:
             product_id=stable_product_id(space_id, name),
             space_id=space_id,
             product_name=name,
-            product_category=raw.get("product_category", ""),
+            product_category=raw.get("product_category") or "",
             created_at=_now_iso(),
         )
         transform = EntityTransformation(
@@ -503,7 +503,7 @@ class OntologyMapper:
         except (ValueError, TypeError):
             amount = 0.0
 
-        description = raw.get("description", "")
+        description = raw.get("description") or ""
         if amount <= 0:
             return None, None, SkippedRecord(
                 entity_type="CostItem", reason="amount<=0 のためスキップ",
@@ -550,8 +550,8 @@ class OntologyMapper:
             space_id=space_id,
             content_name=name,
             content_type=content_type,
-            url=raw.get("url", ""),
-            description=raw.get("description", ""),
+            url=raw.get("url") or "",
+            description=raw.get("description") or "",
             linked_event_id=raw.get("linked_event_id") or None,
         )
         transform = EntityTransformation(
