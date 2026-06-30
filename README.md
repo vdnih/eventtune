@@ -126,6 +126,29 @@ cd backend && uv run uvicorn main:app --reload --port 8000
 cd frontend && npm run dev
 ```
 
+## デプロイ（GCP + Firebase）
+
+IaC は責務で分割する（詳細は [docs/ADR.md](docs/ADR.md) ADR-012 / [docs/INFRA_ARCHITECTURE.md](docs/INFRA_ARCHITECTURE.md)）。
+
+| 対象 | 手段 |
+|------|------|
+| GCP インフラ（Cloud Run, SA/IAM, Artifact Registry, Firestore DB, Storage, Firebase, WIF） | **Terraform**（[infra/terraform/](infra/terraform/)） |
+| Firestore ルール/インデックス・Storage ルール | `firebase deploy --only firestore,storage` |
+| フロント（Next.js SSR） | **Firebase App Hosting**（`frontend/apphosting.yaml`・git push 自動） |
+| バックエンド（Cloud Run） | **GitHub Actions**（`.github/workflows/deploy-backend.yml`・WIF キーレス） |
+| Agent Engine | `backend/scripts/provision_agent_engine.py`（出力を tfvars に注入） |
+
+```bash
+# 1) インフラ（初回手順は infra/terraform/README.md 参照）
+cd infra/terraform && terraform init && terraform apply
+
+# 2) ルール配信
+firebase deploy --only firestore:rules,firestore:indexes,storage
+
+# 3) バックエンドは main への push で自動デプロイ（GitHub Actions）
+# 4) フロントは App Hosting 連携後、main への push で自動デプロイ
+```
+
 ## 使い方
 
 1. `http://localhost:3000` にアクセスして Google ログイン

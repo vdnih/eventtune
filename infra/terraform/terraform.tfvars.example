@@ -1,0 +1,14 @@
+# cp terraform.tfvars.example terraform.tfvars して実値を埋める。
+# terraform.tfvars は .gitignore 済み（秘匿値を含めうるためコミットしない）。
+
+# scripts/provision_agent_engine.py の出力を貼る
+agent_engine_resource_name = "projects/974233950009/locations/us-central1/reasoningEngines/REPLACE_ME"
+agent_engine_id            = "REPLACE_ME"
+
+# App Hosting の配信 URL（初回は apply 後に確定 → ここを更新して再 apply）
+frontend_origin = "https://REPLACE_ME--marketing-mail-generator.asia-east1.hosted.app"
+
+# 既定値で足りる場合は以下は省略可
+# project_id     = "marketing-mail-generator"
+# project_number = "974233950009"
+# region         = "asia-northeast1"

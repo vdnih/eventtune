@@ -8,17 +8,6 @@
   "storage": {
     "rules": "storage.rules"
   },
-  "hosting": {
-    "source": "frontend",
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
-    ],
-    "frameworksBackend": {
-      "region": "asia-northeast1"
-    }
-  },
   "emulators": {
     "auth": {
       "port": 9099
