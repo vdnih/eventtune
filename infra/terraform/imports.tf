@@ -9,9 +9,9 @@ import {
 
 import {
   to = google_firebase_web_app.default
-  # apps/{appId}。実際の Web アプリ ID（1:974233950009:web:75bbffb7465a269bf8bae8 の web:以降）に置換。
+  # apps/{appId}。実際の Web アプリ ID。
   # 取得: firebase apps:list WEB  もしくは コンソール
-  id = "projects/${var.project_id}/webApps/REPLACE_WITH_WEB_APP_ID"
+  id = "projects/${var.project_id}/webApps/1:974233950009:web:75bbffb7465a269bf8bae8"
 }
 
 import {

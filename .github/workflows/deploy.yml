@@ -1,0 +1,113 @@
+name: Deploy (CD)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "firestore.rules"
+      - "firestore.indexes.json"
+      - "storage.rules"
+      - "firebase.json"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: marketing-mail-generator
+  REGION: asia-northeast1
+  SERVICE: mmg-api
+  REPO: mmg
+
+permissions:
+  contents: read
+  id-token: write # WIF 認証に必須
+
+jobs:
+  deploy-backend:
+    name: Deploy Backend to Cloud Run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for backend changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - '.github/workflows/deploy.yml'
+
+      - name: Google Auth (WIF)
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & push image
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+        working-directory: backend
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:${{ github.sha }}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy to Cloud Run
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --image "${{ env.IMAGE }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}"
+
+  deploy-firebase:
+    name: Deploy Firebase Configurations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Firebase changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            firebase:
+              - 'firestore.rules'
+              - 'firestore.indexes.json'
+              - 'storage.rules'
+              - 'firebase.json'
+              - '.github/workflows/deploy.yml'
+
+      - name: Google Auth (WIF)
+        if: steps.filter.outputs.firebase == 'true' || github.event_name == 'workflow_dispatch'
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Setup Node.js
+        if: steps.filter.outputs.firebase == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy Firestore and Storage Configurations
+        if: steps.filter.outputs.firebase == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          npx firebase-tools deploy \
+            --only firestore:rules,firestore:indexes,storage \
+            --project ${{ env.PROJECT_ID }}
