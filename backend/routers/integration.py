@@ -12,33 +12,22 @@ docs/INGESTION_MAPPING.md に従い、イベント割り当てではなく「フ
   GET  /api/integration/batches/{id}/contacts → 取り込み済み Person
 """
 
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
-from google import genai
-from google.genai import types
 from pydantic import BaseModel
 
+from agents.ontology_mapper import _normalize_name
 from dependencies import get_space_context
-from metering import metered, record_llm_response
+from metering import metered
+from ontology import DocumentPlan
 from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/integration", tags=["integration"])
-
-_MODEL = "gemini-3.1-flash-lite"
-_genai_client: genai.Client | None = None
-
-
-def _get_genai_client() -> genai.Client:
-    global _genai_client
-    if _genai_client is None:
-        _genai_client = genai.Client()
-    return _genai_client
 
 
 def _now_iso() -> str:
@@ -47,17 +36,15 @@ def _now_iso() -> str:
 
 # ── 取り込みプラン提案 ──────────────────────────────────────────────────────────
 
-class _ProposedLink(BaseModel):
-    kind: str = ""        # "event" | "account" | "product"
-    name: str = ""
-    existing: bool = False  # 既存マスタに一致するか
-
-
 class _FilePlan(BaseModel):
     filename: str
-    detected_entity_types: list[str] = []  # persons/accounts/events/products/contents/cost_items
-    proposed_links: list[_ProposedLink] = []
-    notes: str = ""
+    business_context: str = ""
+    entity_type: str = ""
+    source_file_role: str = ""
+    link_hints: dict[str, str] = {}       # {kind: マスタ名}
+    link_existing: dict[str, bool] = {}   # {kind: 既存マスタに一致するか}
+    column_map: dict[str, str] = {}
+    unmapped_notes: str = ""
 
 
 class _PlanResponse(BaseModel):
@@ -78,63 +65,48 @@ def _load_master_names(space: SpaceContext) -> dict[str, list[str]]:
     return out
 
 
+_KIND_TO_COL = {"event": "events", "account": "accounts", "product": "products"}
+
+
 @router.post("/plan")
 async def plan_ingestion(
     files: list[UploadFile] = File(...),
     hint: str | None = Form(None),
     space: SpaceContext = Depends(get_space_context),
 ):
-    """ファイルを受け取り、AI が分解プラン（エンティティ種別＋リンク案）を返す（保存しない）。"""
-    file_previews = []
+    """ファイルを受け取り、understand_batch で分解プランを生成して返す（保存しない）。"""
+    from agents.data_integration_agent import understand_batch
+
+    loaded: list[tuple[str, bytes]] = []
     for f in files:
         content = await f.read()
-        filename = f.filename or "upload"
-        try:
-            preview = content[:800].decode("utf-8", errors="replace")
-        except Exception:
-            preview = ""
-        file_previews.append({"filename": filename, "preview": preview})
-
-    masters = _load_master_names(space)
-    hint_block = f"\n\n【ユーザーのヒント】\n{hint.strip()}\n" if (hint or "").strip() else ""
-
-    prompt = f"""\
-あなたはイベントマーケティングデータの統合専門家です。
-アップロードされたファイル（ファイル名と先頭コンテンツ）を読み、各ファイルがオントロジーの
-どのエンティティを含むか、どのマスタにリンクするかを判定してください。イベントは複数マスタの
-1つにすぎません（ファイルを単一イベントに割り当てる発想はしないこと）。
-
-【オントロジーのエンティティ種別】
-persons（人物）, accounts（企業）, events（イベント）, products（製品）, contents（素材）, cost_items（費用）
-※1ファイルに複数種別が含まれることがある（例: 参加者リスト = persons ＋ accounts ＋ events へのリンク）
-
-【既存マスタ名（リンク照合用）】
-events: {json.dumps(masters["events"], ensure_ascii=False)}
-accounts: {json.dumps(masters["accounts"], ensure_ascii=False)}
-products: {json.dumps(masters["products"], ensure_ascii=False)}
-{hint_block}
-【アップロードファイル】
-{json.dumps(file_previews, ensure_ascii=False)}
-
-各ファイルについて判定:
-- detected_entity_types: 含まれるエンティティ種別のリスト
-- proposed_links: このファイルのデータが紐づくマスタ案。各要素 {{kind: event|account|product, name: 名称, existing: 既存マスタ名に一致するか}}。
-  行ごとに異なる場合や列で判別できる場合も、代表的なリンク先を挙げる。リンクが無ければ空配列。
-- notes: 判定の補足（曖昧な点、ヒントの反映など）を簡潔に
-"""
+        loaded.append((f.filename or "upload", content))
 
     with metered(space):
-        response = await _get_genai_client().aio.models.generate_content(
-            model=_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=_PlanResponse,
-            ),
-        )
-    record_llm_response(space, _MODEL, response)
-    result = _PlanResponse.model_validate_json(response.text)
-    return {"files": [f.model_dump() for f in result.files]}
+        document_plans = await understand_batch(loaded, (hint or "").strip() or None, space=space)
+
+    masters = _load_master_names(space)
+
+    result_files: list[_FilePlan] = []
+    for filename, _ in loaded:
+        plan: DocumentPlan = document_plans.get(filename, DocumentPlan())
+        link_existing: dict[str, bool] = {}
+        for kind, name in plan.link_hints.items():
+            col = _KIND_TO_COL.get(kind, kind + "s")
+            norm_name = _normalize_name(name)
+            link_existing[kind] = norm_name in {_normalize_name(n) for n in masters.get(col, [])}
+        result_files.append(_FilePlan(
+            filename=filename,
+            business_context=plan.business_context,
+            entity_type=plan.entity_type,
+            source_file_role=plan.source_file_role,
+            link_hints=plan.link_hints,
+            link_existing=link_existing,
+            column_map=plan.column_map,
+            unmapped_notes=plan.unmapped_notes,
+        ))
+
+    return {"files": [f.model_dump() for f in result_files]}
 
 
 # ── バッチ処理 ─────────────────────────────────────────────────────────────────

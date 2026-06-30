@@ -1,19 +1,12 @@
 """
-OntologyMapper — 取り込みの「解釈」フェーズ（決定論 Python・I/O なし）
+OntologyMapper — 取り込みの「解釈」フェーズ（I/O なし）
 
-DataIntegrationAgent (AI) が出力した生データ（列写像 / 文書抽出）を、決定論的ロジックで
-**中間レコード**へ解釈する。最終的なオントロジーエンティティ（UUID 採番・永続）は作らない。
-
-ADR-011 / docs/INGESTION_MAPPING.md に従う:
-- 参加者ファイルの1行は person ではなく「接客(encounter)＝観測」。1行 → PersonObservation。
-- マスタ（events/accounts/products/contents）は観測から conform される派生ディメンション。
-  ここではリンク先を「名前」のまま持ち、PK の採番・名寄せ（find-or-create）は後段（conform/bind）が
-  実在エンティティへの検索で行う。安定 ID（名前ハッシュ）は廃止。
+ADR-013 / docs/INGESTION_MAPPING.md に従う:
+- CSVパス（パスA）: DataIntegrationAgent が AI で直接 PersonObservation を生成する。
+  OntologyMapper は CSV 行の解釈を担わない（map_rows / _classify_engagement は廃止）。
+- TXTパス（パスB）: DocumentExtractor の出力を map_extraction で中間レコードへ変換する。
 - _normalize_name は照合キーの比較に使う（ID 生成には使わない）。
-- 接客事実（接客担当・課題感・メモ）は PersonObservation 経由で EventAttendance へ。
-  Person.appeal_summary は後段の導出ステージで全 attendance から集約生成する。
-
-Auditable AI（原則4）に従い、各変換判定の根拠を TransformDecision / EntityTransformation として返す。
+- 業務的判定（感度分類等）は行わない。観測事実をそのまま EventAttendance へ載せる。
 """
 
 import re
@@ -23,11 +16,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ontology import (
-    ColumnMappingResult,
     ContentType,
     CostCategory,
     DocumentExtractionResult,
-    EngagementLevel,
     EntityTransformation,
     EventStatus,
     EventType,
@@ -99,7 +90,6 @@ class PersonObservation:
     company_name: str = ""          # account リンク名
     department: str = ""
     job_title: str = ""
-    engagement_level: EngagementLevel | None = None
     event_link_name: str = ""       # event リンク名
     action_type: str = "参加"
     product_link_names: list[str] = field(default_factory=list)
@@ -137,50 +127,11 @@ class MapResult:
 
 
 class OntologyMapper:
-    """AI 抽出結果 → 中間レコード への決定論的解釈を担う（純粋・I/O なし）。"""
+    """AI 抽出結果 → 中間レコード への決定論的解釈を担う（純粋・I/O なし）。
 
-    # ── パスA: 表形式データ ──────────────────────────────────────────────────
-
-    def map_rows(
-        self,
-        column_mapping: ColumnMappingResult,
-        rows: list[dict],
-        space_id: str = "",
-        job_id: str | None = None,
-    ) -> MapResult:
-        """CSV/Excel の行データを ColumnMappingResult に従い中間レコードへ解釈する。"""
-        result = MapResult()
-        entity_type = column_mapping.entity_type
-        link_columns = column_mapping.link_columns or {}
-        default_links = column_mapping.default_links or {}
-
-        for row in rows:
-            mapped = self._apply_column_map(column_mapping.column_map, row)
-            if entity_type in ("persons", "contacts"):
-                self._decompose_person(mapped, link_columns, default_links, result)
-            elif entity_type == "events":
-                self._push(result, self._build_event(mapped))
-            elif entity_type == "accounts":
-                self._push(result, self._build_account(mapped))
-            elif entity_type == "products":
-                self._push(result, self._build_product(mapped))
-            elif entity_type == "contents":
-                event_name = self._resolve_link_name("event", mapped, link_columns, default_links)
-                self._push(result, self._build_content(mapped, event_name=event_name))
-            elif entity_type == "cost_items":
-                event_name = self._resolve_link_name("event", mapped, link_columns, default_links)
-                self._push(result, self._build_cost_item(mapped, event_name=event_name))
-        return result
-
-    def _apply_column_map(self, column_map: dict[str, str], row: dict) -> dict:
-        out: dict = {}
-        for csv_col, ontology_field in column_map.items():
-            val = row.get(csv_col, "")
-            if val is None:
-                val = ""
-            out[ontology_field] = str(val).strip()
-        out["__raw"] = row  # 元の行 dict = observation（一過性・永続しない）
-        return out
+    CSVパス（パスA）の行解釈は DataIntegrationAgent の AI 抽出へ移譲（ADR-013）。
+    このクラスは TXT パス（パスB）の DocumentExtractionResult 変換のみを担う。
+    """
 
     @staticmethod
     def _push(result: MapResult, build: "tuple[InterpretedRecord | None, SkippedRecord | None]") -> None:
@@ -191,105 +142,6 @@ class OntologyMapper:
                 result.transformations.append(record.transform)
         if skip is not None:
             result.skipped.append(skip)
-
-    def _resolve_link_name(
-        self, kind: str, mapped: dict, link_columns: dict, default_links: dict
-    ) -> str:
-        """リンク先マスタ名を解決する: 行の列 → ファイル既定（ヒント由来）の順。"""
-        col = link_columns.get(kind)
-        if col:
-            val = str(mapped.get("__raw", {}).get(col, "")).strip()
-            if val:
-                return val
-        return str(default_links.get(kind, "")).strip()
-
-    def _decompose_person(
-        self,
-        mapped: dict,
-        link_columns: dict,
-        default_links: dict,
-        result: MapResult,
-    ) -> None:
-        """1行（1接客の観測）を PersonObservation へ解釈する。"""
-        name_last = mapped.get("name_last", "")
-        name_first = mapped.get("name_first", "")
-        name = mapped.get("name", f"{name_last}{name_first}").strip()
-        if not name:
-            result.skipped.append(SkippedRecord(
-                entity_type="Person",
-                reason="name 空のためスキップ",
-                detail=f"name_last={name_last!r} name_first={name_first!r}",
-            ))
-            return
-
-        decisions: list[TransformDecision] = []
-
-        engagement, eng_reason, eng_signals = self._classify_engagement(mapped)
-        decisions.append(TransformDecision(
-            field="engagement_level", value=engagement.value,
-            reason=eng_reason, source_signals=eng_signals,
-        ))
-
-        # 接客メモ集約（→ EventAttendance.memo）
-        memo_sources = {
-            "__memo": mapped.get("__memo", ""),
-            "__needs": mapped.get("__needs", ""),
-            "__caution": mapped.get("__caution", ""),
-        }
-        merged_fields = [k for k, v in memo_sources.items() if v]
-        memo = " / ".join(memo_sources[k] for k in merged_fields)
-        if merged_fields:
-            decisions.append(TransformDecision(
-                field="memo", value=memo,
-                reason="次のフィールドを接客メモへ集約: " + ", ".join(merged_fields),
-                source_signals={k: memo_sources[k] for k in merged_fields},
-            ))
-
-        company_name = (
-            mapped.get("company_name", "").strip()
-            or self._resolve_link_name("account", mapped, link_columns, default_links)
-        )
-        event_name = self._resolve_link_name("event", mapped, link_columns, default_links)
-
-        # 製品リンクは link 列と __product_signal の両方から拾い得る。同じ列を指すと
-        # 二重化するため、ソースごとに分割してから名称で重複排除する。
-        product_names: list[str] = []
-        for src in (
-            self._resolve_link_name("product", mapped, link_columns, default_links),
-            mapped.get("__product_signal", ""),
-        ):
-            for nm in _split_names(src):
-                if nm not in product_names:
-                    product_names.append(nm)
-        if product_names:
-            decisions.append(TransformDecision(
-                field="interested_products", value=", ".join(product_names),
-                reason="製品名を products リンクとして抽出（後段で名寄せ）",
-                source_signals={"products": ", ".join(product_names)},
-            ))
-
-        # 接客担当・課題感（→ EventAttendance）。__challenge は旧 extracted_challenge も拾う。
-        owner_staff = mapped.get("__event_owner", "").strip() or mapped.get("owner_staff", "").strip()
-        challenge_note = (
-            mapped.get("__challenge", "").strip()
-            or mapped.get("extracted_challenge", "").strip()
-        )
-
-        result.person_observations.append(PersonObservation(
-            name=name,
-            email=mapped.get("email", "").strip(),
-            company_name=company_name,
-            department=mapped.get("department", ""),
-            job_title=mapped.get("job_title", ""),
-            engagement_level=engagement,
-            event_link_name=event_name,
-            product_link_names=product_names,
-            owner_staff=owner_staff,
-            challenge_note=challenge_note,
-            memo=memo,
-            source_label=f"{name}（{company_name}）" if company_name else name,
-            decisions=decisions,
-        ))
 
     # ── パスB: 非構造化ドキュメント ─────────────────────────────────────────
 
@@ -548,32 +400,3 @@ class OntologyMapper:
             kind="contents", payload=payload, name=name, links=links, transform=transform,
         ), None
 
-    # ── 決定論的分類ロジック ─────────────────────────────────────────────────
-
-    def _classify_engagement(
-        self, mapped: dict
-    ) -> tuple[EngagementLevel, str, dict[str, str]]:
-        """EngagementLevel を決定論的ルールで分類する（AI 不使用）。
-
-        汎用シグナル方式: 判定ランク（A/B/C）・温度感・メモから決める。
-        """
-        judgment = mapped.get("__engagement_signal", "").strip().upper()
-        temperature = mapped.get("__temperature_signal", "").strip()
-        memo = mapped.get("__memo", "").strip()
-        signals = {
-            "__engagement_signal": judgment,
-            "__temperature_signal": temperature,
-            "__memo": memo,
-        }
-
-        if judgment == "A":
-            return EngagementLevel.APPOINTMENT_BOOKED, "判定シグナル=A", signals
-        if any(kw in memo for kw in ("アポ", "アポイント", "アポ取得", "アポ設定")):
-            return EngagementLevel.APPOINTMENT_BOOKED, "memo に「アポ」を含む", signals
-
-        if judgment == "B":
-            return EngagementLevel.HIGH_INTENT, "判定シグナル=B", signals
-        if temperature in ("ホット", "ウォーム", "高", "中", "hot", "warm"):
-            return EngagementLevel.HIGH_INTENT, f"温度感シグナル={temperature}", signals
-
-        return EngagementLevel.NURTURING, "該当ルールなし → 既定(通常リード)", signals

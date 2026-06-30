@@ -30,15 +30,16 @@ from pydantic import BaseModel
 
 import semantic_search
 from agents.ontology_mapper import MapResult, OntologyMapper, _normalize_name
+from config import get_settings
 from metering import record_llm_response
 from space import SpaceContext
 from ontology import (
     Account,
-    ColumnMappingResult,
     ContactStage,
     Content,
     CostItem,
     DocumentExtractionResult,
+    DocumentPlan,
     Event,
     EventAttendance,
     IntegrationJob,
@@ -50,7 +51,6 @@ from ontology import (
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini-3.1-flash-lite"
 _mapper = OntologyMapper()
 _client: genai.Client | None = None
 
@@ -75,109 +75,252 @@ def _hint_block(hint: str | None) -> str:
     return f"\n\n【ユーザーのヒント（リンク解決・種別判定の補正に使う）】\n{hint}\n" if hint else ""
 
 
-# ── パスA: SchemaMapper ──────────────────────────────────────────────────────
-#
-# column_map はキーが CSV カラム名で可変のため response_schema は使わず JSON モードのみ。
+# ── パスA: バッチ横断理解 + 行単位並列抽出（ADR-013）────────────────────────────
 
-_SCHEMA_MAPPER_PROMPT = """\
-あなたはデータ統合の専門家です。CSV のヘッダーとサンプル行（とユーザーのヒント）を読み、
-このテーブルがどのエンティティ種別かを判定し、各カラムをオントロジーフィールドへマッピングしてください。
 
-【エンティティ種別とフィールド】
-persons（人物リスト。氏名・会社・役職などを含む。1行＝1接客の観測）:
-  name / name_last / name_first / company_name / department / job_title / email
-  __engagement_signal（判定ランク A/B/C）/ __temperature_signal（温度感）/ __product_signal（関心製品名）
-  __event_owner（接客担当者）/ __challenge（その接客で把握した課題感）
-  __memo / __needs / __caution（接客メモへ集約される所感・要望・注意）
-accounts（企業マスタ）: account_name（または company_name）/ industry_type / company_size
-events（イベントマスタ）: name / event_type（展示会/セミナー/プライベートイベント）/ status / venue /
-  event_date（YYYY-MM-DD）/ event_date_end / total_budget / target_contact_count / description
+
+_ONTOLOGY_DEFINITION = """\
+【オントロジー定義（エンティティ間の関係・各フィールドの業務的意味）】
+OSI セマンティックレイヤー: 5マスタ（persons/accounts/events/products/contents）+ 2ファクト
+
+persons（人物マスタ）: name / email / company_name / department / job_title
+  ※ 感度・ステータス等の業務的判定は行わない。観測事実のみ格納。
+
+event_attendances（接客ファクト / persons×events）:
+  action_type（参加/商談/問合せ等） / owner_staff（接客担当者名）
+  challenge_note（接客時に把握した課題感。担当者主観の興味レベルもここに含める）
+  memo（その他メモ・所感）
+  ※ challenge_note には「感度A」「関心高め」等のテキストもそのまま含める（分類しない）
+
+product_interests（製品関心ファクト / persons×products）
+
+events（イベントマスタ）: name / event_type / event_date / venue / description 等
+accounts（企業マスタ）: account_name / industry_type / company_size
 products（製品マスタ）: product_name / product_category
-contents（素材マスタ）: name / content_type / url / description
-cost_items（費用）: category / description / amount_jpy / vendor_name / invoice_date
+contents（コンテンツマスタ）: content_name / content_type / url
+"""
 
-【リンク列 link_columns】
-行ごとに異なるリンク先マスタを識別する列があれば {種別: カラム名} で設定する:
-  "event": イベント名・展示会名の列 / "account": 会社名の列 / "product": 製品名の列
+_BATCH_UNDERSTAND_PROMPT = """\
+あなたはイベントマーケティングデータ統合の専門家です。
+バッチ内の全ファイルのヘッダーとサンプル行を読み、各ファイルの業務的な役割・内容・相互関係を把握して
+1ファイルごとの DocumentPlan を生成してください。
 
-【ファイル既定リンク default_links】
-行に該当列が無いが、ファイル全体が特定マスタに属するとヒント等から分かる場合 {種別: 名称} を設定する。
-  例: ヒント「2025秋展示会の参加者リスト」→ {"event": "2025秋展示会"}
+{ontology}
 
 【ルール】
-- entity_type は persons / accounts / events / products / contents / cost_items のいずれか
-- column_map にすべてのカラムを含める（マッピングできないものは unmapped_columns へ）
-- __ プレフィックスは OntologyMapper でさらに変換される特殊フィールド
-- 推測でリンクを作らない。根拠がある場合のみ link_columns / default_links を設定する
+- entity_type: persons / events / accounts / products / contents / cost_items のいずれか
+- link_hints: このファイルに含まれるデータが関連するマスタ名 {{"event": "展示会名"}} 等
+  （バッチ内の別ファイル（イベント概要等）から推定できる場合は積極的に設定する）
+- column_map: CSVカラム名 → オントロジーフィールド名のマッピング
+  persons の場合のフィールド: name/name_last/name_first/email/company_name/department/job_title
+    接客事実: owner_staff/challenge_note/memo/action_type
+    製品リンク: product_link_names（複数可）
+- unmapped_notes: マッピングできなかったカラムや不明な点の説明
+- source_file_role: participant_list / event_master / cost_list / content_list 等
 
-【出力形式】次の形の JSON オブジェクトのみを返す（説明やコードフェンスは不要）:
-{
-  "entity_type": "...",
-  "column_map": { "CSVカラム名": "オントロジーフィールド名", ... },
-  "unmapped_columns": [ ... ],
-  "link_columns": { "event": "カラム名", ... },
-  "default_links": { "event": "名称", ... }
-}
+【出力形式】ファイル名をキーとした JSON オブジェクト:
+{{
+  "ファイル名.csv": {{
+    "business_context": "...",
+    "entity_type": "...",
+    "source_file_role": "...",
+    "link_hints": {{"event": "..."}},
+    "column_map": {{"CSVカラム名": "オントロジーフィールド名"}},
+    "unmapped_notes": "..."
+  }},
+  ...
+}}
+"""
+
+_ROW_EXTRACT_PROMPT = """\
+あなたはイベントマーケティングデータ統合の専門家です。
+1件の接客記録（CSVの1行）を構造化データへ変換してください。
+
+{ontology_short}
+
+【このファイルの業務文脈】
+{business_context}
+エンティティ種別: {entity_type}
+リンク先: {link_hints}
+カラムマッピング: {column_map}
+
+【変換対象の行データ】
+{row_json}
+
+【ルール】
+- challenge_note には担当者主観の興味度（「感度A」「関心高め」等）もテキストのまま含める
+- product_link_names には関連製品名をリストで（複数可）
+- event_link_name はリンク先イベント名（行データに無ければ link_hints から補完）
+- 名前が空の場合は skip_reason を設定する
+- 推測で値を埋めない
+"""
+
+_ONTOLOGY_SHORT = """\
+persons フィールド: name/email/company_name/department/job_title/owner_staff/challenge_note/memo/action_type/product_link_names/event_link_name
 """
 
 
-def _parse_json_response(text: str) -> dict:
-    """JSON モードのレスポンス文字列を dict にパースする（フェンス・ノイズに防御的）。"""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
-        if text.lstrip().startswith("json"):
-            text = text.lstrip()[4:]
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end == -1:
-            raise
-        result = json.loads(text[start : end + 1])
-    return result if isinstance(result, dict) else {}
+class _PersonObservationExtraction(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    company_name: Optional[str] = None
+    department: Optional[str] = None
+    job_title: Optional[str] = None
+    owner_staff: Optional[str] = None
+    challenge_note: Optional[str] = None
+    memo: Optional[str] = None
+    action_type: Optional[str] = None
+    product_link_names: list[str] = []
+    event_link_name: Optional[str] = None
+    skip_reason: Optional[str] = None
 
 
-def _str_map(raw: Any) -> dict[str, str]:
-    return {str(k): str(v) for k, v in raw.items() if v} if isinstance(raw, dict) else {}
-
-
-async def run_schema_mapper(
-    headers: list[str], sample_rows: list[dict],
+async def understand_batch(
+    files: list[tuple[str, bytes]],
+    hint: str | None,
     space: Optional[SpaceContext] = None,
-    hint: str | None = None,
-) -> ColumnMappingResult:
-    sample_text = json.dumps(sample_rows[:5], ensure_ascii=False, indent=2)
+) -> dict[str, DocumentPlan]:
+    """バッチ内全ファイルのヘッダー+サンプルをフルモデルに渡し、各ファイルの DocumentPlan を生成する。"""
+    if not files:
+        return {}
+
+    files_block_parts: list[str] = []
+    for filename, content in files:
+        if _is_tabular(filename):
+            try:
+                headers, rows = _read_tabular(filename, content)
+                sample = json.dumps(rows[:5], ensure_ascii=False)
+                files_block_parts.append(
+                    f"--- {filename} ---\nヘッダー: {headers}\nサンプル: {sample}"
+                )
+            except Exception as e:
+                files_block_parts.append(f"--- {filename} ---\n読み込みエラー: {e}")
+        else:
+            try:
+                text = _read_text(content)
+                files_block_parts.append(f"--- {filename} ---\n{text[:800]}")
+            except Exception:
+                pass
+
+    if not files_block_parts:
+        return {}
+
     prompt = (
-        f"{_SCHEMA_MAPPER_PROMPT}{_hint_block(hint)}\n\n"
-        f"【カラムヘッダー】\n{headers}\n\n"
-        f"【サンプルデータ（先頭5行）】\n{sample_text}"
+        _BATCH_UNDERSTAND_PROMPT.format(ontology=_ONTOLOGY_DEFINITION)
+        + _hint_block(hint)
+        + "\n\n【バッチ内ファイル一覧】\n"
+        + "\n\n".join(files_block_parts)
     )
-    response = await _get_client().aio.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    try:
+        _model = get_settings().model_ingestion
+        response = await _get_client().aio.models.generate_content(
+            model=_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        if space is not None:
+            record_llm_response(space, _model, response)
+        raw = json.loads(response.text)
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, DocumentPlan] = {}
+        for fname, plan_dict in raw.items():
+            if isinstance(plan_dict, dict):
+                result[fname] = DocumentPlan(
+                    business_context=str(plan_dict.get("business_context", "")),
+                    entity_type=str(plan_dict.get("entity_type", "")),
+                    source_file_role=str(plan_dict.get("source_file_role", "")),
+                    link_hints={str(k): str(v) for k, v in (plan_dict.get("link_hints") or {}).items()},
+                    column_map={str(k): str(v) for k, v in (plan_dict.get("column_map") or {}).items()},
+                    unmapped_notes=str(plan_dict.get("unmapped_notes", "")),
+                )
+        logger.info("understand_batch: files=%s plans=%s", [f for f, _ in files], list(result.keys()))
+        return result
+    except Exception:
+        logger.exception("understand_batch failed")
+        return {}
+
+
+async def _extract_single_row(
+    row: dict, plan: DocumentPlan, space: Optional[SpaceContext] = None
+) -> "PersonObservation | None":
+    """1行の CSV データから PersonObservation を軽量モデルで抽出する。"""
+    from agents.ontology_mapper import PersonObservation
+
+    prompt = _ROW_EXTRACT_PROMPT.format(
+        ontology_short=_ONTOLOGY_SHORT,
+        business_context=plan.business_context or "(不明)",
+        entity_type=plan.entity_type,
+        link_hints=json.dumps(plan.link_hints, ensure_ascii=False),
+        column_map=json.dumps(plan.column_map, ensure_ascii=False),
+        row_json=json.dumps(row, ensure_ascii=False),
     )
-    if space is not None:
-        record_llm_response(space, _MODEL, response)
-    parsed = _parse_json_response(response.text)
-    unmapped = parsed.get("unmapped_columns") or []
-    return ColumnMappingResult(
-        entity_type=str(parsed.get("entity_type", "")),
-        column_map=_str_map(parsed.get("column_map")),
-        unmapped_columns=[str(c) for c in unmapped],
-        link_columns=_str_map(parsed.get("link_columns")),
-        default_links=_str_map(parsed.get("default_links")),
-    )
+    try:
+        _model = get_settings().model_batch
+        response = await _get_client().aio.models.generate_content(
+            model=_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=_PersonObservationExtraction,
+            ),
+        )
+        if space is not None:
+            record_llm_response(space, _model, response)
+        ext = _PersonObservationExtraction.model_validate_json(response.text)
+        if ext.skip_reason or not (ext.name or "").strip():
+            return None
+        return PersonObservation(
+            name=(ext.name or "").strip(),
+            email=(ext.email or "").strip(),
+            company_name=(ext.company_name or "").strip(),
+            department=(ext.department or "").strip(),
+            job_title=(ext.job_title or "").strip(),
+            event_link_name=(ext.event_link_name or "").strip(),
+            action_type=(ext.action_type or "参加").strip(),
+            product_link_names=ext.product_link_names or [],
+            owner_staff=(ext.owner_staff or "").strip(),
+            challenge_note=(ext.challenge_note or "").strip(),
+            memo=(ext.memo or "").strip(),
+            source_label=(ext.name or "").strip(),
+        )
+    except Exception:
+        logger.exception("_extract_single_row failed: row=%s", str(row)[:200])
+        return None
+
+
+async def _extract_rows_parallel(
+    filename: str,
+    rows: list[dict],
+    plan: DocumentPlan,
+    space: Optional[SpaceContext] = None,
+    job_id: str = "",
+) -> "MapResult":
+    """全行を並列で AI 抽出し MapResult へまとめる。"""
+    from agents.ontology_mapper import MapResult, PersonObservation, SkippedRecord
+
+    sem = asyncio.Semaphore(20)
+
+    async def _bounded(row: dict) -> "PersonObservation | None":
+        async with sem:
+            return await _extract_single_row(row, plan, space)
+
+    results = await asyncio.gather(*[_bounded(row) for row in rows])
+    mr = MapResult()
+    for obs, row in zip(results, rows):
+        if obs is not None:
+            mr.person_observations.append(obs)
+        else:
+            mr.skipped.append(
+                SkippedRecord(entity_type="Person", reason="AI抽出スキップ",
+                              detail=str(row)[:200])
+            )
+    logger.info("_extract_rows_parallel: file=%s rows=%d persons=%d skipped=%d",
+                filename, len(rows), len(mr.person_observations), len(mr.skipped))
+    return mr
 
 
 # ── パスB: DocumentExtractor ─────────────────────────────────────────────────
-
-class _EngagementCountsExtraction(BaseModel):
-    appointment_booked: Optional[int] = None
-    high_intent: Optional[int] = None
-    nurturing: Optional[int] = None
-
 
 class _EventExtraction(BaseModel):
     name: Optional[str] = None
@@ -202,7 +345,6 @@ class _EventKPIExtraction(BaseModel):
     pipeline_value_jpy: Optional[float] = None
     closed_deals_3m: Optional[int] = None
     closed_revenue_3m_jpy: Optional[float] = None
-    contacts_by_engagement: Optional[_EngagementCountsExtraction] = None
 
 
 class _CostItemExtraction(BaseModel):
@@ -295,8 +437,9 @@ async def run_document_extractor(
     hint: str | None = None,
 ) -> DocumentExtractionResult:
     prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}{_hint_block(hint)}\n\n【ドキュメント】\n{text}"
+    _model = get_settings().model_ingestion
     response = await _get_client().aio.models.generate_content(
-        model=_MODEL,
+        model=_model,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -304,7 +447,7 @@ async def run_document_extractor(
         ),
     )
     if space is not None:
-        record_llm_response(space, _MODEL, response)
+        record_llm_response(space, _model, response)
     parsed = _DocumentExtractionResponse.model_validate_json(response.text)
     return DocumentExtractionResult(
         detected_entity_types=parsed.detected_entity_types,
@@ -455,19 +598,13 @@ _KIND_LABEL = {
 
 def _summarize(result: MapResult) -> TransformationSummary:
     entity_counts: dict[str, int] = {}
-    engagement_breakdown: dict[str, int] = {}
     if result.person_observations:
         entity_counts["Person"] = len(result.person_observations)
-    for obs in result.person_observations:
-        if obs.engagement_level:
-            lvl = obs.engagement_level.value
-            engagement_breakdown[lvl] = engagement_breakdown.get(lvl, 0) + 1
     for rec in result.records:
         label = _KIND_LABEL.get(rec.kind, rec.kind)
         entity_counts[label] = entity_counts.get(label, 0) + 1
     return TransformationSummary(
         entity_counts=entity_counts,
-        engagement_breakdown=engagement_breakdown,
         product_breakdown={},
         skipped_count=len(result.skipped),
     )
@@ -479,24 +616,26 @@ async def _interpret_file(
     hint: str | None,
     db: Any,
     space: Optional[SpaceContext] = None,
+    document_plan: Optional[DocumentPlan] = None,
 ) -> _FileInterpretation:
     """1ファイルを読み・AI 解釈し、中間レコード（MapResult）を返す。永続しない。
 
-    解釈の監査（column_mapping / raw_extraction / transformations / skipped）は
-    integration_jobs に子ジョブとして残す。
+    CSVパス: document_plan（understand_batch 出力）を受け取り、行単位並列 AI 抽出を行う。
+    TXTパス: DocumentExtractor で直接エンティティを抽出する。
+    解釈の監査（column_mapping / raw_extraction）は integration_jobs に子ジョブとして残す。
     """
     job_id = _new_id("job_")
     space_id = space.space_id if space is not None else ""
     try:
-        column_mapping = None
+        column_mapping: Optional[DocumentPlan] = None
         raw_extraction_dict = None
         if _is_tabular(filename):
-            headers, rows = _read_tabular(filename, content)
-            column_mapping = await run_schema_mapper(headers, rows, space=space, hint=hint)
-            logger.info("schema_mapper: file=%s entity_type=%s cols=%d link=%s default=%s",
-                        filename, column_mapping.entity_type, len(column_mapping.column_map),
-                        column_mapping.link_columns, column_mapping.default_links)
-            result = _mapper.map_rows(column_mapping, rows, space_id=space_id, job_id=job_id)
+            _, rows = _read_tabular(filename, content)
+            plan = document_plan or DocumentPlan()
+            column_mapping = plan
+            logger.info("extract_rows_parallel: file=%s entity_type=%s link_hints=%s",
+                        filename, plan.entity_type, plan.link_hints)
+            result = await _extract_rows_parallel(filename, rows, plan, space=space, job_id=job_id)
         else:
             text = _read_text(content)
             extraction = await run_document_extractor(text, space=space, hint=hint)
@@ -694,7 +833,7 @@ async def _bind_facts(
                 person_id=pid, space_id=space_id, account_id=account_id,
                 name=obs.name, email=obs.email or None, department=obs.department,
                 job_title=obs.job_title, stage=ContactStage.LEAD,
-                engagement_level=obs.engagement_level, source_job_id=job_id, created_at=now,
+                source_job_id=job_id, created_at=now,
             )
             # appeal_* は導出ステージで全 attendance を集約して付与する（ここでは温存）
             db.document(f"persons/{pid}").set(
@@ -770,7 +909,6 @@ def _person_appeal_payload(
         "name": person.get("name", ""),
         "department": person.get("department", ""),
         "job_title": person.get("job_title", ""),
-        "engagement_level": person.get("engagement_level") or "",
         "接客履歴": "\n".join(enc_lines),
         "関心製品": ", ".join(interests),
     }
@@ -883,9 +1021,14 @@ async def process_batch(
     """
     default_event = (event or "").strip()
 
-    # 1) 観測着地 + 解釈（ファイル並列）
+    # 1) バッチ横断 AI 理解（Step1: 全ファイルのヘッダー+サンプルをフルモデルへ一括投入）
+    document_plans = await understand_batch(files, hint, space=space)
+
+    # 2) 観測着地 + 解釈（ファイル並列）
     interps = list(await asyncio.gather(
-        *[_interpret_file(fn, content, hint, db, space=space) for fn, content in files]
+        *[_interpret_file(fn, content, hint, db, space=space,
+                          document_plan=document_plans.get(fn))
+          for fn, content in files]
     ))
 
     # resolver を既存マスタからシード
@@ -902,7 +1045,7 @@ async def process_batch(
 
     job_id = _new_id("job_")  # conform/bind の由来として facts に刻む
 
-    # 2) 確定（conform）→ 3) 結合（bind）→ 4) 導出（derive）
+    # 3) 確定（conform）→ 4) 結合（bind）→ 5) 導出（derive）
     batch_event_ids = await _conform_masters(db, space, interps, default_event, resolvers)
     touched = await _bind_facts(
         db, space, interps, resolvers, default_event, job_id, batch_event_ids=batch_event_ids)

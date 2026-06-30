@@ -1,4 +1,4 @@
-"""取り込み多段パイプライン（conform→bind→derive）のオフライン結合テスト（ADR-011）。
+"""取り込み多段パイプライン（conform→bind→derive）のオフライン結合テスト（ADR-013）。
 
 実 Firestore/AI を使わず、Fake な ScopedClient と stub した appeal 生成で、依存順の多段が
 狙いどおり収束することを固定する:
@@ -11,8 +11,7 @@
 import asyncio
 
 import semantic_search
-from ontology import ColumnMappingResult
-from agents.ontology_mapper import OntologyMapper
+from agents.ontology_mapper import InterpretedRecord, MapResult, PersonObservation
 import agents.data_integration_agent as agent
 from agents.data_integration_agent import (
     EntityResolver,
@@ -23,8 +22,6 @@ from agents.data_integration_agent import (
     _load_existing,
     _load_existing_persons,
 )
-
-_mapper = OntologyMapper()
 
 
 # ── Fake Firestore（ScopedClient 互換の最小実装）─────────────────────────────────
@@ -131,6 +128,30 @@ def _docs(db, collection):
             if k.startswith(prefix) and "/" not in k[len(prefix):]]
 
 
+def _event_record(name: str) -> InterpretedRecord:
+    """テスト用: イベントの InterpretedRecord を直接生成する。"""
+    from ontology import EventStatus, EventType
+    return InterpretedRecord(
+        kind="events",
+        name=name,
+        payload={"name": name, "event_type": EventType.TRADE_SHOW, "status": EventStatus.COMPLETED,
+                 "venue": "", "event_date": "", "event_date_end": "", "booth_number": None,
+                 "total_budget": 0.0, "target_contact_count": 0, "description": "", "created_at": ""},
+    )
+
+
+def _content_record(name: str, event_name: str) -> InterpretedRecord:
+    """テスト用: コンテンツの InterpretedRecord を直接生成する。"""
+    from ontology import ContentType
+    return InterpretedRecord(
+        kind="contents",
+        name=name,
+        payload={"content_name": name, "content_type": ContentType.WHITE_PAPER, "url": "http://x",
+                 "description": ""},
+        links={"event": event_name},
+    )
+
+
 def test_pipeline_converges_links_and_dedups(monkeypatch):
     async def _fake_build_appeal(kind, payload, space=None):
         return f"summary:{kind}", [0.1, 0.2, 0.3]
@@ -138,33 +159,25 @@ def test_pipeline_converges_links_and_dedups(monkeypatch):
     monkeypatch.setattr(semantic_search, "build_appeal", _fake_build_appeal)
     monkeypatch.setattr(agent.semantic_search, "build_appeal", _fake_build_appeal)
 
-    # ファイル1: 参加者リスト（イベント名は表記揺れ「２０２５秋 展示会」）。同一 email を2行。
-    persons_map = ColumnMappingResult(
-        entity_type="persons",
-        column_map={"氏名": "name", "会社": "company_name", "メール": "email"},
-        link_columns={"event": "イベント", "product": "関心製品"},
+    # ファイル1: 参加者（イベント名は表記揺れ「２０２５秋 展示会」）。同一 email を2行。
+    persons_result = MapResult(
+        person_observations=[
+            PersonObservation(
+                name="田中太郎", email="t@a.com", company_name="ACME",
+                event_link_name="２０２５秋 展示会", product_link_names=["プロダクトA"],
+            ),
+            PersonObservation(
+                name="田中太郎", email="t@a.com", company_name="ACME",
+                event_link_name="２０２５秋 展示会", product_link_names=["プロダクトA"],
+            ),
+        ]
     )
-    persons_rows = [
-        {"氏名": "田中太郎", "会社": "ACME", "メール": "t@a.com",
-         "イベント": "２０２５秋 展示会", "関心製品": "プロダクトA"},
-        {"氏名": "田中太郎", "会社": "ACME", "メール": "t@a.com",
-         "イベント": "２０２５秋 展示会", "関心製品": "プロダクトA"},
-    ]
-    persons_result = _mapper.map_rows(persons_map, persons_rows, space_id="s1")
 
-    # ファイル2: イベントマスタ（正規表記「2025秋展示会」）。投入は persons より後。
-    events_map = ColumnMappingResult(
-        entity_type="events", column_map={"名称": "name", "種別": "event_type"})
-    events_result = _mapper.map_rows(
-        events_map, [{"名称": "2025秋展示会", "種別": "展示会"}], space_id="s1")
+    # ファイル2: イベントマスタ（正規表記「2025秋展示会」）
+    events_result = MapResult(records=[_event_record("2025秋展示会")])
 
     # ファイル3: 素材（別の表記「2025 秋 展示会」でイベントへリンク）
-    contents_map = ColumnMappingResult(
-        entity_type="contents",
-        column_map={"素材名": "content_name", "種別": "content_type", "URL": "url"},
-        default_links={"event": "2025 秋 展示会"})
-    contents_result = _mapper.map_rows(
-        contents_map, [{"素材名": "導入事例A", "種別": "導入事例", "URL": "http://x"}], space_id="s1")
+    contents_result = MapResult(records=[_content_record("導入事例A", "2025 秋 展示会")])
 
     db = _FakeDB()
     interps = [_interp(persons_result), _interp(events_result), _interp(contents_result)]
@@ -174,15 +187,15 @@ def test_pipeline_converges_links_and_dedups(monkeypatch):
     events = _docs(db, "events")
     assert len(events) == 1
     event_id = events[0]["event_id"]
-    assert events[0]["name"] == "2025秋展示会"  # 詳細レコードの名が優先
+    assert events[0]["name"] == "2025秋展示会"
 
-    # 参加ファクトが実在イベントへ JOIN 可能（event_id 一致）
+    # 参加ファクトが実在イベントへ JOIN 可能
     atts = _docs(db, "event_attendances")
     assert len(atts) == 1  # 同一 (person,event,action) は冪等
     assert atts[0]["event_id"] == event_id
     assert atts[0]["person_id"] in touched
 
-    # contents→event リンクが解決（空でない・同一イベント）
+    # contents→event リンクが解決
     contents = _docs(db, "contents")
     assert len(contents) == 1
     assert contents[0]["linked_event_id"] == event_id
@@ -200,34 +213,23 @@ def test_pipeline_converges_links_and_dedups(monkeypatch):
 
 
 def test_solo_event_fallback_binds_linkless_persons(monkeypatch):
-    """参加者ファイルにイベント列が無くても、バッチに単一イベントがあれば紐付く。
-
-    実データの不具合再現: leads.csv にイベント列が無く hint/event も無いと参加が 0 件に
-    なっていた。バッチが単一イベントのみのときはそのイベントへフォールバックする。
-    """
+    """参加者ファイルにイベント列が無くても、バッチに単一イベントがあれば紐付く。"""
     async def _fake_build_appeal(kind, payload, space=None):
         return f"summary:{kind}", [0.1]
 
     monkeypatch.setattr(agent.semantic_search, "build_appeal", _fake_build_appeal)
 
     # 参加者ファイル（イベントリンク無し）
-    persons_map = ColumnMappingResult(
-        entity_type="persons",
-        column_map={"姓": "name_last", "名": "name_first", "会社名": "company_name", "メアド": "email"},
-        link_columns={"account": "会社名"},
+    persons_result = MapResult(
+        person_observations=[
+            PersonObservation(name="田中太郎", email="a@a.com", company_name="ACME"),
+            PersonObservation(name="鈴木花子", email="b@b.com", company_name="ベータ"),
+        ]
     )
-    persons_rows = [
-        {"姓": "田中", "名": "太郎", "会社名": "ACME", "メアド": "a@a.com"},
-        {"姓": "鈴木", "名": "花子", "会社名": "ベータ", "メアド": "b@b.com"},
-    ]
-    persons_result = _mapper.map_rows(persons_map, persons_rows, space_id="s1")
-    # この観測群にはイベントリンクが無いことを確認
     assert all(o.event_link_name == "" for o in persons_result.person_observations)
 
     # イベント概要ファイル（同一バッチに 1 イベント）
-    events_map = ColumnMappingResult(entity_type="events", column_map={"名称": "name"})
-    events_result = _mapper.map_rows(
-        events_map, [{"名称": "スマート工場EXPO 2025秋"}], space_id="s1")
+    events_result = MapResult(records=[_event_record("スマート工場EXPO 2025秋")])
 
     db = _FakeDB()
     _run(db, [_interp(persons_result), _interp(events_result)])
@@ -248,10 +250,11 @@ def test_no_event_in_batch_creates_no_attendance(monkeypatch):
 
     monkeypatch.setattr(agent.semantic_search, "build_appeal", _fake_build_appeal)
 
-    persons_map = ColumnMappingResult(
-        entity_type="persons", column_map={"氏名": "name", "メアド": "email"})
-    persons_result = _mapper.map_rows(
-        persons_map, [{"氏名": "田中太郎", "メアド": "a@a.com"}], space_id="s1")
+    persons_result = MapResult(
+        person_observations=[
+            PersonObservation(name="田中太郎", email="a@a.com"),
+        ]
+    )
 
     db = _FakeDB()
     _run(db, [_interp(persons_result)])

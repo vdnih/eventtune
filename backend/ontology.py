@@ -48,12 +48,6 @@ class UsagePeriod(BaseModel):
 
 # ── 共通 Enum ────────────────────────────────────────────────────────────────
 
-class EngagementLevel(str, Enum):
-    APPOINTMENT_BOOKED = "アポ獲得済み"
-    HIGH_INTENT        = "アポなし・感度高"
-    NURTURING          = "通常リード"
-
-
 class ContactStage(str, Enum):
     LEAD     = "LEAD"
     MQL      = "MQL"
@@ -86,11 +80,8 @@ class Person(BaseModel):
     department: str = ""
     job_title: str = ""
     stage: ContactStage = ContactStage.LEAD
-    engagement_level: Optional[EngagementLevel] = None
-    # 接客事実（課題感・メモ）は EventAttendance へ移譲（ADR-011）。本人の関心・文脈は
-    # appeal_summary に全 attendance を集約してロールアップ生成する。
-    # extracted_challenge は後方互換のため残置するが、取り込みでは populate しない。
-    extracted_challenge: str = ""
+    # 接客事実（課題感・メモ）は EventAttendance へ移譲（ADR-011）。
+    # 本人の関心・文脈は appeal_summary に全 attendance を集約してロールアップ生成する。
     appeal_summary: str = ""
     appeal_vector: List[float] = []
     source_job_id: Optional[str] = None
@@ -349,6 +340,16 @@ class ColumnMappingResult(BaseModel):
     default_links: dict[str, str] = {}
 
 
+class DocumentPlan(BaseModel):
+    """AI Extract Step1 の出力。1ファイルの業務的理解結果。integration_jobs に保存する。"""
+    business_context: str = ""     # "2025秋展示会の参加者接客記録"
+    entity_type: str = ""          # "persons" | "events" | "products" | ...
+    source_file_role: str = ""     # "participant_list" | "event_master" | "costs" | ...
+    link_hints: dict[str, str] = {}  # {"event": "2025秋展示会"}
+    column_map: dict[str, str] = {}  # {"氏名": "name", "社名": "account_name", ...}
+    unmapped_notes: str = ""
+
+
 class DocumentExtractionResult(BaseModel):
     detected_entity_types: List[str]
     events: List[dict] = []
@@ -380,7 +381,6 @@ class SkippedRecord(BaseModel):
 
 class TransformationSummary(BaseModel):
     entity_counts: dict[str, int] = {}
-    engagement_breakdown: dict[str, int] = {}
     product_breakdown: dict[str, int] = {}
     skipped_count: int = 0
 
@@ -396,7 +396,7 @@ class IntegrationJob(BaseModel):
     created_entities: dict[str, int] = {}
     # このジョブで解決・生成したリンク先マスタの要約 [{kind, name, id}]。
     resolved_links: List[dict] = []
-    column_mapping: Optional[ColumnMappingResult] = None
+    column_mapping: Optional[DocumentPlan] = None
     raw_extraction: Optional[dict] = None
     transformations: List[EntityTransformation] = []
     skipped_records: List[SkippedRecord] = []
