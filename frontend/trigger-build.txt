@@ -1,0 +1,1 @@
+Trigger App Hosting build to initialize deployment
