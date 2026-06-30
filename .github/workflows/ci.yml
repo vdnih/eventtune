@@ -38,6 +38,8 @@ jobs:
   frontend-build:
     name: Frontend Build (Next.js)
     runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_API_URL: https://dummy-api.local
     steps:
       - uses: actions/checkout@v4
 
