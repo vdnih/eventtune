@@ -15,6 +15,9 @@ jobs:
   backend-test:
     name: Backend Test (Python)
     runs-on: ubuntu-latest
+    env:
+      GOOGLE_CLOUD_PROJECT: marketing-mail-generator
+      FIREBASE_PROJECT_ID: marketing-mail-generator
     steps:
       - uses: actions/checkout@v4
 
