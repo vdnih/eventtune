@@ -484,3 +484,39 @@ PR#11/#12（ADR-008 OSI 移行 ＋ ADR-009 Code Interpreter）は、データモ
 - **IaC は「全部 Terraform」ではなく責務で割る**。ルールやフロントは各プロダクト純正の配信に任せた方が単純で壊れにくい。
 - **プロバイダにリソースがあっても、それが自分の使い方をモデル化しているとは限らない**（Agent Engine の `package_spec` 問題）。スキーマ不一致は import 前に気づき、変数注入などの逃げ道に切り替える。
 - **既存手作業環境は greenfield で作り直すより import で正典化**する方が、稼働中の Auth/API キー/データを失わずに済む。
+
+---
+
+## ADR-013: 取り込みパイプライン再設計 — AI が直接抽出・業務判定を排除
+
+**ステータス**: 採用
+
+**背景**:
+ADR-011 で設計した取り込みパイプラインには以下の問題があった:
+- AI 思考フェーズ（SchemaMapper）が浅い: ヘッダー+5行サンプルのみで業務文脈を把握できない
+- `EngagementLevel`（アポ獲得済み/感度高/通常リード）を取り込み時に自動分類していた
+- 「決定論 Python」という概念が実装の役割を曖昧にし、複雑さを生んでいた
+
+**決定**:
+1. **取り込み時の業務的判定を廃止**。`EngagementLevel` 分類（`_classify_engagement`）を削除。
+   感度・興味度の「観測事実」（「感度A」等のテキスト）は `event_attendances.challenge_note` にそのまま保存し、ベクトル検索に乗せる。
+2. **AI Extract を2段構えに再設計**:
+   - **Step 1（バッチ横断1回、フルモデル）**: `understand_batch()` — バッチ内全ファイルのヘッダー+サンプル+オントロジー定義を渡し、各ファイルの `DocumentPlan`（業務文脈・エンティティ種別・カラムマッピング・リンクヒント）を生成する
+   - **Step 3（CSVのみ、行単位並列、軽量モデル）**: `_extract_rows_parallel()` — DocumentPlan を文脈として各行を `asyncio.gather` で並列抽出する
+3. **役割分担の明確化**:
+   - **AI**: ファイルの業務文脈を読み解き、観測事実を構造化データとして返す（コード生成しない）
+   - **Python**: Firestore 読み書き・UUID 採番・find-or-create（業務判定はしない）
+4. **`OntologyMapper` の CSV パス（`map_rows`）を廃止**。TXT パス（`map_extraction`）のみ残す。
+
+**理由**:
+- `appeal_vector` によるコサイン類似度で動的判断できるため、取り込み時の感度分類が不要になった
+- 「感度A」等の観測事実は `challenge_note` → `appeal_summary` → `appeal_vector` の経路でベクトル検索に活きる
+- 全行一括送信はトークン消費が大きく非効率。行単位並列なら1行=数十トークンで軽量モデルが使える
+- バッチ横断理解（Step1）により、参加者 CSV と同バッチのイベント概要 TXT を横断して「このCSVはこのイベントの参加者」と正しく判断できる
+
+**結果**:
+- `EngagementLevel` 型・`Person.engagement_level` フィールドを削除
+- `DocumentPlan` モデルを追加（`ontology.py`）
+- `IntegrationJob.column_mapping` を `DocumentPlan | None` に更新
+- `OntologyMapper._classify_engagement` / `map_rows` / `_decompose_person` を削除
+- `process_batch` が `understand_batch()` を最初に1回呼び、各ファイルの `DocumentPlan` を取得してから並列処理する

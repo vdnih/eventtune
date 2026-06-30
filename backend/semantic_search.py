@@ -22,13 +22,13 @@ from typing import Any, Optional
 from google import genai
 from google.genai import types
 
+from config import get_settings
 from metering import record_llm_response
 from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
 _MODEL_EMBED = "gemini-embedding-001"
-_MODEL_SUMMARY = "gemini-3.1-flash-lite"
 # MRL 切り詰め次元。cosine は内部でノルム除算するため未正規化でも一致計算は正しい。
 _EMBED_DIM = 768
 
@@ -184,12 +184,13 @@ async def generate_appeal_summary(
         return ""
     prompt = f"{instruction}\n\n【情報】\n{body}\n\n【要約】"
     try:
+        _model = get_settings().model_ingestion
         response = await _get_client().aio.models.generate_content(
-            model=_MODEL_SUMMARY,
+            model=_model,
             contents=prompt,
         )
         if space is not None:
-            record_llm_response(space, _MODEL_SUMMARY, response)
+            record_llm_response(space, _model, response)
         return (response.text or "").strip()
     except Exception:
         logger.exception("generate_appeal_summary failed (kind=%s)", kind)

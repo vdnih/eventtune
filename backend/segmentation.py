@@ -25,6 +25,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 
+from config import get_settings
 from metering import record_llm_response
 from ontology import Segment, SegmentAssignment, SegmentSnapshot
 from semantic_search import embed_text_sync, find_similar
@@ -32,7 +33,6 @@ from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini-3.1-flash-lite"
 _BATCH_SIZE = 20
 
 
@@ -210,16 +210,17 @@ reason は判定根拠を20〜40字で簡潔に。
 【Person】
 {slim}
 """
+    _model = get_settings().model_agent
     client = genai.Client()
     response = client.models.generate_content(
-        model=_MODEL,
+        model=_model,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=_BatchResult,
         ),
     )
-    record_llm_response(space, _MODEL, response)
+    record_llm_response(space, _model, response)
     result = _BatchResult.model_validate_json(response.text)
 
     out: dict[str, tuple[str, str, dict[str, str]]] = {}

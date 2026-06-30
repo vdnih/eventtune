@@ -51,8 +51,6 @@ from space_data import load_space_data
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "gemini-3.1-flash-lite"
-
 
 def _normalize_buckets(buckets: Any) -> list[str] | dict:
     """define_segment の buckets 引数を「非空文字列のリスト」に正規化する。
@@ -665,7 +663,7 @@ def build_agent(db: Any, space: SpaceContext) -> Agent:
     """
     return Agent(
         name="marketing_agent",
-        model=_MODEL,
+        model=get_settings().model_agent,
         description="イベントマーケティングAIエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
         instruction=_SYSTEM_PROMPT,
         tools=make_tools(db, space),
@@ -823,7 +821,7 @@ async def chat_stream(
         yield {"type": "error", "message": str(e)}
     finally:
         # メータリング: LLMトークンとコンピュート実行時間を記録
-        record_llm(space, _MODEL, usage_totals["input"], usage_totals["output"])
+        record_llm(space, get_settings().model_agent, usage_totals["input"], usage_totals["output"])
         record_compute(space, int((time.monotonic() - start) * 1000))
 
 
@@ -896,9 +894,10 @@ def _generate_one_pattern(
   資産に無い機能・誇張・本来と異なる用途を創作しない（解決策はマスターに帰結させる）。
 - ブランド資産の維持: トーン＆マナー・用語・言い回しはセグメント横断で一貫させる。
 """
+    _model = get_settings().model_content
     client = genai.Client()
     response = client.models.generate_content(
-        model=_MODEL,
+        model=_model,
         contents=f"セグメント「{bucket}」向けのメールパターンを作成してください。",
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -906,7 +905,7 @@ def _generate_one_pattern(
             response_schema=_PatternSchema,
         ),
     )
-    record_llm_response(space, _MODEL, response)
+    record_llm_response(space, _model, response)
     pattern = _PatternSchema.model_validate_json(response.text)
     return DeliverablePattern(
         pattern_id=f"{bucket}__{output_format}",
