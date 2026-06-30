@@ -446,3 +446,41 @@ PR#11/#12（ADR-008 OSI 移行 ＋ ADR-009 Code Interpreter）は、データモ
 **横展開できる学び**:
 - **症状（FKが入らない）の修正前に、参照の向きと生成・発見の向きを分けて捉える**。マスタが観測から導出される（inferred dimension）ドメインでは、FK の向きと取り込みの順序は逆になり得る。
 - **「順序非依存に見せる」設計（安定ID＋stub）は、自然キーの正規化が完全でない限り破綻する**。小規模なら素直に依存順で多段処理し、実在への検索で解決する方が堅い。
+
+---
+
+## ADR-012: デプロイの IaC 化 — GCP は Terraform、Firebase は CLI / App Hosting に責務分割
+
+**ステータス**: 採用
+
+**背景**:
+これまでインフラは完全に手作業で構成されていた（`.tf` なし・CI/CD なし・`provision_agent_engine.py` のみ）。既存の `marketing-mail-generator` 1プロジェクトには Firestore `(default)`・Auth(Google Sign-In)・Web アプリ・Agent Engine が手作業で既に存在する。これを本番として実デプロイするにあたり、再現性とドリフト検知のため GCP 側を IaC 化したい。一方 Firebase 側に独自の構成管理ツールを足すのは過剰になりうる。
+
+**決定**:
+1. **環境は既存1プロジェクトを Terraform に import して正典化**（dev/prod 分割はしない。`var.project_id` で将来拡張可能な構造のみ用意）。`infra/terraform/` に配置、state は GCS リモート。
+2. **責務を手段で分ける**:
+   - **Terraform** = GCP インフラの「箱」（API 有効化・Artifact Registry・Cloud Run・SA/IAM・Firestore DB 本体・Storage バケット+ライフサイクル・Firebase プロジェクト/Web アプリ・App Hosting backend・GitHub Actions 用 WIF）。
+   - **Firebase CLI**（`firebase deploy`）= アプリ成果物の Firestore **ルール/インデックス**・Storage **ルール**。
+   - **App Hosting**（git push 自動）= フロント（Next.js SSR）のビルド&デプロイ。
+   - **GitHub Actions**（WIF キーレス）= バックエンド（Cloud Run）のビルド&デプロイ。
+3. **フロント配信は Firebase App Hosting に統一**。旧 `firebase.json` の Web Frameworks 設定（`hosting.source` + `frameworksBackend`）は撤去し、`frontend/apphosting.yaml` で構成する。
+4. **Agent Engine は Terraform 管理しない**。`google_vertex_ai_reasoning_engine` は `spec.package_spec`（デプロイ済み ADK コードの GCS 成果物）を前提とするリソースで、当プロジェクトの「コードレスのマネージドランタイム（サンドボックス＋セッションストア）」という使い方と一致せず、import すると恒常的な差分になる。よって作成は従来どおり `provision_agent_engine.py` に委ね、出力（resource name / id）を Terraform 変数として Cloud Run の env に注入する。
+5. **Auth は Firebase 管理のまま**。Google Sign-In の OAuth クライアントは Firebase が自動管理しており、Identity Platform リソースとして Terraform 管理すると client secret の二重管理や競合が生じる。利点に対しコストが高いため対象外（将来 Identity Platform へ寄せる場合の雛形は `auth.tf` にコメントで残す）。
+6. **Secret Manager は使わず Cloud Run の平文 env**。`config.py` が読む値（プロジェクト ID・ロケーション・Agent Engine ID・配信オリジン）はいずれも秘匿情報ではない。`docs/INFRA_ARCHITECTURE.md` の旧「Secret Manager 管理環境変数」表からは意図的に簡素化する。SA には `secretmanager.secretAccessor` を残し、将来の真の秘密が出た時点で `secrets.tf` の雛形を有効化する。
+
+**理由**:
+- 「インフラの箱は宣言的に、アプリのルール/コードは各プロダクト純正の配信経路で」分けると、二重管理と過剰抽象を避けつつ手作業を最小化できる。
+- ブラウンフィールド import（宣言的 `import {}` ブロック）なら既存稼働を壊さず正典化でき、`terraform plan` の no-op を以後のドリフト検知に使える。
+- App Hosting・GitHub Actions(WIF) はいずれも push 起点で人手を介さず、鍵管理も不要（キーレス）。
+- プロバイダのリソースが当プロジェクトの使い方と合わない箇所（Agent Engine・Auth）は、無理に IaC 化せず最小の手作業＋スクリプトに留める方が堅い。
+
+**結果 / 将来課題**:
+- 一度きりの手作業として残るのは: ① tfstate バケット作成、② App Hosting の GitHub OAuth 連携（Developer Connect）、③ Blaze 課金紐付け、④（未初期化時の）Auth 有効化。それ以外は `terraform apply` で自動化。
+- App Hosting backend は GitHub 連携（`app_hosting_repository`）が空の間 `count=0` で apply をブロックしない。連携後に値を入れて再 apply。
+- dev/staging 環境が必要になったら別プロジェクト＋`var.project_id` で複製する（現状は単一環境）。
+- 検証は `terraform plan` の no-op、`/health` 200、App Hosting 自動ビルド、`firebase deploy --only firestore,storage`、アプリ E2E（スペース作成→取り込み→チャット）で行う。
+
+**横展開できる学び**:
+- **IaC は「全部 Terraform」ではなく責務で割る**。ルールやフロントは各プロダクト純正の配信に任せた方が単純で壊れにくい。
+- **プロバイダにリソースがあっても、それが自分の使い方をモデル化しているとは限らない**（Agent Engine の `package_spec` 問題）。スキーマ不一致は import 前に気づき、変数注入などの逃げ道に切り替える。
+- **既存手作業環境は greenfield で作り直すより import で正典化**する方が、稼働中の Auth/API キー/データを失わずに済む。

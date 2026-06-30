@@ -22,6 +22,15 @@ build/
 # Firebase
 .firebase/
 
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+.terraform.lock.hcl
+
 # IDE
 .vscode/
 .idea/

@@ -1,0 +1,50 @@
+# Firebase App Hosting 構成（Next.js 15 SSR）。
+# git push（live branch）で自動ビルド&デプロイされる。
+# NEXT_PUBLIC_* は公開値なので平文で可（Firebase のセキュリティはルール/Auth が担保）。
+
+runConfig:
+  minInstances: 0
+  maxInstances: 2
+  cpu: 1
+  memoryMiB: 512
+  concurrency: 80
+
+env:
+  # SSR の rewrite（next.config.ts の /api/v1/* → これ）先。Cloud Run mmg-api の確定 URL。
+  # ビルド時にバンドルへ焼き込まれるため BUILD でも参照可能にする。
+  - variable: NEXT_PUBLIC_API_URL
+    value: https://mmg-api-974233950009.asia-northeast1.run.app
+    availability:
+      - BUILD
+      - RUNTIME
+
+  - variable: NEXT_PUBLIC_FIREBASE_API_KEY
+    value: AIzaSyAyvwqPprZZick_OsyxnTfsStWAMb_rhhw
+    availability:
+      - BUILD
+      - RUNTIME
+  - variable: NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
+    value: marketing-mail-generator.firebaseapp.com
+    availability:
+      - BUILD
+      - RUNTIME
+  - variable: NEXT_PUBLIC_FIREBASE_PROJECT_ID
+    value: marketing-mail-generator
+    availability:
+      - BUILD
+      - RUNTIME
+  - variable: NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET
+    value: marketing-mail-generator.firebasestorage.app
+    availability:
+      - BUILD
+      - RUNTIME
+  - variable: NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID
+    value: "974233950009"
+    availability:
+      - BUILD
+      - RUNTIME
+  - variable: NEXT_PUBLIC_FIREBASE_APP_ID
+    value: 1:974233950009:web:75bbffb7465a269bf8bae8
+    availability:
+      - BUILD
+      - RUNTIME
