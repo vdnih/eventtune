@@ -7,6 +7,7 @@ import { useThreads } from "@/hooks/useThreads";
 import { getThreadMessages } from "@/lib/threads";
 import { ThreadSidebar } from "@/components/features/agent/ThreadSidebar";
 import { DeliverableCard } from "@/components/features/agent/DeliverableCard";
+import { MessageMarkdown } from "@/components/features/agent/MessageMarkdown";
 import { Loader2, Send, Upload, Wrench, X, Check, FileText } from "lucide-react";
 
 // ── 型定義 ──────────────────────────────────────────────────────────────────
@@ -104,20 +105,6 @@ async function readFileMeta(file: File): Promise<FileMeta> {
     }
   }
   return { name: file.name, size: file.size, type: file.type, lastModified: file.lastModified, preview };
-}
-
-function renderMarkdown(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`(.+?)`/g, "<code class=\"bg-gray-100 px-1 rounded text-xs font-mono\">$1</code>")
-    .replace(/^### (.+)$/gm, "<h3 class=\"font-semibold text-sm mt-2\">$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2 class=\"font-semibold text-base mt-3\">$1</h2>")
-    .replace(/^# (.+)$/gm, "<h1 class=\"font-bold text-base mt-3\">$1</h1>")
-    .replace(/^[-•] (.+)$/gm, "<li class=\"ml-4 list-disc\">$1</li>")
-    .replace(/\n/g, "<br/>");
 }
 
 function extractRunId(text: string): string | null {
@@ -805,10 +792,9 @@ export default function DashboardPage() {
 
               {msg.loading && !msg.content && <Loader2 className="w-4 h-4 animate-spin text-gray-400" />}
               {msg.content && (
-                <div
-                  className={msg.role === "assistant" ? "mt-1" : ""}
-                  dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-                />
+                <div className={msg.role === "assistant" ? "mt-1" : ""}>
+                  <MessageMarkdown content={msg.content} />
+                </div>
               )}
               {msg.loading && msg.content && (
                 <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-gray-400 animate-pulse rounded-sm align-middle" />
