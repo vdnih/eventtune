@@ -22,3 +22,9 @@ resource "google_storage_bucket" "default" {
     ignore_changes = [cors, labels]
   }
 }
+
+resource "google_firebase_storage_bucket" "default" {
+  provider  = google-beta
+  project   = var.project_id
+  bucket_id = google_storage_bucket.default.id
+}

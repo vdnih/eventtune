@@ -39,6 +39,9 @@ locals {
     "roles/cloudbuild.builds.editor",  # gcloud builds submit
     "roles/firebaserules.admin",       # firestore/storage ルール配信
     "roles/datastore.indexAdmin",      # firestore インデックス配信
+    "roles/serviceusage.serviceUsageViewer", # API 有効化状況の取得 (Firebaseデプロイ用)
+    "roles/firebasestorage.admin",     # Firebase Storage 管理権限 (デフォルトバケット取得用)
+    "roles/firebase.admin",            # Firebase 管理者権限 (プロジェクトメタデータ参照用)
   ]
 }
 
