@@ -194,8 +194,8 @@ class OntologyMapper:
             "開催中": EventStatus.ACTIVE,
             "終了": EventStatus.COMPLETED,
         }
-        raw_type = raw.get("event_type", "")
-        raw_status = raw.get("status", "")
+        raw_type = raw.get("event_type") or ""
+        raw_status = raw.get("status") or ""
         event_type = event_type_map.get(raw_type, EventType.TRADE_SHOW)
         status = status_map.get(raw_status, EventStatus.COMPLETED)
 

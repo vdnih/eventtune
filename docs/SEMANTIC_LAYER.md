@@ -72,8 +72,9 @@ YAML は次の 5 つだけで構成する（物理テーブル定義は持たな
 ```
 
 - **5 マスタ**: `persons` / `accounts` / `events` / `products` / `contents`
-- **ファクト**: `event_attendances`（person×event）, `product_interests`（person×product）ほか。
-  用途ごとに分割し、**今後さらに増える前提**でスキーマを拡張可能に保つ。
+- **ファクト**: `event_attendances`（person×event）, `product_interests`（person×product）,
+  `cost_items`（event の費用明細）ほか。用途ごとに分割し、**今後さらに増える前提**で
+  スキーマを拡張可能に保つ。
 - **意味的近接**: `persons` / `events` / `contents` / `products` は `appeal_summary`（監査可能な
   要約テキスト）と `appeal_vector`（その埋め込み）を持ち、コサイン類似度で結びつく（§3.5）。
 
@@ -138,6 +139,7 @@ YAML はランタイムではロードしない（PyYAML 依存なし）。
 | `contents` | マスタ | `contents` | マーケ素材（WP / 事例 / ウェビナーアーカイブ / 募集中セミナー）。**appeal_summary / appeal_vector を持つ** |
 | `event_attendances` | ファクト | `event_attendances` | 申し込み・参加（person×event） |
 | `product_interests` | ファクト | `product_interests` | 製品への興味・商談（person×product） |
+| `cost_items` | ファクト | `cost_items` | イベント費用明細（1行=1費用、event×費用カテゴリ） |
 | `segments` | 運用 | `segments` | **動的セグメント**（フィルタ定義: 軸・バケット・criteria） |
 | `segment_snapshots` | 運用 | `segments/{sid}/snapshots` | **静的スナップショット**（施策時点で凍結したメンバーの版。複数保持） |
 | `segment_assignments` | 運用 | `…/snapshots/{snap}/assignments` | スナップショット配下のメンバー（person→bucket→reason, reason 必須） |
@@ -169,10 +171,12 @@ YAML はランタイムではロードしない（PyYAML 依存なし）。
 > `product_interests`（興味製品）。課題・関心は `persons.appeal_summary` / `appeal_vector` が担う。
 > フラットな 1 実体を、マスタ＋ファクトの星座へ正規化した。
 
-> **KPI / NPS / 費用の扱い**: 旧 `EventKPI` / `SurveyResponse` / `CostItem`（集計）は
+> **KPI / NPS / 費用の扱い**: 旧 `EventKPI` / `SurveyResponse` / `CostItem`（集計）は当初
 > 独立 dataset にせず、`events` の **metrics**（`total_visitors` / `nps_score` / `total_cost` /
-> `cost_per_acquisition` 等）として畳み込んだ。費用明細やアンケート自由記述が必要になった時点で
-> `event_costs` / `survey_verbatims` を fact dataset として追加する。
+> `cost_per_acquisition` 等）として畳み込んでいた。費用明細は需要が出たため
+> `cost_items` fact dataset として実装済み（`total_cost` / `cost_per_acquisition` は
+> `cost_items` の集計を参照する）。アンケート自由記述は `survey_verbatims` として
+> 引き続き将来課題。
 
 ---
 
@@ -190,8 +194,8 @@ spaces/{space_id}/
   contents/{content_id}             ← appeal_summary / appeal_vector を保持
   event_attendances/{attendance_id}
   product_interests/{interest_id}
+  cost_items/{cost_id}               ← 費用明細（CostItem, event_id で events に紐づく）
   events/{event_id}                 ← appeal_summary / appeal_vector を保持
-    events/{event_id}/costs/{cost_id}                           ← 費用明細（CostItem）
     events/{event_id}/reports/{report_id}                       ← save_report の出力
   segments/{segment_id}                                          ← 動的定義
     segments/{segment_id}/snapshots/{snapshot_id}               ← 静的版（凍結メンバー）

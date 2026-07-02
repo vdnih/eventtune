@@ -11,6 +11,7 @@ import { formatDetail, isComplex, pickEntityId } from "@/components/ui/format";
 interface Collection {
   key: string;
   label: string;
+  group: string;
 }
 
 interface LineageNode {
@@ -94,30 +95,36 @@ export default function ExplorerPage() {
     <div className="h-full flex overflow-hidden">
       {/* Left: collection nav */}
       <aside className="w-52 shrink-0 border-r border-gray-200 bg-white overflow-y-auto">
-        <div className="px-3 pt-4 pb-2 text-xs font-semibold text-gray-400 uppercase tracking-wide">
-          コレクション
-        </div>
         {loadingCols ? (
           <div className="flex justify-center py-8">
             <Loader2 className="w-5 h-5 animate-spin text-gray-300" />
           </div>
         ) : (
-          <ul>
-            {collections.map((col) => (
-              <li key={col.key}>
-                <button
-                  onClick={() => setActiveKey(col.key)}
-                  className={`w-full flex items-center justify-between px-3 py-2 text-sm transition ${
-                    activeKey === col.key
-                      ? "bg-brand-50 text-brand-700 font-medium"
-                      : "text-gray-700 hover:bg-gray-50"
-                  }`}
-                >
-                  <span className="truncate">{col.label}</span>
-                </button>
-              </li>
+          <>
+            {Array.from(new Map(collections.map((c) => [c.group, true])).keys()).map((group) => (
+              <div key={group}>
+                <div className="px-3 pt-3 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-wide">
+                  {group}
+                </div>
+                <ul>
+                  {collections.filter((c) => c.group === group).map((col) => (
+                    <li key={col.key}>
+                      <button
+                        onClick={() => setActiveKey(col.key)}
+                        className={`w-full flex items-center px-3 py-1.5 text-sm transition ${
+                          activeKey === col.key
+                            ? "bg-brand-50 text-brand-700 font-medium"
+                            : "text-gray-700 hover:bg-gray-50"
+                        }`}
+                      >
+                        <span className="truncate">{col.label}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             ))}
-          </ul>
+          </>
         )}
       </aside>
 

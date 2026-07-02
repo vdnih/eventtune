@@ -15,7 +15,7 @@ AIが最適化する）という設計思想に基づく（[docs/MARKETING_PHILO
 2. CSV / Excel やイベント概要・KPI・アンケートのテキストを**複数まとめてアップロード**
 3. **DataIntegrationAgent** が列名・表記ゆれを吸収し、来歴（source_job_id）付きで OSI
    オントロジー（マスタ `Person` / `Account` / `Product` / `Content` / `Event` ＋ ファクト
-   `EventAttendance` / `ProductInterest`。各マスタは appeal_summary / appeal_vector を持つ）へ統合
+   `EventAttendance` / `ProductInterest` / `CostItem`。各マスタは appeal_summary / appeal_vector を持つ）へ統合
 4. チャットで **MarketingAgent** に指示（例: 「このイベントの参加者にお礼メールを」）
 5. **セグメント方式 + HIL** で個別対応 — AIが軸を設計 → 人が承認 → 分類 → バケット別パターン生成 →
    各メールは決定論的に組み立て（高速・低コスト）。各ブロックの `reason_for_inclusion`（AIの判断根拠）を確認・CSV出力

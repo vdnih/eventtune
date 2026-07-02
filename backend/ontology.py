@@ -130,6 +130,38 @@ class ProductInterest(BaseModel):
     created_at: str = ""
 
 
+class CostCategory(str, Enum):
+    VENUE        = "会場費・出展費"
+    BOOTH_DESIGN = "ブース装飾・設営"
+    MARKETING    = "集客"
+    SPEAKER      = "登壇者"
+    STAFFING     = "人件費・派遣"
+    TRAVEL       = "交通・宿泊"
+    PRINTING     = "印刷・販促物・ノベルティ"
+    OPERATIONS   = "運営"
+    CATERING     = "飲食・接待"
+    OTHER        = "その他"
+
+
+class CostItem(BaseModel):
+    """費用ファクト（Event に紐づく費用明細）。展示会・セミナー共通。"""
+    cost_id: str
+    space_id: str
+    event_id: str
+    category: CostCategory
+    description: str
+    amount_jpy: float
+    vendor_name: Optional[str] = None
+    invoice_date: Optional[str] = None
+    source_job_id: Optional[str] = None
+    created_at: str = ""
+
+
+class CostSummary(BaseModel):
+    total_jpy: float
+    by_category: dict[str, float]
+
+
 # ── Event ─────────────────────────────────────────────────────────────────────
 
 class EventType(str, Enum):
@@ -181,34 +213,6 @@ class Event(BaseModel):
     # Semantic layer
     appeal_summary: str = ""
     appeal_vector: List[float] = []
-
-
-# ── CostItem ──────────────────────────────────────────────────────────────────
-
-class CostCategory(str, Enum):
-    BOOTH_RENTAL = "ブース出展料"
-    BOOTH_DESIGN = "ブース装飾・設営"
-    EQUIPMENT    = "機材・備品"
-    STAFFING     = "人件費・派遣"
-    TRAVEL       = "交通・宿泊"
-    PRINTING     = "印刷・販促物"
-    CATERING     = "飲食・接待"
-    OTHER        = "その他"
-
-
-class CostItem(BaseModel):
-    cost_id: str
-    event_id: str
-    category: CostCategory
-    description: str
-    amount_jpy: float
-    vendor_name: Optional[str] = None
-    invoice_date: Optional[str] = None
-
-
-class CostSummary(BaseModel):
-    total_jpy: float
-    by_category: dict[str, float]
 
 
 # ── Content（旧 ContentAsset を改名・拡張）───────────────────────────────────
