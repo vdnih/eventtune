@@ -45,18 +45,19 @@ def _list_deliverables(space: SpaceContext) -> Iterator[dict]:
                 yield data
 
 
-# key -> (label, lister)
-VIEWS: dict[str, tuple[str, Callable[[SpaceContext], Iterator[dict]]]] = {
-    "events":             ("イベント",            _list_collection("events")),
-    "persons":            ("ハウスリスト",        _list_collection("persons")),
-    "accounts":           ("企業マスター",         _list_collection("accounts")),
-    "products":           ("製品マスター",         _list_collection("products")),
-    "event_attendances":  ("イベント参加",         _list_collection("event_attendances")),
-    "product_interests":  ("製品関心",            _list_collection("product_interests")),
-    "contents":           ("コンテンツ",          _list_collection("contents")),
-    "segments":           ("セグメント",          _list_collection("segments")),
-    "marketing_runs":     ("生成ジョブ",          _list_collection("marketing_runs")),
-    "deliverables":       ("生成成果物",          _list_deliverables),
+# key -> (label, group, lister)
+VIEWS: dict[str, tuple[str, str, Callable[[SpaceContext], Iterator[dict]]]] = {
+    "events":             ("イベント",      "マスタ",   _list_collection("events")),
+    "persons":            ("ハウスリスト",  "マスタ",   _list_collection("persons")),
+    "accounts":           ("企業",          "マスタ",   _list_collection("accounts")),
+    "products":           ("製品",          "マスタ",   _list_collection("products")),
+    "contents":           ("コンテンツ",    "マスタ",   _list_collection("contents")),
+    "event_attendances":  ("イベント参加",  "ファクト", _list_collection("event_attendances")),
+    "product_interests":  ("製品関心",      "ファクト", _list_collection("product_interests")),
+    "cost_items":         ("費用明細",      "ファクト", _list_collection("cost_items")),
+    "segments":           ("セグメント",    "分析",     _list_collection("segments")),
+    "marketing_runs":     ("生成ジョブ",    "生成",     _list_collection("marketing_runs")),
+    "deliverables":       ("生成成果物",    "生成",     _list_deliverables),
 }
 
 
@@ -65,7 +66,10 @@ VIEWS: dict[str, tuple[str, Callable[[SpaceContext], Iterator[dict]]]] = {
 @router.get("/collections")
 async def list_collections(space: SpaceContext = Depends(get_space_context)):
     """閲覧可能なデータビューの一覧（左メニュー用）を返す。"""
-    return {"collections": [{"key": key, "label": label} for key, (label, _) in VIEWS.items()]}
+    return {"collections": [
+        {"key": key, "label": label, "group": group}
+        for key, (label, group, _) in VIEWS.items()
+    ]}
 
 
 @router.get("/lineage/by-entity/{entity_id}")
@@ -101,6 +105,6 @@ async def list_view(
     entry = VIEWS.get(view_key)
     if entry is None:
         raise HTTPException(status_code=404, detail="Unknown data view")
-    _, lister = entry
+    _, _group, lister = entry
     rows: list[dict[str, Any]] = list(lister(space))
     return {"key": view_key, "rows": rows, "count": len(rows)}

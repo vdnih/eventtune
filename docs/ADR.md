@@ -261,6 +261,12 @@ Event は 5 マスタの 1 つにすぎず、唯一のルートではない。
     に切り出し、実装前のレビューゲートとする（マッピング方式: 自動検出＋チャットヒント）。
 - 任意で YAML と Pydantic のドリフト検出 pytest（dev-only で PyYAML を導入）を追加する。
 - 費用明細・アンケート自由記述など、当面 metrics に畳んだ要素は需要が出た時点で fact dataset 化する。
+- **[2026-07 追記] 費用明細を `cost_items` fact dataset へ昇格**: 判断6で `events` の
+  metrics に畳んでいた `CostItem`（集計）を、上記の予告どおり独立 fact
+  `cost_items`（トップレベル、`event_id` で `events` に紐づく）へ昇格した。
+  `events.total_cost` / `cost_per_acquisition` metrics はこの fact の集計を参照する形に
+  更新（正典 YAML・`SEMANTIC_LAYER.md`・`ontology.py`・`README.md` 反映済み）。
+  アンケート自由記述（`survey_verbatims`）は引き続き未着手。
 
 ---
 

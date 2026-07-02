@@ -126,16 +126,17 @@ datasets:
       - {name: nps_score,           type: avg,   sql: "{{ datasets.events.nps_score }}",                 description: "NPS（-100〜100）"}
       - name: total_cost
         type: sum
-        sql: "SUM(events/{event_id}/costs.amount_jpy)"
+        sql: "SUM(datasets.cost_items.amount_jpy) WHERE cost_items.event_id = events.event_id"
         description: "総費用（JPY）"
-        context: "AIへの指示: Event 本体に total_cost_jpy 列は無い。費用は events/{event_id}/costs サブコレクション（CostItem.amount_jpy）の合計から算出する。"
+        context: "AIへの指示: Event 本体に total_cost_jpy 列は無い。費用は cost_items fact dataset（event_id で本 event に紐づく行）の amount_jpy 合計から算出する。"
       - name: cost_per_acquisition
         type: ratio
         numerator: total_cost
         denominator: contacts_collected
         description: "名刺1件あたり費用（CPA, JPY）"
         context: "AIへの指示: 'CPA' や '費用対効果' を聞かれたらこれを使う。"
-    # 実装済み: 費用明細は events/{event_id}/costs（CostItem）に1行ごと保持する。
+    # 実装済み: 費用明細は cost_items（トップレベル fact dataset）に1行ごと保持する
+    # （旧 events/{event_id}/costs サブコレクションから移行済み）。定義は下記 cost_items 参照。
     # 将来: アンケート自由記述（survey_verbatims）が必要になれば独立 fact dataset を追加する。
 
   # --- 4. products（自社プロダクト・ソリューション）-----------------------------
@@ -244,6 +245,30 @@ datasets:
         sql: "{{ datasets.product_interests.person_id }}"
         description: "キャンセルを除外した、製品に興味を持つ有効な顧客数"
         filter: "interest_status != 'キャンセル'"
+
+  # --- 行動ログ C: イベント費用明細（event の費用行）---------------------------
+  # 旧 CostItem(集計) は当初 events の metrics へ畳んでいたが（ADR-008 判断6）、
+  # ADR-008「結果/将来課題」が予告したとおり需要が出たため独立 fact へ昇格した。
+  - name: cost_items
+    physical: {collection: cost_items, id: cost_id}
+    description: "イベントに紐づく費用明細の1行（展示会・セミナー共通）"
+    context: "AIへの指示: events.total_cost / cost_per_acquisition metrics の実体はこの fact の集計。カテゴリ別の内訳を聞かれたら category で group する。"
+    identifiers:
+      - {name: cost_id, type: primary}
+      - {name: event_id, type: foreign}      # → events
+    dimensions:
+      - name: category
+        type: categorical
+        description: "費用カテゴリ"
+        context: "'会場費・出展費' / 'ブース装飾・設営' / '集客' / '登壇者' / '人件費・派遣' / '交通・宿泊' / '印刷・販促物・ノベルティ' / '運営' / '飲食・接待' / 'その他' の値をとる。"
+      - {name: description, type: text,       description: "費用の内容（自由文）"}
+      - {name: vendor_name, type: categorical, description: "支払先・ベンダー名（任意）"}
+      - {name: invoice_date, type: time,      description: "請求日（ISO YYYY-MM-DD、任意）"}
+    metrics:
+      - name: total_jpy
+        type: sum
+        sql: "{{ datasets.cost_items.amount_jpy }}"
+        description: "費用合計（JPY）。event_id で絞れば1イベント分、絞らなければスペース全体。"
 
   # 注: 旧 person_challenges / product_challenges / content_challenges ブリッジは撤回した
   #     （ADR-008）。「person の関心 → 合う製品 / 素材 / イベント」のマルチホップ案内は、

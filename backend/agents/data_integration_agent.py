@@ -81,7 +81,7 @@ def _hint_block(hint: str | None) -> str:
 
 _ONTOLOGY_DEFINITION = """\
 【オントロジー定義（エンティティ間の関係・各フィールドの業務的意味）】
-OSI セマンティックレイヤー: 5マスタ（persons/accounts/events/products/contents）+ 2ファクト
+OSI セマンティックレイヤー: 5マスタ（persons/accounts/events/products/contents）+ 3ファクト
 
 persons（人物マスタ）: name / email / company_name / department / job_title
   ※ 感度・ステータス等の業務的判定は行わない。観測事実のみ格納。
@@ -93,6 +93,11 @@ event_attendances（接客ファクト / persons×events）:
   ※ challenge_note には「感度A」「関心高め」等のテキストもそのまま含める（分類しない）
 
 product_interests（製品関心ファクト / persons×products）
+
+cost_items（費用ファクト / events の費用明細。展示会・セミナー共通）:
+  category（会場費・出展費/ブース装飾・設営/集客/登壇者/人件費・派遣/交通・宿泊/印刷・販促物・ノベルティ/運営/飲食・接待/その他）
+  description / amount_jpy（数値のみ）/ vendor_name / invoice_date（YYYY-MM-DD）
+  ※ 必ず特定の event にリンクされる。link_hints に {"event": "イベント名"} を設定する。
 
 events（イベントマスタ）: name / event_type / event_date / venue / description 等
 accounts（企業マスタ）: account_name / industry_type / company_size
@@ -411,7 +416,7 @@ EventKPI:
   contacts_by_engagement: { appointment_booked, high_intent, nurturing }
 
 CostItem（複数可）:
-  category（ブース出展料/ブース装飾・設営/機材・備品/人件費・派遣/交通・宿泊/印刷・販促物/飲食・接待/その他）,
+  category（会場費・出展費/ブース装飾・設営/集客/登壇者/人件費・派遣/交通・宿泊/印刷・販促物・ノベルティ/運営/飲食・接待/その他）,
   description, amount_jpy（数値のみ）, vendor_name, invoice_date（YYYY-MM-DD）
 
 SurveyResponse:
@@ -459,6 +464,33 @@ async def run_document_extractor(
             [a.model_dump() for a in parsed.content_assets] if parsed.content_assets else None
         ),
     )
+
+
+def _extract_cost_rows_from_csv(rows: list[dict], plan: DocumentPlan) -> MapResult:
+    """費用CSVを column_map で決定論的に InterpretedRecord へ変換する（AI呼び出しなし）。
+
+    ADR-013: AI は構造を解釈（understand_batch）、Python は決定論的にマップ。
+    OntologyMapper._build_cost_item を再利用するため正規化ロジックの重複なし。
+    """
+    from agents.ontology_mapper import MapResult
+
+    result = MapResult()
+    col_map = plan.column_map
+    event_link = plan.link_hints.get("event", "")
+
+    for row in rows:
+        mapped: dict = {}
+        for csv_col, onto_field in col_map.items():
+            if csv_col in row:
+                mapped[onto_field] = row[csv_col]
+        rec, skip = _mapper._build_cost_item(mapped, event_name=event_link)
+        if rec is not None:
+            result.records.append(rec)
+            if rec.transform is not None:
+                result.transformations.append(rec.transform)
+        if skip is not None:
+            result.skipped.append(skip)
+    return result
 
 
 # ── ファイル種別判定・読み込み ────────────────────────────────────────────────
@@ -633,9 +665,14 @@ async def _interpret_file(
             _, rows = _read_tabular(filename, content)
             plan = document_plan or DocumentPlan()
             column_mapping = plan
-            logger.info("extract_rows_parallel: file=%s entity_type=%s link_hints=%s",
-                        filename, plan.entity_type, plan.link_hints)
-            result = await _extract_rows_parallel(filename, rows, plan, space=space, job_id=job_id)
+            if plan.entity_type == "cost_items":
+                logger.info("extract_cost_rows_from_csv: file=%s link_hints=%s",
+                            filename, plan.link_hints)
+                result = _extract_cost_rows_from_csv(rows, plan)
+            else:
+                logger.info("extract_rows_parallel: file=%s entity_type=%s link_hints=%s",
+                            filename, plan.entity_type, plan.link_hints)
+                result = await _extract_rows_parallel(filename, rows, plan, space=space, job_id=job_id)
         else:
             text = _read_text(content)
             extraction = await run_document_extractor(text, space=space, hint=hint)
@@ -878,11 +915,14 @@ async def _bind_facts(
                 continue
             cost_id = _new_id("cost_")
             try:
-                cost = CostItem(cost_id=cost_id, event_id=ev_id, **rec.payload)
+                cost = CostItem(
+                    cost_id=cost_id, space_id=space_id, event_id=ev_id,
+                    source_job_id=job_id, created_at=_now_iso(), **rec.payload,
+                )
             except Exception:
                 logger.exception("cost build failed: payload=%s", rec.payload)
                 continue
-            db.document(f"events/{ev_id}/costs/{cost_id}").set(cost.model_dump(), merge=True)
+            db.document(f"cost_items/{cost_id}").set(cost.model_dump(), merge=True)
 
     logger.info("bind done: touched_persons=%d solo_event_fallback=%d", len(touched), fallback_used)
     return touched

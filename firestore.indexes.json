@@ -1,5 +1,14 @@
 {
-  "indexes": [],
+  "indexes": [
+    {
+      "collectionGroup": "cost_items",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "event_id", "order": "ASCENDING"},
+        {"fieldPath": "cost_id", "order": "ASCENDING"}
+      ]
+    }
+  ],
   "fieldOverrides": [
     {
       "collectionGroup": "members",
