@@ -1,13 +1,24 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-import { ChevronDown, Settings, LogOut, Users, BarChart3, Plus, Check } from "lucide-react";
+import { ChevronDown, Settings, LogOut, Users, BarChart3, Plus, Check, HelpCircle, AlertTriangle } from "lucide-react";
 import { auth } from "@/lib/firebase";
 import { useAuth } from "@/hooks/useAuth";
 import { SpaceProvider, useSpace } from "@/lib/space-context";
+import { authFetch } from "@/lib/api";
+import { ConsentGate } from "@/components/ConsentGate";
+import { HACKATHON_NOTICE } from "@/lib/legal";
+
+function FullScreenSpinner() {
+  return (
+    <div className="min-h-screen flex items-center justify-center">
+      <div className="w-8 h-8 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
+    </div>
+  );
+}
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -18,18 +29,63 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   }, [state, router]);
 
   if (state !== "authed") {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="w-8 h-8 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
-      </div>
-    );
+    return <FullScreenSpinner />;
   }
 
   return (
-    <SpaceProvider>
-      <AppShell userEmail={user?.email ?? ""}>{children}</AppShell>
-    </SpaceProvider>
+    <ConsentBoundary>
+      <SpaceProvider>
+        <AppShell userEmail={user?.email ?? ""}>{children}</AppShell>
+      </SpaceProvider>
+    </ConsentBoundary>
   );
+}
+
+// 認証後・アプリ本体表示前に利用規約への同意を確認するゲート。
+// 同意（またはバージョン一致）が確認できるまでスペース取得やオンボーディングへ進めない。
+function ConsentBoundary({ children }: { children: React.ReactNode }) {
+  const [status, setStatus] = useState<"checking" | "needed" | "ok" | "error">("checking");
+  const [version, setVersion] = useState("");
+
+  const check = useCallback(async () => {
+    setStatus("checking");
+    try {
+      const res = await authFetch("/api/users/me");
+      if (!res.ok) throw new Error("failed to load user");
+      const me = await res.json();
+      setVersion(me.current_terms_version ?? "");
+      setStatus(
+        me.terms_accepted_version && me.terms_accepted_version === me.current_terms_version
+          ? "ok"
+          : "needed",
+      );
+    } catch {
+      setStatus("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    check();
+  }, [check]);
+
+  if (status === "checking") return <FullScreenSpinner />;
+  if (status === "error") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 p-4">
+        <p className="text-sm text-gray-600">読み込みに失敗しました。</p>
+        <button
+          onClick={check}
+          className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm font-medium hover:bg-brand-700"
+        >
+          再試行
+        </button>
+      </div>
+    );
+  }
+  if (status === "needed") {
+    return <ConsentGate version={version} onAccepted={() => setStatus("ok")} />;
+  }
+  return <>{children}</>;
 }
 
 function AppShell({ userEmail, children }: { userEmail: string; children: React.ReactNode }) {
@@ -46,15 +102,15 @@ function AppShell({ userEmail, children }: { userEmail: string; children: React.
   }, [loading, spaces.length, onSpacesRoute, router]);
 
   if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="w-8 h-8 border-4 border-brand-500 border-t-transparent rounded-full animate-spin" />
-      </div>
-    );
+    return <FullScreenSpinner />;
   }
 
   return (
     <div className="h-screen flex flex-col overflow-hidden">
+      <div className="shrink-0 flex items-center justify-center gap-2 bg-amber-50 border-b border-amber-200 px-4 py-1.5 text-xs text-amber-900">
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+        <span className="text-center">{HACKATHON_NOTICE}</span>
+      </div>
       <header className="shrink-0 bg-white border-b border-gray-200">
         <div className="px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -172,6 +228,9 @@ function UserMenu({ userEmail }: { userEmail: string }) {
       </button>
       {open && (
         <div className="absolute right-0 mt-1 w-56 bg-white border border-gray-200 rounded-md shadow-lg z-50 py-1">
+          <Link href="/help" onClick={() => setOpen(false)} className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50">
+            <HelpCircle className="w-4 h-4 text-gray-400" /> ヘルプ / 使い方
+          </Link>
           <Link href="/settings/usage" onClick={() => setOpen(false)} className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-gray-50">
             <BarChart3 className="w-4 h-4 text-gray-400" /> 利用状況
           </Link>
@@ -192,6 +251,16 @@ function UserMenu({ userEmail }: { userEmail: string }) {
           >
             <LogOut className="w-4 h-4 text-gray-400" /> ログアウト
           </button>
+          <div className="border-t border-gray-100 my-1" />
+          <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-gray-400">
+            <Link href="/terms" onClick={() => setOpen(false)} className="hover:text-gray-600">
+              利用規約
+            </Link>
+            <span>·</span>
+            <Link href="/privacy" onClick={() => setOpen(false)} className="hover:text-gray-600">
+              プライバシー
+            </Link>
+          </div>
         </div>
       )}
     </div>

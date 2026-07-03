@@ -45,3 +45,6 @@ Thumbs.db
 npm-debug.log*
 
 手作業の作業ログ.txt
+
+# コーディングエージェントの作業ディレクトリ
+scratch/

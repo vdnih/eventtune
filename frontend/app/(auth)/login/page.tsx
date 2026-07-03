@@ -3,7 +3,10 @@
 import { signInWithPopup } from "firebase/auth";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import Link from "next/link";
+import { AlertTriangle } from "lucide-react";
 import { auth, googleProvider } from "@/lib/firebase";
+import { HACKATHON_NOTICE } from "@/lib/legal";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -29,9 +32,14 @@ export default function LoginPage() {
         <h1 className="text-2xl font-bold text-gray-900 mb-2">
           EventTune
         </h1>
-        <p className="text-gray-500 text-sm mb-8">
+        <p className="text-gray-500 text-sm mb-6">
           AIで商談メモを高品質なメールに変換
         </p>
+
+        <div className="mb-6 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-left text-xs text-amber-900">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+          <span>{HACKATHON_NOTICE}</span>
+        </div>
 
         {error && (
           <p className="text-red-500 text-sm mb-4 bg-red-50 p-3 rounded-lg">
@@ -64,6 +72,18 @@ export default function LoginPage() {
           </svg>
           {loading ? "ログイン中..." : "Googleでログイン"}
         </button>
+
+        <p className="mt-6 text-xs text-gray-400 leading-relaxed">
+          ログインすることで、
+          <Link href="/terms" className="text-brand-600 hover:underline">
+            利用規約
+          </Link>
+          および
+          <Link href="/privacy" className="text-brand-600 hover:underline">
+            プライバシーポリシー
+          </Link>
+          に同意したものとみなされます。
+        </p>
       </div>
     </div>
   );

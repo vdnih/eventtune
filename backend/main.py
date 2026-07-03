@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
-from routers import data, events, integration, marketing, spaces, threads
+from routers import data, events, integration, marketing, spaces, threads, users
 
 settings = get_settings()
 
@@ -30,6 +30,7 @@ app.add_middleware(
 )
 
 app.include_router(spaces.router)
+app.include_router(users.router)
 app.include_router(integration.router)
 app.include_router(marketing.router)
 app.include_router(threads.router)
