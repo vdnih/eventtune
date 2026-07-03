@@ -1,5 +1,12 @@
+import os
+
 from dotenv import load_dotenv
 load_dotenv()
+
+# grpc C-core の fork検知ログ（ev_poll_posix 等）を抑制。uvicorn --reload 等の
+# 開発時プロセス起動と組み合わさると出る実害のないINFOログのため。
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
 
 import firebase_admin
 from fastapi import FastAPI

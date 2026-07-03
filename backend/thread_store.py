@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+
+from google.cloud.firestore import FieldFilter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -109,7 +111,7 @@ def extract_run_id_from_text(text: str) -> str | None:
 
 def list_threads(space: SpaceContext) -> list[dict[str, Any]]:
     """自分（uid）のスレッドを updated_at 降順で返す。"""
-    docs = space.col("threads").where("uid", "==", space.uid).get()
+    docs = space.col("threads").where(filter=FieldFilter("uid", "==", space.uid)).get()
     threads = [d.to_dict() for d in docs]
     threads.sort(key=lambda t: t.get("updated_at", ""), reverse=True)
     return threads
