@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Optional
+from typing import Any
 
 from google import genai
 from google.genai import types
@@ -44,7 +44,8 @@ def _get_client() -> genai.Client:
 
 # ── 埋め込み ───────────────────────────────────────────────────────────────────
 
-async def embed_text(text: str, space: Optional[SpaceContext] = None) -> list[float]:
+
+async def embed_text(text: str, space: SpaceContext | None = None) -> list[float]:
     """テキストを appeal_vector（list[float]）に埋め込む。空文字・失敗時は [] を返す。"""
     text = (text or "").strip()
     if not text:
@@ -70,7 +71,7 @@ async def embed_text(text: str, space: Optional[SpaceContext] = None) -> list[fl
         return []
 
 
-def embed_text_sync(text: str, space: Optional[SpaceContext] = None) -> list[float]:
+def embed_text_sync(text: str, space: SpaceContext | None = None) -> list[float]:
     """embed_text の同期版。空文字・失敗時は [] を返す。
 
     segmentation 等の同期パス（バケット代表テキストの埋め込み）から使う。意味検索の
@@ -102,11 +103,12 @@ def embed_text_sync(text: str, space: Optional[SpaceContext] = None) -> list[flo
 
 # ── 類似度（決定論 Python 総当たり）────────────────────────────────────────────
 
+
 def cosine(a: list[float], b: list[float]) -> float:
     """コサイン類似度。どちらかが空・ゼロノルムなら 0.0。"""
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     if na == 0.0 or nb == 0.0:
@@ -126,11 +128,7 @@ def find_similar(
     """
     if not query_vector:
         return []
-    scored = [
-        (item, cosine(query_vector, vec))
-        for item, vec in candidates
-        if vec
-    ]
+    scored = [(item, cosine(query_vector, vec)) for item, vec in candidates if vec]
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored[:top_k]
 
@@ -175,7 +173,7 @@ def _payload_text(payload: dict) -> str:
 async def generate_appeal_summary(
     kind: str,
     payload: dict,
-    space: Optional[SpaceContext] = None,
+    space: SpaceContext | None = None,
 ) -> str:
     """マスタの情報から appeal_summary（要約テキスト）を生成する。失敗時は空文字。"""
     instruction = _SUMMARY_INSTRUCTIONS.get(kind)
@@ -200,7 +198,7 @@ async def generate_appeal_summary(
 async def build_appeal(
     kind: str,
     payload: dict,
-    space: Optional[SpaceContext] = None,
+    space: SpaceContext | None = None,
 ) -> tuple[str, list[float]]:
     """appeal_summary を生成し、その埋め込み appeal_vector も返す。
 

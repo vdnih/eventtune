@@ -13,7 +13,8 @@ Data Router — /api/data
 """
 
 import logging
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -27,12 +28,14 @@ router = APIRouter(prefix="/api/data", tags=["data"])
 
 # ── データビューのレジストリ ──────────────────────────────────────────────────
 
+
 def _list_collection(name: str) -> Callable[[SpaceContext], Iterator[dict]]:
     def lister(space: SpaceContext) -> Iterator[dict]:
         for doc in space.col(name).stream():
             data = doc.to_dict()
             if data:
                 yield data
+
     return lister
 
 
@@ -47,29 +50,31 @@ def _list_deliverables(space: SpaceContext) -> Iterator[dict]:
 
 # key -> (label, group, lister)
 VIEWS: dict[str, tuple[str, str, Callable[[SpaceContext], Iterator[dict]]]] = {
-    "events":             ("イベント",      "マスタ",   _list_collection("events")),
-    "persons":            ("ハウスリスト",  "マスタ",   _list_collection("persons")),
-    "accounts":           ("企業",          "マスタ",   _list_collection("accounts")),
-    "products":           ("製品",          "マスタ",   _list_collection("products")),
-    "contents":           ("コンテンツ",    "マスタ",   _list_collection("contents")),
-    "event_attendances":  ("イベント参加",  "ファクト", _list_collection("event_attendances")),
-    "product_interests":  ("製品関心",      "ファクト", _list_collection("product_interests")),
-    "cost_items":         ("費用明細",      "ファクト", _list_collection("cost_items")),
-    "segments":           ("セグメント",    "分析",     _list_collection("segments")),
-    "marketing_runs":     ("生成ジョブ",    "生成",     _list_collection("marketing_runs")),
-    "deliverables":       ("生成成果物",    "生成",     _list_deliverables),
+    "events": ("イベント", "マスタ", _list_collection("events")),
+    "persons": ("ハウスリスト", "マスタ", _list_collection("persons")),
+    "accounts": ("企業", "マスタ", _list_collection("accounts")),
+    "products": ("製品", "マスタ", _list_collection("products")),
+    "contents": ("コンテンツ", "マスタ", _list_collection("contents")),
+    "event_attendances": ("イベント参加", "ファクト", _list_collection("event_attendances")),
+    "product_interests": ("製品関心", "ファクト", _list_collection("product_interests")),
+    "cost_items": ("費用明細", "ファクト", _list_collection("cost_items")),
+    "segments": ("セグメント", "分析", _list_collection("segments")),
+    "marketing_runs": ("生成ジョブ", "生成", _list_collection("marketing_runs")),
+    "deliverables": ("生成成果物", "生成", _list_deliverables),
 }
 
 
 # ── エンドポイント ────────────────────────────────────────────────────────────
 
+
 @router.get("/collections")
 async def list_collections(space: SpaceContext = Depends(get_space_context)):
     """閲覧可能なデータビューの一覧（左メニュー用）を返す。"""
-    return {"collections": [
-        {"key": key, "label": label, "group": group}
-        for key, (label, group, _) in VIEWS.items()
-    ]}
+    return {
+        "collections": [
+            {"key": key, "label": label, "group": group} for key, (label, group, _) in VIEWS.items()
+        ]
+    }
 
 
 @router.get("/lineage/by-entity/{entity_id}")

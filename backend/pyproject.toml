@@ -19,8 +19,45 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=8.0.0",
+    "ruff>=0.8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: requires Firebase emulators (FIRESTORE_EMULATOR_HOST)",
+]
+# デフォルトはユニットのみ。統合テストは `pytest -m integration`（エミュレータ必須）。
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# UP042(str,Enum → StrEnum)は str() の表示挙動が変わりうるため既存コードには適用しない。
+# E501 はコード行幅を ruff format に委ね、日本語プロンプト文字列・docstring には適用しない
+# （折り返しは LLM への入力を変えるため）。
+ignore = ["UP042", "E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI の DI イディオム（引数デフォルトでの Depends/Header 等）を B008 から除外
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Header",
+    "fastapi.Query",
+    "fastapi.Body",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Path",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# main.py は import 前の環境変数設定（grpc ログ抑制）を意図的に行う
+"main.py" = ["E402"]
 
 [build-system]
 requires = ["hatchling"]

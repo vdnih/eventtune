@@ -130,6 +130,26 @@ cd backend && uv run uvicorn main:app --reload --port 8000
 cd frontend && npm run dev
 ```
 
+## テスト
+
+方針と詳細は [docs/TESTING.md](docs/TESTING.md) を参照。CI（PR時）でも同じものが走る。
+
+```bash
+# backend ユニット + lint（backend/ で実行）
+uv run pytest && uv run ruff check .
+
+# backend 統合テスト（リポジトリルートで実行。Firebase エミュレータ使用、Java 必須）
+firebase emulators:exec --only firestore,auth --project demo-eventtune \
+  "cd backend && uv run pytest -m integration"
+
+# frontend ユニット + 型チェック（frontend/ で実行）
+npm run test && npm run typecheck
+
+# E2E スモーク（リポジトリルートで実行）
+firebase emulators:exec --only firestore,auth --project demo-eventtune \
+  "cd frontend && npx playwright test"
+```
+
 ## デプロイ（GCP + Firebase）
 
 IaC は責務で分割する（詳細は [docs/ADR.md](docs/ADR.md) ADR-012 / [docs/INFRA_ARCHITECTURE.md](docs/INFRA_ARCHITECTURE.md)）。
@@ -170,5 +190,6 @@ firebase deploy --only firestore:rules,firestore:indexes,storage
 - [システム思想と命名規約](docs/PHILOSOPHY_AND_NAMING.md) — 設計原則、オントロジー、正規命名一覧
 - [ソフトウェアアーキテクチャ](docs/SOFTWARE_ARCHITECTURE.md) — オントロジー設計、エージェント構成、APIルート、Firestoreスキーマ
 - [インフラアーキテクチャ](docs/INFRA_ARCHITECTURE.md) — GCP/Firebase構成、Cloud Run設定、認証フロー
+- [テスト戦略](docs/TESTING.md) — テストピラミッド、各層の実行方法、AIエージェントのテスト方針、保証する不変条件
 - [アーキテクチャ決定記録](docs/ADR.md) — 設計上の意思決定とその根拠
 - [プロジェクト管理](docs/PM.md) — スコープ、マイルストーン、リスク管理

@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from firebase_admin import firestore
@@ -36,7 +36,7 @@ DEFAULT_COMPUTE_RESOURCE = "cloudrun-default"
 
 
 def _period() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return datetime.now(UTC).strftime("%Y-%m")
 
 
 def _usage_ref(space: SpaceContext):
@@ -63,10 +63,17 @@ def record_llm(
     in_tok, out_tok = int(input_tokens or 0), int(output_tokens or 0)
     if not (in_tok or out_tok):
         return
-    _apply(space, {"llm": {model: {
-        "input_tokens": firestore.Increment(in_tok),
-        "output_tokens": firestore.Increment(out_tok),
-    }}})
+    _apply(
+        space,
+        {
+            "llm": {
+                model: {
+                    "input_tokens": firestore.Increment(in_tok),
+                    "output_tokens": firestore.Increment(out_tok),
+                }
+            }
+        },
+    )
 
 
 def record_compute(

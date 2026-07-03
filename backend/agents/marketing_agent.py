@@ -20,8 +20,9 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from typing import Any
 
 import pandas as pd
 import vertexai
@@ -71,7 +72,9 @@ def _normalize_buckets(buckets: Any) -> list[str] | dict:
             return {"error": f"buckets の解析に失敗（JSON配列文字列で渡してください）: {e}"}
 
     if not isinstance(buckets, (list, tuple)):
-        return {"error": f"buckets は配列（または JSON 配列文字列）で渡してください: {type(buckets).__name__}"}
+        return {
+            "error": f"buckets は配列（または JSON 配列文字列）で渡してください: {type(buckets).__name__}"
+        }
 
     cleaned = [b.strip() for b in buckets if isinstance(b, str) and b.strip()]
     if not cleaned:
@@ -219,12 +222,20 @@ ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / ap
 
 # ── スキーマテキスト生成 ──────────────────────────────────────────────────────
 
+
 def _build_schema_text() -> str:
     """ontology.py の Pydantic モデル定義からスキーマ説明を自動生成する。"""
     from ontology import (
-        Account, Content, Event, EventAttendance,
-        Person, Product, ProductInterest, Segment,
+        Account,
+        Content,
+        Event,
+        EventAttendance,
+        Person,
+        Product,
+        ProductInterest,
+        Segment,
     )
+
     models = [Person, Event, Account, EventAttendance, ProductInterest, Product, Content, Segment]
     lines = []
     for model in models:
@@ -287,7 +298,9 @@ def _ensure_sandbox(tool_context: ToolContext) -> str:
     return name
 
 
-def _exec_in_sandbox(sandbox_name: str, code: str, files: list[dict] | None = None) -> tuple[str, str]:
+def _exec_in_sandbox(
+    sandbox_name: str, code: str, files: list[dict] | None = None
+) -> tuple[str, str]:
     """サンドボックスでコードを実行し (stdout, stderr) を返す。
 
     files は [{"name","content"(bytes),"mimeType"}]。execute_code が読むのは 'content'（単数）＋生 bytes。
@@ -312,6 +325,7 @@ def _exec_in_sandbox(sandbox_name: str, code: str, files: list[dict] | None = No
 # db は space.ScopedClient（spaces/{space_id}/ で前置済み）。各ツールは db を closure で
 # 捕捉するため、自スペース配下にしか到達できない。ツール引数に space_id は存在しない。
 # space は計測（メータリング）専用に捕捉する（データ参照は db のみを使う）。
+
 
 def make_tools(db: Any, space: SpaceContext) -> list:
     """スペース前置済み db を closure 束縛したツール群を返す。"""
@@ -348,11 +362,13 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             # 類似度計算は semantic_search.py（決定論 Python）が担う。
             if "appeal_vector" in df.columns:
                 df = df.drop(columns=["appeal_vector"])
-            files.append({
-                "name": f"{name}.csv",
-                "content": df.to_csv(index=False).encode("utf-8"),
-                "mimeType": "text/csv",
-            })
+            files.append(
+                {
+                    "name": f"{name}.csv",
+                    "content": df.to_csv(index=False).encode("utf-8"),
+                    "mimeType": "text/csv",
+                }
+            )
 
         sandbox = _ensure_sandbox(tool_context)
         # ファイルをサンドボックスへ投入し、pandas/numpy を pre-import する。
@@ -371,7 +387,12 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
         schema = _build_schema_text()
         return json.dumps(
-            {"loaded": True, "files": [f["name"] for f in files], "counts": counts, "schema": schema},
+            {
+                "loaded": True,
+                "files": [f["name"] for f in files],
+                "counts": counts,
+                "schema": schema,
+            },
             ensure_ascii=False,
         )
 
@@ -428,7 +449,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         cols = {
             "contents": ("content_id", "content_name"),
             "products": ("product_id", "product_name"),
-            "events":   ("event_id", "name"),
+            "events": ("event_id", "name"),
         }
         if target not in cols:
             return json.dumps({"error": f"target は {list(cols)} のいずれか"}, ensure_ascii=False)
@@ -439,13 +460,17 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         pvec = (pdoc.to_dict() or {}).get("appeal_vector") or []
         if not pvec:
             return json.dumps(
-                {"error": "この Person には appeal_vector が無く意味検索できません（取り込み時に未生成）"},
+                {
+                    "error": "この Person には appeal_vector が無く意味検索できません（取り込み時に未生成）"
+                },
                 ensure_ascii=False,
             )
 
         id_field, name_field = cols[target]
-        candidates = [(d.to_dict(), (d.to_dict() or {}).get("appeal_vector") or [])
-                      for d in db.collection(target).get()]
+        candidates = [
+            (d.to_dict(), (d.to_dict() or {}).get("appeal_vector") or [])
+            for d in db.collection(target).get()
+        ]
         ranked = find_similar(pvec, candidates, top_k=top_k)
         results = [
             {
@@ -468,13 +493,15 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         content: JSON 文字列または自由テキスト
         """
         report_id = f"report_{uuid.uuid4().hex[:12]}"
-        db.collection(f"events/{event_id}/reports").document(report_id).set({
-            "report_id": report_id,
-            "event_id": event_id,
-            "report_type": report_type,
-            "content": content,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        db.collection(f"events/{event_id}/reports").document(report_id).set(
+            {
+                "report_id": report_id,
+                "event_id": event_id,
+                "report_type": report_type,
+                "content": content,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
         return json.dumps({"report_id": report_id, "status": "saved"})
 
     # ── 個別カスタマイズ（セグメント方式・HIL） ──────────────────────────────
@@ -519,7 +546,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             axes=axes,
             buckets=bucket_list,
             criteria=criteria,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
         )
         db.collection("segments").document(segment_id).set(segment.model_dump())
         return json.dumps(
@@ -550,7 +577,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         segment_id: str,
         purpose: str = "",
         context: str = "",
-        content_ids: list[str] = [],
+        content_ids: list[str] = [],  # noqa: B006 — ADKツールスキーマ維持のため（読み取り専用）
         output_format: str = "EMAIL",
     ) -> str:
         """
@@ -588,13 +615,20 @@ def make_tools(db: Any, space: SpaceContext) -> list:
                 db.collection(f"segments/{segment_id}/patterns").document(pattern.pattern_id).set(
                     pattern.model_dump()
                 )
-                results.append({
-                    "bucket": bucket,
-                    "pattern_id": pattern.pattern_id,
-                    "subject": pattern.subject,
-                })
+                results.append(
+                    {
+                        "bucket": bucket,
+                        "pattern_id": pattern.pattern_id,
+                        "subject": pattern.subject,
+                    }
+                )
         return json.dumps(
-            {"segment_id": segment_id, "format": output_format, "patterns": results, "count": len(results)},
+            {
+                "segment_id": segment_id,
+                "format": output_format,
+                "patterns": results,
+                "count": len(results),
+            },
             ensure_ascii=False,
         )
 
@@ -620,17 +654,22 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
         # パターン未生成チェック（pattern_id = "{bucket}__{format}" をキーに保持）
         patterns = {
-            p.id: p.to_dict()
-            for p in db.collection(f"segments/{segment_id}/patterns").get()
+            p.id: p.to_dict() for p in db.collection(f"segments/{segment_id}/patterns").get()
         }
         if not patterns:
-            return json.dumps({"error": "パターンが未生成です。先に generate_patterns を実行してください"})
+            return json.dumps(
+                {"error": "パターンが未生成です。先に generate_patterns を実行してください"}
+            )
 
         # スナップショット解決（省略時は最新）
         if not snapshot_id:
             snap_docs = list(db.collection(f"segments/{segment_id}/snapshots").get())
             if not snap_docs:
-                return json.dumps({"error": "セグメント割り当てがありません。先に assign_segment を実行してください"})
+                return json.dumps(
+                    {
+                        "error": "セグメント割り当てがありません。先に assign_segment を実行してください"
+                    }
+                )
             snap_docs.sort(key=lambda d: d.to_dict().get("created_at", ""), reverse=True)
             snapshot_id = snap_docs[0].id
 
@@ -654,6 +693,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
 
 # ── エージェント・ランナー構築 ────────────────────────────────────────────────
+
 
 def build_agent(db: Any, space: SpaceContext) -> Agent:
     """スペース束縛ツールを持つ Agent をリクエストごとに構築する。
@@ -718,7 +758,8 @@ async def ensure_session(session_id: str | None, space: SpaceContext) -> str:
         if session is not None:
             return session.id
     session = await _session_service.create_session(
-        app_name=_APP_NAME, user_id=session_user_id  # session_id 未指定 → サーバ採番
+        app_name=_APP_NAME,
+        user_id=session_user_id,  # session_id 未指定 → サーバ採番
     )
     return session.id
 
@@ -799,14 +840,18 @@ async def chat_stream(
                             out = f"{out}\n{parsed['stderr']}" if out else parsed["stderr"]
                         yield {
                             "type": "code_result",
-                            "outcome": "ERROR" if (parsed.get("stderr") or parsed.get("error")) else "OK",
+                            "outcome": "ERROR"
+                            if (parsed.get("stderr") or parsed.get("error"))
+                            else "OK",
                             "output": out,
                         }
                     else:
                         yield {
                             "type": "tool_result",
                             "tool_name": fr.name,
-                            "result": fr.response if isinstance(fr.response, dict) else {"value": fr.response},
+                            "result": fr.response
+                            if isinstance(fr.response, dict)
+                            else {"value": fr.response},
                         }
             # 最終テキスト応答
             elif event.is_final_response() and event.content and event.content.parts:
@@ -838,11 +883,11 @@ class _PatternBlock(BaseModel):
     block_type: str
     reason_for_inclusion: str
     associated_asset_ids: list[str] = []
-    block_text: str          # {name} {company_name} {department} {job_title} を含めてよい
+    block_text: str  # {name} {company_name} {department} {job_title} を含めてよい
 
 
 class _PatternSchema(BaseModel):
-    subject: str             # プレースホルダ可
+    subject: str  # プレースホルダ可
     blocks: list[_PatternBlock]
 
 
@@ -914,11 +959,12 @@ def _generate_one_pattern(
         format=output_format,
         subject=pattern.subject,
         blocks=[DeliverableBlock(**b.model_dump()) for b in pattern.blocks],
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
 
 
 # ── Stage 2b: 決定論的な組み立て（LLM不使用） ────────────────────────────────
+
 
 def _fill(template: str, ctx: dict) -> str:
     """テンプレート中のプレースホルダを Person/Account の値で決定論的に置換する。"""
@@ -950,7 +996,7 @@ def _assemble_run(
         snapshot_id=snapshot_id,
         purpose=segment.purpose,
         total=len(assignments),
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=datetime.now(UTC).isoformat(),
     )
     db.collection("marketing_runs").document(run_id).set(run.model_dump())
 
@@ -962,9 +1008,7 @@ def _assemble_run(
         pattern_key = f"{bucket}__{output_format}"
         pattern = patterns.get(pattern_key)
         if not pattern:
-            logger.warning(
-                "no pattern for key '%s' (person %s)", pattern_key, person_id
-            )
+            logger.warning("no pattern for key '%s' (person %s)", pattern_key, person_id)
             continue
 
         person_doc = db.collection("persons").document(person_id).get()
@@ -1000,7 +1044,7 @@ def _assemble_run(
             bucket=bucket,
             subject=_fill(pattern.get("subject", ""), fill_ctx),
             blocks=blocks,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
         )
         db.collection(f"marketing_runs/{run_id}/deliverables").document(deliverable_id).set(
             deliverable.model_dump()
@@ -1010,5 +1054,7 @@ def _assemble_run(
     db.collection("marketing_runs").document(run_id).update(
         {"status": "done", "done": done, "deliverable_count": done}
     )
-    logger.info("assembly completed: run_id=%s segment=%s done=%d", run_id, segment.segment_id, done)
+    logger.info(
+        "assembly completed: run_id=%s segment=%s done=%d", run_id, segment.segment_id, done
+    )
     return done

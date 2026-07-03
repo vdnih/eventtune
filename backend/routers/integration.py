@@ -14,7 +14,7 @@ docs/INGESTION_MAPPING.md に従い、イベント割り当てではなく「フ
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -31,18 +31,19 @@ router = APIRouter(prefix="/api/integration", tags=["integration"])
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # ── 取り込みプラン提案 ──────────────────────────────────────────────────────────
+
 
 class _FilePlan(BaseModel):
     filename: str
     business_context: str = ""
     entity_type: str = ""
     source_file_role: str = ""
-    link_hints: dict[str, str] = {}       # {kind: マスタ名}
-    link_existing: dict[str, bool] = {}   # {kind: 既存マスタに一致するか}
+    link_hints: dict[str, str] = {}  # {kind: マスタ名}
+    link_existing: dict[str, bool] = {}  # {kind: 既存マスタに一致するか}
     column_map: dict[str, str] = {}
     unmapped_notes: str = ""
 
@@ -54,7 +55,11 @@ class _PlanResponse(BaseModel):
 def _load_master_names(space: SpaceContext) -> dict[str, list[str]]:
     """既存マスタ名（events/accounts/products）を取得し、リンク照合のヒントにする。"""
     out: dict[str, list[str]] = {"events": [], "accounts": [], "products": []}
-    for col, field in (("events", "name"), ("accounts", "account_name"), ("products", "product_name")):
+    for col, field in (
+        ("events", "name"),
+        ("accounts", "account_name"),
+        ("products", "product_name"),
+    ):
         try:
             for doc in space.col(col).get():
                 name = (doc.to_dict() or {}).get(field, "")
@@ -95,21 +100,24 @@ async def plan_ingestion(
             col = _KIND_TO_COL.get(kind, kind + "s")
             norm_name = _normalize_name(name)
             link_existing[kind] = norm_name in {_normalize_name(n) for n in masters.get(col, [])}
-        result_files.append(_FilePlan(
-            filename=filename,
-            business_context=plan.business_context,
-            entity_type=plan.entity_type,
-            source_file_role=plan.source_file_role,
-            link_hints=plan.link_hints,
-            link_existing=link_existing,
-            column_map=plan.column_map,
-            unmapped_notes=plan.unmapped_notes,
-        ))
+        result_files.append(
+            _FilePlan(
+                filename=filename,
+                business_context=plan.business_context,
+                entity_type=plan.entity_type,
+                source_file_role=plan.source_file_role,
+                link_hints=plan.link_hints,
+                link_existing=link_existing,
+                column_map=plan.column_map,
+                unmapped_notes=plan.unmapped_notes,
+            )
+        )
 
     return {"files": [f.model_dump() for f in result_files]}
 
 
 # ── バッチ処理 ─────────────────────────────────────────────────────────────────
+
 
 async def _run_integration(
     space: SpaceContext,
@@ -125,7 +133,8 @@ async def _run_integration(
         scoped.collection("integration_jobs").document(batch_id).update({"status": "processing"})
         with metered(space):
             results = await process_batch(
-                files, batch_id, scoped, hint=hint, space=space, event=event)
+                files, batch_id, scoped, hint=hint, space=space, event=event
+            )
 
         merged: dict[str, int] = {}
         for r in results:
@@ -137,25 +146,31 @@ async def _run_integration(
         batch_status = "done" if any_ok else "error"
         child_job_ids = [r.job_id for r in results if r.job_id]
 
-        scoped.collection("integration_jobs").document(batch_id).update({
-            "status": batch_status,
-            "files": [r.to_dict() for r in results],
-            "created_entities": merged,
-            "child_job_ids": child_job_ids,
-            "partial": any_ok and any_err,
-        })
+        scoped.collection("integration_jobs").document(batch_id).update(
+            {
+                "status": batch_status,
+                "files": [r.to_dict() for r in results],
+                "created_entities": merged,
+                "child_job_ids": child_job_ids,
+                "partial": any_ok and any_err,
+            }
+        )
         logger.info(
             "integration done: batch_id=%s status=%s created=%s",
-            batch_id, batch_status, merged,
+            batch_id,
+            batch_status,
+            merged,
         )
 
     except Exception as e:
         logger.exception("integration failed: batch_id=%s error=%s", batch_id, e)
         try:
-            scoped.collection("integration_jobs").document(batch_id).update({
-                "status": "error",
-                "error": str(e)[:500],
-            })
+            scoped.collection("integration_jobs").document(batch_id).update(
+                {
+                    "status": "error",
+                    "error": str(e)[:500],
+                }
+            )
         except Exception:
             pass
 
@@ -187,18 +202,21 @@ async def start_integration(
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     filenames = [name for name, _ in loaded]
 
-    space.col("integration_jobs").document(batch_id).set({
-        "batch_id": batch_id,
-        "filenames": filenames,
-        "files": [{"filename": name, "status": "queued"} for name in filenames],
-        "hint": (hint or "").strip(),
-        "event": (event or "").strip(),
-        "status": "queued",
-        "created_at": _now_iso(),
-    })
+    space.col("integration_jobs").document(batch_id).set(
+        {
+            "batch_id": batch_id,
+            "filenames": filenames,
+            "files": [{"filename": name, "status": "queued"} for name in filenames],
+            "hint": (hint or "").strip(),
+            "event": (event or "").strip(),
+            "status": "queued",
+            "created_at": _now_iso(),
+        }
+    )
 
     background_tasks.add_task(
-        _run_integration, space, batch_id, loaded, (hint or "").strip(), (event or "").strip())
+        _run_integration, space, batch_id, loaded, (hint or "").strip(), (event or "").strip()
+    )
 
     return {"batch_id": batch_id, "filenames": filenames}
 
@@ -223,5 +241,3 @@ async def get_batch_status(
         "partial": data.get("partial", False),
         "error": data.get("error"),
     }
-
-

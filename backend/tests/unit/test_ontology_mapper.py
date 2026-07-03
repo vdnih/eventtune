@@ -3,8 +3,8 @@
 ADR-013 により CSV パスの行解釈は AI が直接担い、OntologyMapper は TXT パス（map_extraction）のみを担う。
 """
 
-from ontology import DocumentExtractionResult
 from agents.ontology_mapper import OntologyMapper, _normalize_name
+from ontology import DocumentExtractionResult
 
 _mapper = OntologyMapper()
 
@@ -35,9 +35,7 @@ def test_map_extraction_content_carries_event_link():
     extraction = DocumentExtractionResult(
         detected_entity_types=["Event", "ContentAsset"],
         events=[{"name": "2025秋展示会"}],
-        content_assets=[{
-            "name": "導入事例A", "content_type": "導入事例", "url": "http://x"
-        }],
+        content_assets=[{"name": "導入事例A", "content_type": "導入事例", "url": "http://x"}],
     )
     result = _mapper.map_extraction(extraction, space_id="s1")
     content_recs = [r for r in result.records if r.kind == "contents"]

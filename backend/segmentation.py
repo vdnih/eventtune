@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Iterator, Optional
+from collections.abc import Iterator
+from datetime import UTC, datetime
 
 from google import genai
 from google.cloud.firestore import FieldFilter
@@ -38,7 +38,7 @@ _BATCH_SIZE = 20
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _new_id(prefix: str = "") -> str:
@@ -47,14 +47,19 @@ def _new_id(prefix: str = "") -> str:
 
 # ── Person 走査 ──────────────────────────────────────────────────────────────
 
-def _iter_persons(space: SpaceContext, event_id: Optional[str] = None) -> Iterator[dict]:
+
+def _iter_persons(space: SpaceContext, event_id: str | None = None) -> Iterator[dict]:
     """スペース内の Person を列挙する（ADR-008 フラットスキーマ）。
 
     event_id 指定時は event_attendances → persons の順で絞り込む。
     未指定なら persons を直接 stream する。
     """
     if event_id:
-        att_docs = space.col("event_attendances").where(filter=FieldFilter("event_id", "==", event_id)).stream()
+        att_docs = (
+            space.col("event_attendances")
+            .where(filter=FieldFilter("event_id", "==", event_id))
+            .stream()
+        )
         person_ids = [a.to_dict().get("person_id") for a in att_docs]
         for pid in (p for p in person_ids if p):
             doc = space.doc(f"persons/{pid}").get()
@@ -73,7 +78,11 @@ def _get_product_interests(space: SpaceContext, person_id: str) -> tuple[list[st
     製品名は products マスタ（データ駆動）から解決する。旧 ProductCode のハードコード
     マッピングは撤去し、取り込みで生成された Product.product_name を参照する。
     """
-    docs = space.col("product_interests").where(filter=FieldFilter("person_id", "==", person_id)).stream()
+    docs = (
+        space.col("product_interests")
+        .where(filter=FieldFilter("person_id", "==", person_id))
+        .stream()
+    )
     product_ids = [d.to_dict().get("product_id", "") for d in docs if d.to_dict()]
     names: list[str] = []
     for pid in product_ids:
@@ -89,9 +98,10 @@ def _get_product_interests(space: SpaceContext, person_id: str) -> tuple[list[st
 
 # ── 決定論的割り当て ──────────────────────────────────────────────────────────
 
+
 def _deterministic_bucket(
     space: SpaceContext, segment: Segment, person: dict
-) -> Optional[tuple[str, str, dict[str, str]]]:
+) -> tuple[str, str, dict[str, str]] | None:
     """構造化フィールドだけで自明に決まる場合に (bucket, reason, signals) を返す。
 
     対応する自明ケース: 単一軸で、その軸が「関心製品」を表す場合。
@@ -121,9 +131,8 @@ def _deterministic_bucket(
 
 # ── バケット代表ベクトル（意味的近接の参照側）────────────────────────────────
 
-def _bucket_reference_vectors(
-    space: SpaceContext, segment: Segment
-) -> dict[str, list[float]]:
+
+def _bucket_reference_vectors(space: SpaceContext, segment: Segment) -> dict[str, list[float]]:
     """各バケットの代表テキストを埋め込み、{bucket: appeal_vector} を返す。
 
     person.appeal_vector とのコサイン近接（find_similar）で意味的な一次候補を出すための
@@ -136,9 +145,7 @@ def _bucket_reference_vectors(
     return vectors
 
 
-def _vector_rank(
-    person: dict, bucket_vectors: dict[str, list[float]]
-) -> tuple[str, float]:
+def _vector_rank(person: dict, bucket_vectors: dict[str, list[float]]) -> tuple[str, float]:
     """person.appeal_vector に最も近いバケットと類似度を返す（無ければ ("", 0.0)）。"""
     pvec = person.get("appeal_vector") or []
     if not pvec:
@@ -148,6 +155,7 @@ def _vector_rank(
 
 
 # ── 軽量 LLM によるバッチ分類 ────────────────────────────────────────────────
+
 
 class _OneAssignment(BaseModel):
     person_id: str
@@ -172,9 +180,7 @@ def _classify_batch(
 
     Returns: { person_id: (bucket, reason, source_signals) }
     """
-    axes_desc = "\n".join(
-        f"- {ax.name}: {' / '.join(ax.values)}" for ax in segment.axes
-    )
+    axes_desc = "\n".join(f"- {ax.name}: {' / '.join(ax.values)}" for ax in segment.axes)
     # 各 Person の意味的近接の一次候補（vector prior）を先に計算する
     ranks: dict[str, tuple[str, float]] = {
         p.get("person_id", ""): _vector_rank(p, bucket_vectors) for p in persons
@@ -242,10 +248,11 @@ reason は判定根拠を20〜40字で簡潔に。
 
 # ── 公開エントリ ─────────────────────────────────────────────────────────────
 
+
 def assign_contacts_to_segment(
     space: SpaceContext,
     segment: Segment,
-    event_id: Optional[str] = None,
+    event_id: str | None = None,
 ) -> dict:
     """対象 Person を Segment のバケットへ割り当て、Firestore にスナップショットとして保存する。
 
@@ -266,15 +273,17 @@ def assign_contacts_to_segment(
         det = _deterministic_bucket(space, segment, p)
         if det is not None:
             bucket, reason, signals = det
-            assignments.append(SegmentAssignment(
-                person_id=pid,
-                segment_id=segment.segment_id,
-                snapshot_id=snapshot_id,
-                space_id=space.space_id,
-                bucket=bucket,
-                reason=reason,
-                source_signals=signals,
-            ))
+            assignments.append(
+                SegmentAssignment(
+                    person_id=pid,
+                    segment_id=segment.segment_id,
+                    snapshot_id=snapshot_id,
+                    space_id=space.space_id,
+                    bucket=bucket,
+                    reason=reason,
+                    source_signals=signals,
+                )
+            )
         else:
             undecided.append(p)
 
@@ -282,7 +291,7 @@ def assign_contacts_to_segment(
     llm_persons = 0
     bucket_vectors = _bucket_reference_vectors(space, segment) if undecided else {}
     for i in range(0, len(undecided), _BATCH_SIZE):
-        chunk = undecided[i:i + _BATCH_SIZE]
+        chunk = undecided[i : i + _BATCH_SIZE]
         try:
             decided = _classify_batch(space, segment, chunk, bucket_vectors)
         except Exception:
@@ -291,25 +300,32 @@ def assign_contacts_to_segment(
         for p in chunk:
             pid = p.get("person_id", "")
             bucket, reason, signals = decided.get(
-                pid, (fallback, "分類失敗→既定バケット", {"appeal_summary": p.get("appeal_summary", "")})
+                pid,
+                (
+                    fallback,
+                    "分類失敗→既定バケット",
+                    {"appeal_summary": p.get("appeal_summary", "")},
+                ),
             )
-            assignments.append(SegmentAssignment(
-                person_id=pid,
-                segment_id=segment.segment_id,
-                snapshot_id=snapshot_id,
-                space_id=space.space_id,
-                bucket=bucket,
-                reason=reason,
-                source_signals=signals,
-            ))
+            assignments.append(
+                SegmentAssignment(
+                    person_id=pid,
+                    segment_id=segment.segment_id,
+                    snapshot_id=snapshot_id,
+                    space_id=space.space_id,
+                    bucket=bucket,
+                    reason=reason,
+                    source_signals=signals,
+                )
+            )
             llm_persons += 1
 
     # 3) スナップショット下に保存（segments/{sid}/snapshots/{snap_id}/assignments/{pid}）
     by_bucket: dict[str, int] = {}
     for a in assignments:
-        space.col(
-            f"segments/{segment.segment_id}/snapshots/{snapshot_id}/assignments"
-        ).document(a.person_id).set(a.model_dump())
+        space.col(f"segments/{segment.segment_id}/snapshots/{snapshot_id}/assignments").document(
+            a.person_id
+        ).set(a.model_dump())
         by_bucket[a.bucket] = by_bucket.get(a.bucket, 0) + 1
 
     snap = SegmentSnapshot(

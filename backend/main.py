@@ -1,6 +1,7 @@
 import os
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # grpc C-core の fork検知ログ（ev_poll_posix 等）を抑制。uvicorn --reload 等の
@@ -17,7 +18,26 @@ from routers import data, events, integration, marketing, spaces, threads, users
 
 settings = get_settings()
 
-firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id})
+
+def _firebase_credential():
+    """エミュレータ利用時（統合テスト・ローカル開発）は ADC が無い環境でも動くよう
+    エミュレータ用クレデンシャルを返す。本番（Cloud Run）はこの env が無いため
+    None（= Application Default Credentials）のまま。
+    """
+    if os.environ.get("FIRESTORE_EMULATOR_HOST"):
+        from firebase_admin import _utils, credentials
+
+        class _EmulatorCredential(credentials.Base):
+            def get_credential(self):
+                return _utils.EmulatorAdminCredentials()
+
+        return _EmulatorCredential()
+    return None
+
+
+firebase_admin.initialize_app(
+    _firebase_credential(), options={"projectId": settings.firebase_project_id}
+)
 
 app = FastAPI(title="EventTune API", version="3.0.0")
 

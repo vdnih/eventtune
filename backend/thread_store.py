@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import UTC, datetime
+from typing import Any
 
 from google.cloud.firestore import FieldFilter
-from datetime import datetime, timezone
-from typing import Any
 
 from space import SpaceContext
 
@@ -32,7 +32,7 @@ _RUN_ID_RE = re.compile(r"run_[0-9a-f]{12}")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _title_from_message(message: str) -> str:

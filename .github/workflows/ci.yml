@@ -31,9 +31,59 @@ jobs:
         working-directory: backend
         run: uv sync --frozen
 
-      - name: Run Pytest
+      - name: Ruff lint
+        working-directory: backend
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        working-directory: backend
+        run: uv run ruff format --check .
+
+      - name: Run Pytest (unit)
         working-directory: backend
         run: uv run pytest
+
+  backend-integration:
+    name: Backend Integration Test (Firestore Emulator)
+    runs-on: ubuntu-latest
+    env:
+      # demo- プレフィックスはエミュレータ専用プロジェクトID（実プロジェクトへの誤接続を構造的に防ぐ）
+      GOOGLE_CLOUD_PROJECT: demo-eventtune
+      FIREBASE_PROJECT_ID: demo-eventtune
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java (Firebase emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Firebase emulators
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Run integration tests (emulator)
+        run: >
+          npx -y firebase-tools emulators:exec --only firestore,auth --project demo-eventtune
+          "cd backend && uv run pytest -m integration"
 
   frontend-build:
     name: Frontend Build (Next.js)
@@ -64,6 +114,81 @@ jobs:
         working-directory: frontend
         run: npm run lint
 
+      - name: Type check
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Unit tests (Vitest)
+        working-directory: frontend
+        run: npm run test
+
       - name: Build project
         working-directory: frontend
         run: npm run build
+
+  e2e-smoke:
+    name: E2E Smoke (Playwright)
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_CLOUD_PROJECT: demo-eventtune
+      FIREBASE_PROJECT_ID: demo-eventtune
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Java (Firebase emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Firebase emulators
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E smoke tests (emulator)
+        run: >
+          npx -y firebase-tools emulators:exec --only firestore,auth --project demo-eventtune
+          "cd frontend && npx playwright test"
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          retention-days: 7

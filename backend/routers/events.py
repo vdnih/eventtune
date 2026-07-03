@@ -8,7 +8,7 @@ Event エンティティの一覧取得と作成のみを提供する薄い REST
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/api/events", tags=["events"])
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class CreateEventRequest(BaseModel):
