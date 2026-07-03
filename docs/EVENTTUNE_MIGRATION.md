@@ -37,10 +37,30 @@ GitHub/DNS 側の切り替えをユーザー自身が行うための手順。背
 | 3 | Terraform apply（リソース作り直し） | ✅ 完了（`Apply complete! Resources: 16 added, 2 changed, 16 destroyed`） |
 | 3.5 | `frontend_origin`（CORS）の暫定修正 | ✅ 完了・apply済み（`terraform plan` が No changes になることを確認済み） |
 | 4 | Cloud Run URL の反映 | ✅ 完了（`frontend/apphosting.yaml` 更新済み） |
-| 5〜7 | カスタムドメイン設定・Auth Authorized domains・CORS本反映 | 🟡 進行中（DNSレコード2件待ち、下記参照） |
+| 5 | カスタムドメイン設定 | ✅ 完了（DNS 3件すべて反映、`hostState/ownershipState/certState` すべて `ACTIVE`、HTTPS疎通確認済み） |
+| 6 | Auth Authorized domains | ✅ 完了（`app.eventtune.link` が登録済みであることをAPIで確認済み） |
+| 7 | `frontend_origin`（CORS）本反映 | 🟡 コード修正済み・**要apply**（下記参照） |
 | 8 | `github_repo` 変数の反映 | ✅ 手順3の apply に含まれ反映済み |
 | 9 | Firebase Auth ブランディングの反映 | ⬜ 未着手 |
 | 10 | 商標クリアランス | ⬜ 未着手（対外公開前まででよい） |
+
+### 手順7で見つかった問題: カスタムドメインからのAPI呼び出しがCORSで拒否される
+
+ステップ5(カスタムドメイン)完了後も`terraform.tfvars`の`frontend_origin`は暫定URL
+（`eventtune-frontend--marketing-mail-generator.asia-east1.hosted.app`）のままだったため、
+**`https://app.eventtune.link`からのAPI呼び出しがCORSエラーになる状態**だった
+（`OPTIONS /health`を`Origin: https://app.eventtune.link`付きで叩き、
+`Access-Control-Allow-Origin`ヘッダーが返らないことを確認して検出）。
+`terraform.tfvars`の`frontend_origin`を`https://app.eventtune.link`に更新済み。
+**この変更を反映するため、以下を実行して再applyが必要:**
+
+```bash
+cd infra/terraform
+terraform apply
+```
+
+（`terraform plan`で`FRONTEND_ORIGIN`env変数の更新1件 + 既存の軽微な`root_directory`表記ゆれ
+1件のみになることを確認済み）
 
 ### 実際に確定した値（手順3 apply の出力）
 
@@ -136,55 +156,34 @@ terraform output cloud_run_url
 `frontend/apphosting.yaml` の `NEXT_PUBLIC_API_URL` を実際の値に更新済み
 （`https://eventtune-api-bd2jolesza-an.a.run.app`）。
 
-### 5. `app.eventtune.link` を App Hosting のカスタムドメインとして追加 🟡 進行中（DNSレコード待ち）
+### 5. `app.eventtune.link` を App Hosting のカスタムドメインとして追加 ✅ 完了
 
-Firebase コンソール → App Hosting → 対象 backend → カスタムドメインの追加 で
-`app.eventtune.link` を登録し、表示された検証用 TXT レコード・A/CNAME レコードを
-AWS Route 53 の `eventtune.link` ホストゾーンに追加する。DNS 伝播・SSL 証明書発行
-（数分〜数十分）を待って `https://app.eventtune.link` で疎通確認する。
+Route 53 に A / TXT / CNAME の3レコードを追加し、DNS伝播・所有権検証・SSL証明書発行が完了。
+2026-07-03 時点で API 上も `hostState: HOST_ACTIVE` / `ownershipState: OWNERSHIP_ACTIVE` /
+`certState: CERT_ACTIVE` を確認し、`https://app.eventtune.link` への実際の HTTPS 疎通
+（`HTTP/2 200`、有効な証明書）も確認済み。
 
-> **トップレベル `eventtune.link`（apex）には何も設定しない**（将来のランディングページ用に
-> 予約のため）。
+> **トップレベル `eventtune.link`（apex）には何も設定していない**（将来のランディングページ用に
+> 予約のため、今回は触らず）。
 
-#### 現在の状態（2026-07-03 API 直接確認済み）
+### 6. Firebase Auth の Authorized domains に追加 ✅ 完了
 
-ドメイン作成操作は既に開始済み（`operation-1783055771547-655ae05e0b59f-...`）だが、
-以下2件の DNS レコードが Route 53 に未追加のため `OWNERSHIP_MISSING` / `CERT_VALIDATING`
-で止まっている。**Firebase コンソールで再度「ロールアウトの作成中にエラーが発生しました」
-と出るのは、この既存の保留中オペレーションと衝突しているため**であり、コード側の問題ではない。
-以下のレコードを追加すれば Firebase 側の定期チェックで自動的に解消される（コンソールでの
-再試行は不要）。
-
-| 種別 | ホスト名 | 値 |
-|---|---|---|
-| A | `app.eventtune.link` | `35.219.200.58`（設定済み・確認済み） |
-| TXT | `app.eventtune.link` | `fah-claim=004-02-39fa2bf8-8c4b-4d96-b55d-2efac2a84cee` |
-| CNAME | `_acme-challenge_2rq7mkdon47fmtoa.app.eventtune.link` | `acbd5da6-b7c5-47a5-bdce-ed0d987046d9.16.authorize.certificatemanager.goog.` |
-
-> レコード値はドメイン追加操作ごとに固有（ランダムなチャレンジ文字列を含む）。もし
-> Firebase コンソールで一度ドメイン登録をキャンセルして再登録した場合は、上記の値は
-> 無効になり新しい値に差し替わる。その場合は下記コマンドで最新の要求レコードを再取得できる:
-> ```bash
-> TOKEN=$(gcloud auth print-access-token)
-> curl -s -H "Authorization: Bearer $TOKEN" \
->   "https://firebaseapphosting.googleapis.com/v1/projects/marketing-mail-generator/locations/asia-east1/operations?pageSize=20" \
->   | grep -A40 'domains/app.eventtune.link'
-> ```
-
-### 6. Firebase Auth の Authorized domains に追加
-
-Firebase コンソール → Authentication → Settings → Authorized domains に
-`app.eventtune.link` を追加する。**これを忘れると当該ドメインからの Google ログインが
-`auth/unauthorized-domain` エラーで失敗する。** `authDomain` の値自体
+`app.eventtune.link` が Authorized domains に登録済みであることを Identity Toolkit API で
+確認済み（`authorizedDomains` に含まれる）。`authDomain` の値自体
 （`NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`）は `marketing-mail-generator.firebaseapp.com` の
-ままで変更不要。
+ままで変更していない（ログインポップアップが一瞬その URL を経由するのみで実害が小さいため）。
 
-### 7. `frontend_origin`（CORS）を確定ドメインに更新
+### 7. `frontend_origin`（CORS）を確定ドメインに更新 🟡 コード修正済み・要apply
 
 `terraform.tfvars` の `frontend_origin` を（暫定値の App Hosting 既定 URL から）
-`"https://app.eventtune.link"` に更新し、`terraform apply` を再実行してバックエンドの
-CORS 許可オリジンを最終ドメインに合わせる（バックエンドは単一オリジンのみ許可する実装のため、
-実際にユーザーがアクセスするドメインと一致している必要がある）。
+`"https://app.eventtune.link"` に更新済み。実際に CORS が拒否されていることを
+`OPTIONS` リクエストで確認した上での修正（詳細は上記「進捗状況」内の該当セクション参照）。
+**以下を実行して反映すること:**
+
+```bash
+cd infra/terraform
+terraform apply
+```
 
 ### 8. `github_repo` 変数の反映 ✅ 完了
 
