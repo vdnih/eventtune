@@ -48,3 +48,7 @@ npm-debug.log*
 
 # コーディングエージェントの作業ディレクトリ
 scratch/
+
+# GCPプロジェクト番号・APIキーのリソースIDなど内部識別子を含む運用ログ。
+# 将来リポジトリをPublic化する予定のため追跡対象から除外する。
+docs/EVENTTUNE_MIGRATION.md
