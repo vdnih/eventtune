@@ -92,7 +92,7 @@ def _normalize_buckets(buckets: Any) -> list[str] | dict:
 # 下記【ブランドの一貫性】ブロックは同ドキュメント第4節のガードレールを実装したもの。
 
 _SYSTEM_PROMPT = """\
-あなたはイベントマーケティングAIプラットフォームのマーケティングエージェントです。
+あなたは EventTune（イベントマーケティング・インテリジェンス）のマーケティングエージェントです。
 
 【プラットフォームの思想】
 このプラットフォームは、展示会・セミナー・イベントを中心に、カオスなマーケティングデータを
@@ -664,7 +664,7 @@ def build_agent(db: Any, space: SpaceContext) -> Agent:
     return Agent(
         name="marketing_agent",
         model=get_settings().model_agent,
-        description="イベントマーケティングAIエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
+        description="EventTune のマーケティングエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
         instruction=_SYSTEM_PROMPT,
         tools=make_tools(db, space),
     )

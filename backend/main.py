@@ -12,7 +12,7 @@ settings = get_settings()
 
 firebase_admin.initialize_app(options={"projectId": settings.firebase_project_id})
 
-app = FastAPI(title="Event Marketing Platform API", version="3.0.0")
+app = FastAPI(title="EventTune API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,

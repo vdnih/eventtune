@@ -525,4 +525,65 @@ ADR-011 で設計した取り込みパイプラインには以下の問題があ
 - `DocumentPlan` モデルを追加（`ontology.py`）
 - `IntegrationJob.column_mapping` を `DocumentPlan | None` に更新
 - `OntologyMapper._classify_engagement` / `map_rows` / `_decompose_person` を削除
+
+---
+
+## ADR-014: プロダクト名を EventTune に確定 — GCP プロジェクト ID は維持し個別リソースのみ改称
+
+**ステータス**: 採用
+
+**背景**:
+[NAMING_PROPOSAL.md](2026-07-02_レビュー/NAMING_PROPOSAL.md) §7 でプロダクト名は一度
+「EventWeave」に確定していたが、商標・ドメイン調査および Firebase/GCP プロジェクト ID の
+重複可能性を踏まえた最終検討の結果、**EventTune** に変更された（詳細は
+[MESSAGING_EVENTTUNE.md](2026-07-02_レビュー/MESSAGING_EVENTTUNE.md)）。旧名
+`marketing-mail-generator` は命名規約（本書 §6 `generator` 禁止）に違反しており、確定した
+新名称への反映が必要だった。
+
+当初は新規 GCP/Firebase プロジェクト（`eventtune`）を作成し、旧プロジェクトから完全移行する
+方針を検討したが、**GCP 側のプロジェクト作成クォータ制限に抵触し新規プロジェクトを作成できな
+かった**。
+
+**決定**:
+1. **GCP/Firebase プロジェクト ID `marketing-mail-generator` は維持する**。ユーザーからは
+   見えない内部識別子であり、ADR-012 で確立した Terraform カバレッジ（Cloud Run・Artifact
+   Registry・SA/IAM・WIF・Firestore・Firebase Web App・App Hosting backend が全て state 管理下）
+   により、プロジェクトを跨がなくても個別リソースの改称は `terraform apply` 一発で安全に行える。
+2. **Terraform 管理下の個別リソースのみ `eventtune-*` に作り直す**（Cloud Run `mmg-api` →
+   `eventtune-api`、Artifact Registry `mmg` → `eventtune`、サービスアカウント `mmg-api-sa` →
+   `eventtune-api-sa`、App Hosting backend `mmg-frontend` → `eventtune-frontend`）。
+   リソース属性値（`name`/`account_id`/`repository_id`/`backend_id`）のみ変更し、Terraform
+   リソースアドレス（ラベル名）は state 移行の複雑化を避けるため変更しない。
+3. **GitHub リポジトリ名も `eventtune` に改称**する（`gh repo rename`、旧 URL は自動リダイレクト）。
+4. **カスタムドメイン `app.eventtune.link`（AWS Route 53 で取得）を App Hosting に割り当てる**。
+   プロジェクト ID を維持する以上、App Hosting の既定配信 URL
+   （`https://<backend_id>--marketing-mail-generator.<region>.hosted.app`）と Firebase Auth の
+   `authDomain`（`marketing-mail-generator.firebaseapp.com`）には引き続きプロジェクト ID が
+   残るため、ユーザーに見える面（既定配信 URL）はカスタムドメインで隠す。authDomain 自体は
+   ログインポップアップの一瞬の遷移にしか出ないため据え置く。トップレベル `eventtune.link` は
+   将来のランディングページ用に予約し、今回は割り当てない。
+
+**理由**:
+- 本番データがまだ無いため、Terraform 管理下リソースの destroy→create は許容できる
+  （ADR-011/ADR-008 のグリーンフィールド方針と整合）。
+- ADR-012 の IaC 化により、直近デバッグした App Hosting ビルド用 IAM 権限
+  （`developerconnect.user` 等）は既に `service_account.tf` に定義済みであり、同一プロジェクト内
+  でのリソース作り直しでも再取得され、デバッグをやり直す必要はない。
+- GCP プロジェクト ID はサービス提供上ユーザーに直接見せる情報ではなく、カスタムドメインで
+  代替可能なため、クォータ制限という制約下でも「見た目」上の目的は達成できる。
+
+**結果 / 将来課題**:
+- `docker タグ・Artifact Registry の中身（旧イメージ）は引き継がれない。次回 CI push で
+  新規リポジトリに再構築される。
+- App Hosting backend の改称で既定配信 URL が変わるため、`frontend_origin`（CORS）を
+  `https://app.eventtune.link` に更新し再 apply する必要がある。
+- 商標調査は「EventWeave」時点のものであり、「EventTune」については未実施。対外公開前に
+  別途実施する。
+
+**横展開できる学び**:
+- **プロダクト名とインフラの内部 ID は独立して扱える**。GCP/Firebase プロジェクト ID は
+  作成後不変だが、ユーザー向けの見た目はカスタムドメインで完全に切り離せるため、
+  プロジェクト ID の改称可否がプロダクトのリブランディングを妨げる理由にはならない。
+- **IaC のカバレッジが高いほど「作り直し」のコストは下がる**。ADR-012 で個別リソースを
+  Terraform 管理下に置いていたことが、今回のクォータ制約への迅速な方針転換を可能にした。
 - `process_batch` が `understand_batch()` を最初に1回呼び、各ファイルの `DocumentPlan` を取得してから並列処理する

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Marketing Mail Generator",
+  title: "EventTune",
   description: "AIによる個別カスタマイズメール一括生成",
 };
 

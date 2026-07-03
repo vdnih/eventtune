@@ -4,7 +4,7 @@
 責務分割の全体像は `docs/INFRA_ARCHITECTURE.md` / ADR-012 を参照。
 
 ## 何を Terraform が持つか
-- API 有効化 / Artifact Registry / Cloud Run(`mmg-api`) / 実行 SA + IAM
+- API 有効化 / Artifact Registry / Cloud Run(`eventtune-api`) / 実行 SA + IAM
 - Firestore データベース本体 / 既定 Storage バケット + ライフサイクル
 - Firebase プロジェクト紐付け / Web アプリ / App Hosting backend
 - GitHub Actions 用 WIF + デプロイ SA

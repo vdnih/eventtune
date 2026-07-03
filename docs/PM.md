@@ -66,10 +66,10 @@ BtoB SaaS・製造業・コンサルなど、**商談後のフォローアップ
 | タスク | 担当 | 完了 |
 |--------|------|------|
 | Firebase プロジェクト作成（Auth / Firestore / Storage 有効化） | - | [ ] |
-| Cloud Run サービス `mmg-api` デプロイ（ヘルスチェックのみ） | - | [ ] |
+| Cloud Run サービス `eventtune-api` デプロイ（ヘルスチェックのみ） | - | [ ] |
 | Firebase Auth Google Sign-In の Next.js 動作確認 | - | [ ] |
 | Firestore セキュリティルール デプロイ | - | [ ] |
-| サービスアカウント `mmg-api-sa` と IAM ロール設定 | - | [ ] |
+| サービスアカウント `eventtune-api-sa` と IAM ロール設定 | - | [ ] |
 
 ### Milestone 2: データパイプライン（Day 1 PM / 目安 6h）
 | タスク | 担当 | 完了 |

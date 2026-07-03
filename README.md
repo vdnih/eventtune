@@ -1,13 +1,17 @@
-# Event Marketing AI Platform
+# EventTune — イベントマーケティング・インテリジェンス
+
+EventTune は、単なるメール生成ツールではありません。展示会・セミナーで生まれた出会いを意味で
+統合し、根拠つきの個別フォローと振り返り分析を実行する、イベントマーケティング・
+インテリジェンスです。
 
 展示会・セミナー・イベントで集めたカオスなマーケティングデータを **オントロジー** に統合し、
 AIエージェントがその上でマーケティング活動（個別フォローアップメール生成・イベント振り返り分析・
 戦略レポート）を行う **マルチテナント SaaS プラットフォーム**。
 
-単なるメール生成ツールではない。イベントを中心軸に、ハウスリスト・KPI・費用・アンケートを束ね、
-「相手の状況・課題・温度感」をAIが読み解いてふさわしい構成と言葉を選ぶ。個別カスタマイズは
-**Static Core & Dynamic Context**（不変のコア＝自社の機能・価値は固定し、動的な文脈＝相手の悩みだけを
-AIが最適化する）という設計思想に基づく（[docs/MARKETING_PHILOSOPHY.md](docs/MARKETING_PHILOSOPHY.md)）。
+イベントを中心軸に、ハウスリスト・KPI・費用・アンケートを束ね、「相手の状況・課題・温度感」を
+AIが読み解いてふさわしい構成と言葉を選ぶ。個別カスタマイズは **Static Core & Dynamic Context**
+（不変のコア＝自社の機能・価値は固定し、動的な文脈＝相手の悩みだけを AIが最適化する）という
+設計思想に基づく（[docs/MARKETING_PHILOSOPHY.md](docs/MARKETING_PHILOSOPHY.md)）。
 
 ## コア体験
 
@@ -61,7 +65,7 @@ AIが最適化する）という設計思想に基づく（[docs/MARKETING_PHILO
 ## ディレクトリ構成
 
 ```
-marketing-mail-generator/
+eventtune/
 ├── frontend/                          # Next.js 15 (App Router, SSR)
 │   ├── app/
 │   │   ├── (auth)/login/

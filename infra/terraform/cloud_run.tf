@@ -1,7 +1,7 @@
 # バックエンド API（FastAPI + ADK）。仕様は docs/INFRA_ARCHITECTURE.md を踏襲。
 resource "google_cloud_run_v2_service" "mmg_api" {
   project  = var.project_id
-  name     = "mmg-api"
+  name     = "eventtune-api"
   location = var.region
 
   deletion_protection = false

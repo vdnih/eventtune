@@ -1,5 +1,5 @@
 output "cloud_run_url" {
-  description = "mmg-api の URL（apphosting.yaml の NEXT_PUBLIC_API_URL / frontend_origin 設定に使う）"
+  description = "eventtune-api の URL（apphosting.yaml の NEXT_PUBLIC_API_URL / frontend_origin 設定に使う）"
   value       = google_cloud_run_v2_service.mmg_api.uri
 }
 

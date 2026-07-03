@@ -56,7 +56,7 @@ variable "github_owner" {
 variable "github_repo" {
   description = "GitHub リポジトリ名"
   type        = string
-  default     = "marketing-mail-generator"
+  default     = "eventtune"
 }
 
 variable "storage_location" {
