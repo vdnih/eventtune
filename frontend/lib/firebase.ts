@@ -1,5 +1,5 @@
 import { initializeApp, getApps } from "firebase/app";
-import { getAuth, GoogleAuthProvider } from "firebase/auth";
+import { getAuth, connectAuthEmulator, GoogleAuthProvider } from "firebase/auth";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY!,
@@ -13,4 +13,13 @@ const firebaseConfig = {
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 
 export const auth = getAuth(app);
+
+// E2E テスト・ローカル開発用: env が設定されているときだけ Auth エミュレータへ接続する。
+// 本番ビルドではこの env を設定しないため挙動は変わらない。
+if (process.env.NEXT_PUBLIC_AUTH_EMULATOR_HOST) {
+  connectAuthEmulator(auth, `http://${process.env.NEXT_PUBLIC_AUTH_EMULATOR_HOST}`, {
+    disableWarnings: true,
+  });
+}
+
 export const googleProvider = new GoogleAuthProvider();

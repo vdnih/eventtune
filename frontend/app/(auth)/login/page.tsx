@@ -1,6 +1,6 @@
 "use client";
 
-import { signInWithPopup } from "firebase/auth";
+import { signInAnonymously, signInWithPopup } from "firebase/auth";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import Link from "next/link";
@@ -18,6 +18,21 @@ export default function LoginPage() {
     setError("");
     try {
       await signInWithPopup(auth, googleProvider);
+      router.push("/dashboard");
+    } catch {
+      setError("ログインに失敗しました。もう一度お試しください。");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // E2E テスト用: Auth エミュレータ接続時のみ有効な匿名ログイン。
+  // 本番ビルドでは NEXT_PUBLIC_AUTH_EMULATOR_HOST が未設定のためボタンごと消える。
+  async function handleEmulatorSignIn() {
+    setLoading(true);
+    setError("");
+    try {
+      await signInAnonymously(auth);
       router.push("/dashboard");
     } catch {
       setError("ログインに失敗しました。もう一度お試しください。");
@@ -72,6 +87,16 @@ export default function LoginPage() {
           </svg>
           {loading ? "ログイン中..." : "Googleでログイン"}
         </button>
+
+        {process.env.NEXT_PUBLIC_AUTH_EMULATOR_HOST && (
+          <button
+            onClick={handleEmulatorSignIn}
+            disabled={loading}
+            className="mt-3 w-full px-4 py-2 border border-dashed border-gray-300 rounded-lg text-gray-500 text-sm hover:bg-gray-50 transition disabled:opacity-50"
+          >
+            テストユーザーでログイン（エミュレータ）
+          </button>
+        )}
 
         <p className="mt-6 text-xs text-gray-400 leading-relaxed">
           ログインすることで、
