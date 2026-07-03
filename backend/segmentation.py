@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from google import genai
+from google.cloud.firestore import FieldFilter
 from google.genai import types
 from pydantic import BaseModel
 
@@ -53,7 +54,7 @@ def _iter_persons(space: SpaceContext, event_id: Optional[str] = None) -> Iterat
     未指定なら persons を直接 stream する。
     """
     if event_id:
-        att_docs = space.col("event_attendances").where("event_id", "==", event_id).stream()
+        att_docs = space.col("event_attendances").where(filter=FieldFilter("event_id", "==", event_id)).stream()
         person_ids = [a.to_dict().get("person_id") for a in att_docs]
         for pid in (p for p in person_ids if p):
             doc = space.doc(f"persons/{pid}").get()
@@ -72,7 +73,7 @@ def _get_product_interests(space: SpaceContext, person_id: str) -> tuple[list[st
     製品名は products マスタ（データ駆動）から解決する。旧 ProductCode のハードコード
     マッピングは撤去し、取り込みで生成された Product.product_name を参照する。
     """
-    docs = space.col("product_interests").where("person_id", "==", person_id).stream()
+    docs = space.col("product_interests").where(filter=FieldFilter("person_id", "==", person_id)).stream()
     product_ids = [d.to_dict().get("product_id", "") for d in docs if d.to_dict()]
     names: list[str] = []
     for pid in product_ids:

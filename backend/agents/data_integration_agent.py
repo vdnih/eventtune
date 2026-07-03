@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import pandas as pd
 from google import genai
+from google.cloud.firestore import FieldFilter
 from google.genai import types
 from pydantic import BaseModel
 
@@ -987,7 +988,7 @@ async def _derive_person_appeal(
 
             encounters: list[dict] = []
             try:
-                atts = db.collection("event_attendances").where("person_id", "==", pid).get()
+                atts = db.collection("event_attendances").where(filter=FieldFilter("person_id", "==", pid)).get()
             except Exception:
                 atts = []
             for a in atts:
@@ -1003,7 +1004,7 @@ async def _derive_person_appeal(
 
             interests: list[str] = []
             try:
-                pis = db.collection("product_interests").where("person_id", "==", pid).get()
+                pis = db.collection("product_interests").where(filter=FieldFilter("person_id", "==", pid)).get()
             except Exception:
                 pis = []
             for pi in pis:

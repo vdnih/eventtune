@@ -30,6 +30,10 @@ import argparse
 import os
 import sys
 
+# grpc C-core の fork検知ログ（ev_poll_posix 等）を抑制。実害のないINFOログのため。
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
+
 import firebase_admin
 from firebase_admin import firestore
 

@@ -108,7 +108,7 @@ async def list_my_spaces(user: dict = Depends(get_current_user)):
     uid = user.get("uid")
     db = firestore.client()
     member_docs = (
-        db.collection_group("members").where("user_id", "==", uid).get()
+        db.collection_group("members").where(filter=firestore.FieldFilter("user_id", "==", uid)).get()
     )
     spaces = []
     for m in member_docs:

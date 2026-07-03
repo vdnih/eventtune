@@ -13,6 +13,12 @@ service cloud.firestore {
         && exists(/databases/$(database)/documents/spaces/$(spaceId)/members/$(request.auth.uid));
     }
 
+    // アプリとしてのユーザー本体（同意状態など）。本人のみ read 可、書込は Admin SDK のみ。
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+    }
+
     match /spaces/{spaceId} {
       // スペース本体・配下の全データ（events / members / usage / ...）はメンバーのみ read 可
       allow read: if isMember(spaceId);
