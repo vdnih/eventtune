@@ -86,12 +86,8 @@ def _count_collection(db, path: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("space_id", help="対象スペースID（例: space_8b33f288e0f1）")
-    parser.add_argument(
-        "--dry-run", action="store_true", help="削除せず件数だけ表示する"
-    )
-    parser.add_argument(
-        "--force", action="store_true", help="対話確認をスキップして即削除する"
-    )
+    parser.add_argument("--dry-run", action="store_true", help="削除せず件数だけ表示する")
+    parser.add_argument("--force", action="store_true", help="対話確認をスキップして即削除する")
     args = parser.parse_args()
 
     settings = Settings(_env_file=_ENV_PATH)

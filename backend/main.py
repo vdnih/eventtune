@@ -1,6 +1,7 @@
 import os
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # grpc C-core の fork検知ログ（ev_poll_posix 等）を抑制。uvicorn --reload 等の

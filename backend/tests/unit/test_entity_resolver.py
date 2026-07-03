@@ -51,7 +51,9 @@ def test_blank_name_resolves_to_none():
 
 
 def test_person_key_prefers_email_then_name_company():
-    assert _person_key("田中", "Tanaka@Acme.co.jp", "ACME") == _person_key("別名", "tanaka@acme.co.jp", "他社")
+    assert _person_key("田中", "Tanaka@Acme.co.jp", "ACME") == _person_key(
+        "別名", "tanaka@acme.co.jp", "他社"
+    )
     # email 無しは name|company で識別
     k1 = _person_key("田中太郎", "", "ACME")
     k2 = _person_key("田中太郎", "", "別会社")

@@ -23,7 +23,7 @@ from ontology import Plan
 
 # 入力/出力トークン → クレジット（モデル別）
 TOKEN_CREDIT_RATES: dict[str, dict[str, float]] = {
-    "gemini-3.5-flash":      {"input": 0.000001,  "output": 0.000004},
+    "gemini-3.5-flash": {"input": 0.000001, "output": 0.000004},
     "gemini-3.1-flash-lite": {"input": 0.0000003, "output": 0.0000012},
 }
 _DEFAULT_TOKEN_RATE = {"input": 0.000002, "output": 0.000008}
@@ -37,8 +37,8 @@ _DEFAULT_TIME_RATE = 0.0000005
 
 # ── プラン上限（月次クレジット） ───────────────────────────────────────────────
 PLAN_MONTHLY_CREDIT_LIMIT: dict[Plan, float] = {
-    Plan.FREE:    1_000.0,
-    Plan.PRO:     50_000.0,
+    Plan.FREE: 1_000.0,
+    Plan.PRO: 50_000.0,
     Plan.PREMIUM: 500_000.0,
 }
 

@@ -1,19 +1,18 @@
 from enum import Enum
-from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
-
 # ── Space（テナント）/ メンバー / 利用状況 ─────────────────────────────────────
 
+
 class Role(str, Enum):
-    OWNER  = "owner"
+    OWNER = "owner"
     MEMBER = "member"
 
 
 class Plan(str, Enum):
-    FREE    = "free"
-    PRO     = "pro"
+    FREE = "free"
+    PRO = "pro"
     PREMIUM = "premium"
 
 
@@ -41,25 +40,29 @@ class UsagePeriod(BaseModel):
     - llm:     モデル種別ごとの入出力トークン   {model: {"input_tokens": int, "output_tokens": int}}
     - compute: リソース種別ごとの実行時間(ms)   {resource_type: {"ms": int}}
     """
+
     period: str
-    llm: Dict[str, Dict[str, int]] = {}
-    compute: Dict[str, Dict[str, int]] = {}
+    llm: dict[str, dict[str, int]] = {}
+    compute: dict[str, dict[str, int]] = {}
 
 
 # ── 共通 Enum ────────────────────────────────────────────────────────────────
 
+
 class ContactStage(str, Enum):
-    LEAD     = "LEAD"
-    MQL      = "MQL"
-    SQL      = "SQL"
+    LEAD = "LEAD"
+    MQL = "MQL"
+    SQL = "SQL"
     CUSTOMER = "CUSTOMER"
     EXCLUDED = "EXCLUDED"
 
 
 # ── マスターデータ ─────────────────────────────────────────────────────────────
 
+
 class Account(BaseModel):
     """企業マスター。Person を束ねる単位。"""
+
     account_id: str
     space_id: str
     account_name: str
@@ -72,34 +75,37 @@ class Person(BaseModel):
     """個人（旧 Contact を分解・再定義）。
     企業情報は Account へ、参加履歴は EventAttendance へ、製品興味は ProductInterest へ分離。
     """
+
     person_id: str
     space_id: str
-    account_id: Optional[str] = None
+    account_id: str | None = None
     name: str
-    email: Optional[str] = None
+    email: str | None = None
     department: str = ""
     job_title: str = ""
     stage: ContactStage = ContactStage.LEAD
     # 接客事実（課題感・メモ）は EventAttendance へ移譲（ADR-011）。
     # 本人の関心・文脈は appeal_summary に全 attendance を集約してロールアップ生成する。
     appeal_summary: str = ""
-    appeal_vector: List[float] = []
-    source_job_id: Optional[str] = None
+    appeal_vector: list[float] = []
+    source_job_id: str | None = None
     created_at: str = ""
 
 
 class Product(BaseModel):
     """製品マスター。"""
+
     product_id: str
     space_id: str
     product_name: str
     product_category: str = ""
     appeal_summary: str = ""
-    appeal_vector: List[float] = []
+    appeal_vector: list[float] = []
     created_at: str = ""
 
 
 # ── ファクトデータ ─────────────────────────────────────────────────────────────
+
 
 class EventAttendance(BaseModel):
     """イベント参加ファクト（Person × Event の多対多）。
@@ -107,53 +113,56 @@ class EventAttendance(BaseModel):
     接客(encounter)時の事実をここに保持する（ADR-011）: 接客担当・課題感・所感メモ。
     Person.appeal_summary はこれら全 attendance を集約して導出される。
     """
+
     attendance_id: str
     space_id: str
     person_id: str
     event_id: str
     action_type: str = "参加"  # "申し込み" | "参加" | "アンケート高評価"
-    owner_staff: str = ""      # 接客担当者
-    challenge_note: str = ""   # その接客で把握した課題感
-    memo: str = ""             # 所感・要望・注意などの自由メモ
-    source_job_id: Optional[str] = None
+    owner_staff: str = ""  # 接客担当者
+    challenge_note: str = ""  # その接客で把握した課題感
+    memo: str = ""  # 所感・要望・注意などの自由メモ
+    source_job_id: str | None = None
     created_at: str = ""
 
 
 class ProductInterest(BaseModel):
     """製品関心ファクト（Person × Product の多対多）。"""
+
     interest_id: str
     space_id: str
     person_id: str
     product_id: str
     interest_status: str = "興味あり"  # "興味あり" | "デモ実施済み" | "キャンセル"
-    source_job_id: Optional[str] = None
+    source_job_id: str | None = None
     created_at: str = ""
 
 
 class CostCategory(str, Enum):
-    VENUE        = "会場費・出展費"
+    VENUE = "会場費・出展費"
     BOOTH_DESIGN = "ブース装飾・設営"
-    MARKETING    = "集客"
-    SPEAKER      = "登壇者"
-    STAFFING     = "人件費・派遣"
-    TRAVEL       = "交通・宿泊"
-    PRINTING     = "印刷・販促物・ノベルティ"
-    OPERATIONS   = "運営"
-    CATERING     = "飲食・接待"
-    OTHER        = "その他"
+    MARKETING = "集客"
+    SPEAKER = "登壇者"
+    STAFFING = "人件費・派遣"
+    TRAVEL = "交通・宿泊"
+    PRINTING = "印刷・販促物・ノベルティ"
+    OPERATIONS = "運営"
+    CATERING = "飲食・接待"
+    OTHER = "その他"
 
 
 class CostItem(BaseModel):
     """費用ファクト（Event に紐づく費用明細）。展示会・セミナー共通。"""
+
     cost_id: str
     space_id: str
     event_id: str
     category: CostCategory
     description: str
     amount_jpy: float
-    vendor_name: Optional[str] = None
-    invoice_date: Optional[str] = None
-    source_job_id: Optional[str] = None
+    vendor_name: str | None = None
+    invoice_date: str | None = None
+    source_job_id: str | None = None
     created_at: str = ""
 
 
@@ -164,15 +173,16 @@ class CostSummary(BaseModel):
 
 # ── Event ─────────────────────────────────────────────────────────────────────
 
+
 class EventType(str, Enum):
-    TRADE_SHOW    = "展示会"
-    SEMINAR       = "セミナー"
+    TRADE_SHOW = "展示会"
+    SEMINAR = "セミナー"
     PRIVATE_EVENT = "プライベートイベント"
 
 
 class EventStatus(str, Enum):
-    PLANNED   = "計画中"
-    ACTIVE    = "開催中"
+    PLANNED = "計画中"
+    ACTIVE = "開催中"
     COMPLETED = "終了"
 
 
@@ -183,6 +193,7 @@ class Event(BaseModel):
     その場合 identity フィールドのみのスタブとして書き込まれ、後から概要ファイル等で
     詳細が merge される。スタブが read 側で valid となるよう必須スカラーに既定値を持つ。
     """
+
     event_id: str
     space_id: str = ""
     name: str
@@ -191,72 +202,76 @@ class Event(BaseModel):
     venue: str = ""
     event_date: str = ""
     event_date_end: str = ""
-    booth_number: Optional[str] = None
+    booth_number: str | None = None
     total_budget: float = 0.0
     target_contact_count: int = 0
     description: str = ""
     created_at: str = ""
     updated_at: str = ""
     # KPI（旧 EventKPI から畳み込み）
-    total_visitors_to_booth: Optional[int] = None
-    total_contacts_collected: Optional[int] = None
-    appointments_booked: Optional[int] = None
-    demo_sessions_held: Optional[int] = None
-    follow_email_open_rate: Optional[float] = None
-    follow_email_reply_rate: Optional[float] = None
-    pipeline_value_jpy: Optional[float] = None
-    closed_deals_3m: Optional[int] = None
-    closed_revenue_3m_jpy: Optional[float] = None
+    total_visitors_to_booth: int | None = None
+    total_contacts_collected: int | None = None
+    appointments_booked: int | None = None
+    demo_sessions_held: int | None = None
+    follow_email_open_rate: float | None = None
+    follow_email_reply_rate: float | None = None
+    pipeline_value_jpy: float | None = None
+    closed_deals_3m: int | None = None
+    closed_revenue_3m_jpy: float | None = None
     # Survey 集計値（旧 SurveyResponse から畳み込み）
-    nps_score: Optional[float] = None
-    total_survey_responses: Optional[int] = None
+    nps_score: float | None = None
+    total_survey_responses: int | None = None
     # Semantic layer
     appeal_summary: str = ""
-    appeal_vector: List[float] = []
+    appeal_vector: list[float] = []
 
 
 # ── Content（旧 ContentAsset を改名・拡張）───────────────────────────────────
 
+
 class ContentType(str, Enum):
     SEMINAR_UPCOMING = "未来のセミナー（募集中）"
-    EVENT_UPCOMING   = "未来のイベント（募集中）"
-    WHITE_PAPER      = "資料・ホワイトペーパー"
-    CASE_STUDY       = "導入事例"
-    WEBINAR_ARCHIVE  = "ウェビナーアーカイブ"
+    EVENT_UPCOMING = "未来のイベント（募集中）"
+    WHITE_PAPER = "資料・ホワイトペーパー"
+    CASE_STUDY = "導入事例"
+    WEBINAR_ARCHIVE = "ウェビナーアーカイブ"
 
 
 class Content(BaseModel):
     """コンテンツアセット（旧 ContentAsset を改名）。"""
+
     content_id: str
     space_id: str = ""
     content_name: str
     content_type: ContentType
     url: str
     description: str = ""
-    linked_event_id: Optional[str] = None
+    linked_event_id: str | None = None
     appeal_summary: str = ""
-    appeal_vector: List[float] = []
+    appeal_vector: list[float] = []
 
 
 # ── Segment ───────────────────────────────────────────────────────────────────
 
+
 class SegmentAxis(BaseModel):
     name: str
-    values: List[str]
+    values: list[str]
 
 
 class Segment(BaseModel):
     segment_id: str
     name: str
     purpose: str
-    axes: List[SegmentAxis]
-    buckets: List[str]
+    axes: list[SegmentAxis]
+    buckets: list[str]
     criteria: str
     created_at: str
 
 
 class SegmentSnapshot(BaseModel):
     """セグメント割り当てのスナップショット（バージョン管理）。"""
+
     snapshot_id: str
     segment_id: str
     space_id: str
@@ -267,6 +282,7 @@ class SegmentSnapshot(BaseModel):
 
 class SegmentAssignment(BaseModel):
     """1人のセグメントにおける所属バケットと根拠。"""
+
     person_id: str
     segment_id: str
     snapshot_id: str
@@ -278,11 +294,12 @@ class SegmentAssignment(BaseModel):
 
 # ── Deliverable（旧 ComposedEmail / EmailBlock を汎用化）────────────────────
 
+
 class DeliverableBlock(BaseModel):
     block_type: str
     block_text: str = ""
     reason_for_inclusion: str  # Optional 不可
-    associated_asset_ids: List[str] = []
+    associated_asset_ids: list[str] = []
 
 
 class DeliverablePattern(BaseModel):
@@ -291,33 +308,36 @@ class DeliverablePattern(BaseModel):
     pattern_id は "{bucket}__{format}" 規約。本文中の個人差分はプレースホルダで表現し、
     組み立て（run_assembly）で決定論的に置換する。
     """
+
     pattern_id: str
     segment_id: str = ""
     bucket: str
     format: str = "EMAIL"  # "EMAIL" | "TALK_SCRIPT" | "PROPOSAL"
     subject: str = ""
-    blocks: List[DeliverableBlock] = []
+    blocks: list[DeliverableBlock] = []
     created_at: str = ""
 
 
 class Deliverable(BaseModel):
     """生成成果物（メール / トークスクリプト / 提案書 など）。"""
+
     deliverable_id: str
     space_id: str
     run_id: str
     person_id: str
-    event_id: Optional[str] = None
-    snapshot_id: Optional[str] = None
-    pattern_id: Optional[str] = None
+    event_id: str | None = None
+    snapshot_id: str | None = None
+    pattern_id: str | None = None
     format: str = "EMAIL"  # "EMAIL" | "TALK_SCRIPT" | "PROPOSAL"
     bucket: str = ""
-    subject: Optional[str] = None
-    blocks: List[DeliverableBlock] = []
+    subject: str | None = None
+    blocks: list[DeliverableBlock] = []
     created_at: str = ""
 
 
 class MarketingRun(BaseModel):
     """個別カスタマイズの組み立てジョブ（marketing_runs/{run_id}）。"""
+
     run_id: str
     space_id: str = ""
     status: str = "running"  # "running" | "done" | "error"
@@ -332,10 +352,11 @@ class MarketingRun(BaseModel):
 
 # ── 統合ジョブ（旧 DataLineage + integration_batches を統合）────────────────
 
+
 class ColumnMappingResult(BaseModel):
     entity_type: str
     column_map: dict[str, str]
-    unmapped_columns: List[str] = []
+    unmapped_columns: list[str] = []
     # 行ごとに異なるリンク先（マスタ）を識別する列。{kind: カラム名}。
     # kind は "event" | "account" | "product"。旧 event_routing_column を一般化したもの。
     link_columns: dict[str, str] = {}
@@ -346,21 +367,22 @@ class ColumnMappingResult(BaseModel):
 
 class DocumentPlan(BaseModel):
     """AI Extract Step1 の出力。1ファイルの業務的理解結果。integration_jobs に保存する。"""
-    business_context: str = ""     # "2025秋展示会の参加者接客記録"
-    entity_type: str = ""          # "persons" | "events" | "products" | ...
-    source_file_role: str = ""     # "participant_list" | "event_master" | "costs" | ...
+
+    business_context: str = ""  # "2025秋展示会の参加者接客記録"
+    entity_type: str = ""  # "persons" | "events" | "products" | ...
+    source_file_role: str = ""  # "participant_list" | "event_master" | "costs" | ...
     link_hints: dict[str, str] = {}  # {"event": "2025秋展示会"}
     column_map: dict[str, str] = {}  # {"氏名": "name", "社名": "account_name", ...}
     unmapped_notes: str = ""
 
 
 class DocumentExtractionResult(BaseModel):
-    detected_entity_types: List[str]
-    events: List[dict] = []
-    event_kpi: Optional[dict] = None
-    cost_items: Optional[List[dict]] = None
-    survey_response: Optional[dict] = None
-    content_assets: Optional[List[dict]] = None
+    detected_entity_types: list[str]
+    events: list[dict] = []
+    event_kpi: dict | None = None
+    cost_items: list[dict] | None = None
+    survey_response: dict | None = None
+    content_assets: list[dict] | None = None
 
 
 class TransformDecision(BaseModel):
@@ -374,7 +396,7 @@ class EntityTransformation(BaseModel):
     entity_type: str
     entity_id: str
     source_label: str
-    decisions: List[TransformDecision] = []
+    decisions: list[TransformDecision] = []
 
 
 class SkippedRecord(BaseModel):
@@ -391,20 +413,21 @@ class TransformationSummary(BaseModel):
 
 class IntegrationJob(BaseModel):
     """データ統合ジョブ（旧 DataLineage + integration_batches を統合）。"""
+
     job_id: str
     space_id: str
-    filenames: List[str] = []
+    filenames: list[str] = []
     # ユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正に使う）。
     hint: str = ""
     status: str = "queued"  # "queued" | "running" | "done" | "error"
     created_entities: dict[str, int] = {}
     # このジョブで解決・生成したリンク先マスタの要約 [{kind, name, id}]。
-    resolved_links: List[dict] = []
-    column_mapping: Optional[DocumentPlan] = None
-    raw_extraction: Optional[dict] = None
-    transformations: List[EntityTransformation] = []
-    skipped_records: List[SkippedRecord] = []
-    transformation_summary: Optional[TransformationSummary] = None
+    resolved_links: list[dict] = []
+    column_mapping: DocumentPlan | None = None
+    raw_extraction: dict | None = None
+    transformations: list[EntityTransformation] = []
+    skipped_records: list[SkippedRecord] = []
+    transformation_summary: TransformationSummary | None = None
     partial: bool = False
-    error: Optional[str] = None
+    error: str | None = None
     created_at: str = ""

@@ -41,6 +41,7 @@ def load_space_data(space: SpaceContext) -> SpaceData:
     スキップする（例外は上位に伝播させない）。
     """
     import logging
+
     logger = logging.getLogger(__name__)
 
     def _stream(col_name: str, model_class):

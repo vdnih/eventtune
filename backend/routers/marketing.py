@@ -4,11 +4,11 @@ Marketing Router — /api/marketing
 MarketingAgent とのチャット（SSE）と、メール生成ランの管理を担う。
 """
 
+import io
 import json
 import logging
 
 import pandas as pd
-import io
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api/marketing", tags=["marketing"])
 
 
 # ── チャット (SSE) ──────────────────────────────────────────────────────────
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -38,23 +39,25 @@ async def chat(
     MarketingAgent とのチャット。Server-Sent Events でストリーミングする。
     各イベントは JSON 文字列として `data: {...}\n\n` 形式で送信される。
     """
-    from agents.marketing_agent import chat_stream, ensure_session
     import thread_store
+    from agents.marketing_agent import chat_stream, ensure_session
 
     # Agent Engine の session_id はサーバ採番。既存IDは resume、未指定なら新規採番する。
     # ここで確定させ、X-Session-Id ヘッダ・thread_store・chat_stream で同一IDを使う。
     try:
         session_id = await ensure_session(body.session_id, space)
-    except Exception:
+    except Exception as e:
         logger.exception("ensure_session failed")
-        raise HTTPException(status_code=502, detail="セッションの初期化に失敗しました")
+        raise HTTPException(status_code=502, detail="セッションの初期化に失敗しました") from e
 
     async def event_generator():
         # スレッドを upsert し、user メッセージを再表示用スナップショットとして保存する。
         # 永続化の失敗はチャット自体を止めない（ベストエフォート）。
         try:
             thread_store.touch_thread(space, session_id, body.message)
-            thread_store.append_message(space, session_id, {"role": "user", "content": body.message})
+            thread_store.append_message(
+                space, session_id, {"role": "user", "content": body.message}
+            )
         except Exception:
             logger.exception("thread persist (user) failed: session_id=%s", session_id)
 
@@ -74,7 +77,9 @@ async def chat(
                 if etype == "text":
                     acc_text += event.get("text", "")
                 elif etype == "tool_call":
-                    tool_calls.append({"tool_name": event.get("tool_name"), "args": event.get("args", {})})
+                    tool_calls.append(
+                        {"tool_name": event.get("tool_name"), "args": event.get("args", {})}
+                    )
                 elif etype == "tool_result":
                     rid = thread_store.extract_run_id_from_result(event)
                     if rid:
@@ -174,16 +179,17 @@ async def export_run_results(
         blocks = dlv.get("blocks", [])
         full_text = "\n\n".join(b.get("block_text", "") for b in blocks)
         reasons = "\n".join(
-            f"[{b.get('block_type','')}] {b.get('reason_for_inclusion','')}"
-            for b in blocks
+            f"[{b.get('block_type', '')}] {b.get('reason_for_inclusion', '')}" for b in blocks
         )
-        rows.append({
-            "person_id": dlv.get("person_id", ""),
-            "bucket": dlv.get("bucket", ""),
-            "件名": dlv.get("subject", ""),
-            "本文（全体）": full_text,
-            "包含根拠": reasons,
-        })
+        rows.append(
+            {
+                "person_id": dlv.get("person_id", ""),
+                "bucket": dlv.get("bucket", ""),
+                "件名": dlv.get("subject", ""),
+                "本文（全体）": full_text,
+                "包含根拠": reasons,
+            }
+        )
 
     df = pd.DataFrame(rows)
     buf = io.BytesIO()

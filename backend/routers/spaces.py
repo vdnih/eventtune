@@ -11,7 +11,7 @@ Spaces Router — /api/spaces
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from firebase_admin import auth, firestore
@@ -27,14 +27,15 @@ router = APIRouter(prefix="/api/spaces", tags=["spaces"])
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _period() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return datetime.now(UTC).strftime("%Y-%m")
 
 
 # ── スキーマ ──────────────────────────────────────────────────────────────────
+
 
 class CreateSpaceRequest(BaseModel):
     name: str
@@ -57,6 +58,7 @@ class UpdateMemberRequest(BaseModel):
 
 
 # ── スペース CRUD ─────────────────────────────────────────────────────────────
+
 
 @router.post("", status_code=201)
 async def create_space(body: CreateSpaceRequest, user: dict = Depends(get_current_user)):
@@ -108,16 +110,20 @@ async def list_my_spaces(user: dict = Depends(get_current_user)):
     uid = user.get("uid")
     db = firestore.client()
     member_docs = (
-        db.collection_group("members").where(filter=firestore.FieldFilter("user_id", "==", uid)).get()
+        db.collection_group("members")
+        .where(filter=firestore.FieldFilter("user_id", "==", uid))
+        .get()
     )
     spaces = []
     for m in member_docs:
         data = m.to_dict()
-        spaces.append({
-            "space_id": data.get("space_id"),
-            "name": data.get("space_name"),
-            "role": data.get("role"),
-        })
+        spaces.append(
+            {
+                "space_id": data.get("space_id"),
+                "name": data.get("space_name"),
+                "role": data.get("role"),
+            }
+        )
     spaces.sort(key=lambda s: s.get("name") or "")
     return {"spaces": spaces, "count": len(spaces)}
 
@@ -168,6 +174,7 @@ async def delete_space(space_id: str, space: SpaceContext = Depends(require_owne
 
 # ── メンバー管理 ──────────────────────────────────────────────────────────────
 
+
 @router.get("/{space_id}/members")
 async def list_members(space_id: str, space: SpaceContext = Depends(get_space_context)):
     """スペースのメンバー一覧を返す（メンバーのみ）。"""
@@ -193,8 +200,8 @@ async def invite_member(
 
     try:
         invited = auth.get_user_by_email(body.email)
-    except Exception:
-        raise HTTPException(status_code=404, detail="No user found with that email")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail="No user found with that email") from e
 
     role = body.role if body.role in ("owner", "member") else "member"
     member_ref = space.doc(f"members/{invited.uid}")
@@ -262,6 +269,7 @@ async def remove_member(
 
 
 # ── 利用状況（メータリング） ──────────────────────────────────────────────────
+
 
 @router.get("/{space_id}/usage")
 async def get_usage(space_id: str, space: SpaceContext = Depends(get_space_context)):

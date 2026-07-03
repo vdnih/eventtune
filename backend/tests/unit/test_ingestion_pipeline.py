@@ -10,21 +10,21 @@
 
 import asyncio
 
-import semantic_search
-from agents.ontology_mapper import InterpretedRecord, MapResult, PersonObservation
 import agents.data_integration_agent as agent
+import semantic_search
 from agents.data_integration_agent import (
     EntityResolver,
-    _FileInterpretation,
     _bind_facts,
     _conform_masters,
     _derive_person_appeal,
+    _FileInterpretation,
     _load_existing,
     _load_existing_persons,
 )
-
+from agents.ontology_mapper import InterpretedRecord, MapResult, PersonObservation
 
 # ── Fake Firestore（ScopedClient 互換の最小実装）─────────────────────────────────
+
 
 class _Snap:
     def __init__(self, path, data):
@@ -71,7 +71,7 @@ class _Collection:
         out = []
         prefix = self._name + "/"
         for path, data in self._store.items():
-            if path.startswith(prefix) and "/" not in path[len(prefix):]:
+            if path.startswith(prefix) and "/" not in path[len(prefix) :]:
                 out.append(_Snap(path, data))
         return out
 
@@ -102,20 +102,26 @@ def _interp(map_result) -> _FileInterpretation:
 
 def _run(db, interps, default_event=""):
     resolvers = {
-        "events": EntityResolver("event", _load_existing(db, "events", "name", "event_id"), "event_"),
+        "events": EntityResolver(
+            "event", _load_existing(db, "events", "name", "event_id"), "event_"
+        ),
         "accounts": EntityResolver(
-            "account", _load_existing(db, "accounts", "account_name", "account_id"), "account_"),
+            "account", _load_existing(db, "accounts", "account_name", "account_id"), "account_"
+        ),
         "products": EntityResolver(
-            "product", _load_existing(db, "products", "product_name", "product_id"), "product_"),
+            "product", _load_existing(db, "products", "product_name", "product_id"), "product_"
+        ),
         "contents": EntityResolver(
-            "content", _load_existing(db, "contents", "content_name", "content_id"), "content_"),
+            "content", _load_existing(db, "contents", "content_name", "content_id"), "content_"
+        ),
         "persons": EntityResolver("person", _load_existing_persons(db), "person_", fuzzy=False),
     }
 
     async def go():
         batch_event_ids = await _conform_masters(db, None, interps, default_event, resolvers)
         touched = await _bind_facts(
-            db, None, interps, resolvers, default_event, "job_x", batch_event_ids=batch_event_ids)
+            db, None, interps, resolvers, default_event, "job_x", batch_event_ids=batch_event_ids
+        )
         await _derive_person_appeal(db, None, touched)
         return touched
 
@@ -124,30 +130,45 @@ def _run(db, interps, default_event=""):
 
 def _docs(db, collection):
     prefix = collection + "/"
-    return [v for k, v in db.store.items()
-            if k.startswith(prefix) and "/" not in k[len(prefix):]]
+    return [v for k, v in db.store.items() if k.startswith(prefix) and "/" not in k[len(prefix) :]]
 
 
 def _event_record(name: str) -> InterpretedRecord:
     """テスト用: イベントの InterpretedRecord を直接生成する。"""
     from ontology import EventStatus, EventType
+
     return InterpretedRecord(
         kind="events",
         name=name,
-        payload={"name": name, "event_type": EventType.TRADE_SHOW, "status": EventStatus.COMPLETED,
-                 "venue": "", "event_date": "", "event_date_end": "", "booth_number": None,
-                 "total_budget": 0.0, "target_contact_count": 0, "description": "", "created_at": ""},
+        payload={
+            "name": name,
+            "event_type": EventType.TRADE_SHOW,
+            "status": EventStatus.COMPLETED,
+            "venue": "",
+            "event_date": "",
+            "event_date_end": "",
+            "booth_number": None,
+            "total_budget": 0.0,
+            "target_contact_count": 0,
+            "description": "",
+            "created_at": "",
+        },
     )
 
 
 def _content_record(name: str, event_name: str) -> InterpretedRecord:
     """テスト用: コンテンツの InterpretedRecord を直接生成する。"""
     from ontology import ContentType
+
     return InterpretedRecord(
         kind="contents",
         name=name,
-        payload={"content_name": name, "content_type": ContentType.WHITE_PAPER, "url": "http://x",
-                 "description": ""},
+        payload={
+            "content_name": name,
+            "content_type": ContentType.WHITE_PAPER,
+            "url": "http://x",
+            "description": "",
+        },
         links={"event": event_name},
     )
 
@@ -163,12 +184,18 @@ def test_pipeline_converges_links_and_dedups(monkeypatch):
     persons_result = MapResult(
         person_observations=[
             PersonObservation(
-                name="田中太郎", email="t@a.com", company_name="ACME",
-                event_link_name="２０２５秋 展示会", product_link_names=["プロダクトA"],
+                name="田中太郎",
+                email="t@a.com",
+                company_name="ACME",
+                event_link_name="２０２５秋 展示会",
+                product_link_names=["プロダクトA"],
             ),
             PersonObservation(
-                name="田中太郎", email="t@a.com", company_name="ACME",
-                event_link_name="２０２５秋 展示会", product_link_names=["プロダクトA"],
+                name="田中太郎",
+                email="t@a.com",
+                company_name="ACME",
+                event_link_name="２０２５秋 展示会",
+                product_link_names=["プロダクトA"],
             ),
         ]
     )
@@ -214,6 +241,7 @@ def test_pipeline_converges_links_and_dedups(monkeypatch):
 
 def test_solo_event_fallback_binds_linkless_persons(monkeypatch):
     """参加者ファイルにイベント列が無くても、バッチに単一イベントがあれば紐付く。"""
+
     async def _fake_build_appeal(kind, payload, space=None):
         return f"summary:{kind}", [0.1]
 
@@ -245,6 +273,7 @@ def test_solo_event_fallback_binds_linkless_persons(monkeypatch):
 
 def test_no_event_in_batch_creates_no_attendance(monkeypatch):
     """イベントが一切無いバッチ（参加者のみ）はフォールバックせず参加 0 件。"""
+
     async def _fake_build_appeal(kind, payload, space=None):
         return "", []
 

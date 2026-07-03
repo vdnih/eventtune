@@ -27,11 +27,11 @@ async def get_current_user(
     try:
         decoded = auth.verify_id_token(credentials.credentials)
         return decoded
-    except Exception:
+    except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
-        )
+        ) from e
 
 
 async def get_space_context(
