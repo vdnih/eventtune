@@ -1,12 +1,12 @@
-# Cloud Run 実行 SA（mmg-api-sa）と IAM ロール。docs/INFRA_ARCHITECTURE.md の表に対応。
+# Cloud Run 実行 SA（eventtune-api-sa）と IAM ロール。docs/INFRA_ARCHITECTURE.md の表に対応。
 resource "google_service_account" "mmg_api" {
   project      = var.project_id
-  account_id   = "mmg-api-sa"
-  display_name = "mmg-api Cloud Run runtime SA"
+  account_id   = "eventtune-api-sa"
+  display_name = "eventtune-api Cloud Run runtime SA"
 }
 
 locals {
-  mmg_api_roles = [
+  eventtune_api_roles = [
     "roles/datastore.user",                  # Firestore 読み書き
     "roles/storage.objectViewer",            # GCS アップロード読み取り
     "roles/aiplatform.user",                 # Vertex AI(Gemini) / Agent Engine
@@ -20,7 +20,7 @@ locals {
 }
 
 resource "google_project_iam_member" "mmg_api" {
-  for_each = toset(local.mmg_api_roles)
+  for_each = toset(local.eventtune_api_roles)
 
   project = var.project_id
   role    = each.value

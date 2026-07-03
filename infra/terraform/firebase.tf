@@ -11,7 +11,7 @@ resource "google_firebase_project" "default" {
 resource "google_firebase_web_app" "default" {
   provider     = google-beta
   project      = var.project_id
-  display_name = "Marketing Mail Generator"
+  display_name = "EventTune"
 
   # 削除しても基盤アプリは残す（誤 destroy 時の保険）
   deletion_policy = "ABANDON"

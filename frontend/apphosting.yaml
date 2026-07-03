@@ -10,10 +10,10 @@ runConfig:
   concurrency: 80
 
 env:
-  # SSR の rewrite（next.config.ts の /api/v1/* → これ）先。Cloud Run mmg-api の確定 URL。
+  # SSR の rewrite（next.config.ts の /api/v1/* → これ）先。Cloud Run eventtune-api の確定 URL。
   # ビルド時にバンドルへ焼き込まれるため BUILD でも参照可能にする。
   - variable: NEXT_PUBLIC_API_URL
-    value: https://mmg-api-974233950009.asia-northeast1.run.app
+    value: https://eventtune-api-bd2jolesza-an.a.run.app
     availability:
       - BUILD
       - RUNTIME

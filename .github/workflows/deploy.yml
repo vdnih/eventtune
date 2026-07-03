@@ -15,8 +15,8 @@ on:
 env:
   PROJECT_ID: marketing-mail-generator
   REGION: asia-northeast1
-  SERVICE: mmg-api
-  REPO: mmg
+  SERVICE: eventtune-api
+  REPO: eventtune
 
 permissions:
   contents: read

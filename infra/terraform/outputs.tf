@@ -1,6 +1,11 @@
 output "cloud_run_url" {
-  description = "mmg-api の URL（apphosting.yaml の NEXT_PUBLIC_API_URL / frontend_origin 設定に使う）"
+  description = "eventtune-api の URL（apphosting.yaml の NEXT_PUBLIC_API_URL 設定に使う）"
   value       = google_cloud_run_v2_service.mmg_api.uri
+}
+
+output "app_hosting_url" {
+  description = "App Hosting の配信 URL（terraform.tfvars の frontend_origin 設定に使う）。app_hosting_repository 未設定時は null"
+  value       = length(google_firebase_app_hosting_backend.frontend) > 0 ? "https://${google_firebase_app_hosting_backend.frontend[0].uri}" : null
 }
 
 output "artifact_registry_repo" {

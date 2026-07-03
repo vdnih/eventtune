@@ -59,7 +59,7 @@ function AppShell({ userEmail, children }: { userEmail: string; children: React.
         <div className="px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Link href="/dashboard" className="text-lg font-bold text-brand-600">
-              イベントマーケティング
+              EventTune
             </Link>
             <SpaceSwitcher />
             <nav className="flex items-center gap-1 text-sm">

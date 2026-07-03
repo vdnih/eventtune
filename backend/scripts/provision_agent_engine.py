@@ -42,7 +42,7 @@ def main() -> None:
     client = vertexai.Client(project=project, location=location)
     agent_engine = client.agent_engines.create(
         config={
-            "display_name": "marketing-mail-generator-runtime",
+            "display_name": "eventtune-runtime",
             "description": "Code execution sandbox + session store for marketing_agent",
         }
     )

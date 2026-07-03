@@ -53,7 +53,7 @@ resource "google_project_iam_member" "github_deployer" {
   member  = "serviceAccount:${google_service_account.github_deployer.email}"
 }
 
-# Cloud Run deploy 時に実行 SA（mmg-api-sa）として振る舞う権限。
+# Cloud Run deploy 時に実行 SA（eventtune-api-sa）として振る舞う権限。
 resource "google_service_account_iam_member" "deployer_act_as_runtime" {
   service_account_id = google_service_account.mmg_api.name
   role               = "roles/iam.serviceAccountUser"

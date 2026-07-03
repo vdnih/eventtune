@@ -30,7 +30,7 @@
     "providers": {
       "emailPassword": false,
       "googleSignIn": {
-        "oAuthBrandDisplayName": "Marketing Mail Generator",
+        "oAuthBrandDisplayName": "EventTune",
         "supportEmail": "rozaki320@gmail.com"
       }
     }

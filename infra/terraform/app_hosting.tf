@@ -29,7 +29,7 @@ resource "google_firebase_app_hosting_backend" "frontend" {
   provider         = google-beta
   project          = var.project_id
   location         = var.app_hosting_location
-  backend_id       = "mmg-frontend"
+  backend_id       = "eventtune-frontend"
   app_id           = google_firebase_web_app.default.app_id
   serving_locality = var.app_hosting_serving_locality
   service_account  = google_service_account.mmg_api.email

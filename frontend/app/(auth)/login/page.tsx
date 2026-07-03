@@ -27,7 +27,7 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-brand-50 to-blue-100">
       <div className="bg-white rounded-2xl shadow-lg p-10 w-full max-w-sm text-center">
         <h1 className="text-2xl font-bold text-gray-900 mb-2">
-          Marketing Mail Generator
+          EventTune
         </h1>
         <p className="text-gray-500 text-sm mb-8">
           AIで商談メモを高品質なメールに変換
