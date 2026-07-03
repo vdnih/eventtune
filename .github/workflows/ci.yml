@@ -43,6 +43,48 @@ jobs:
         working-directory: backend
         run: uv run pytest
 
+  backend-integration:
+    name: Backend Integration Test (Firestore Emulator)
+    runs-on: ubuntu-latest
+    env:
+      # demo- プレフィックスはエミュレータ専用プロジェクトID（実プロジェクトへの誤接続を構造的に防ぐ）
+      GOOGLE_CLOUD_PROJECT: demo-eventtune
+      FIREBASE_PROJECT_ID: demo-eventtune
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java (Firebase emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache Firebase emulators
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
+      - name: Run integration tests (emulator)
+        run: >
+          npx -y firebase-tools emulators:exec --only firestore,auth --project demo-eventtune
+          "cd backend && uv run pytest -m integration"
+
   frontend-build:
     name: Frontend Build (Next.js)
     runs-on: ubuntu-latest
