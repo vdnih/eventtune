@@ -350,6 +350,61 @@ class MarketingRun(BaseModel):
     created_at: str = ""
 
 
+# ── 取り込みプラン（BatchPlan = 承認と実行の契約。ADR-015）───────────────────
+
+
+class TargetPlan(BaseModel):
+    """1ファイル内の1エンティティ種別ぶんの変換仕様。"""
+
+    entity_type: str  # ingestion.specs.REGISTRY のキー
+    column_map: dict[str, str] = {}  # {元列: observation フィールド}
+    column_modes: dict[str, str] = {}  # {元列: "direct" | "ai_parse"}
+    link_columns: dict[str, str] = {}  # {リンク種別: 元列}（行ごとにリンク先が異なる列）
+
+
+class FilePlan(BaseModel):
+    """1ファイルの変換仕様。1ファイルが複数種別（targets）を含み得る。"""
+
+    filename: str
+    business_context: str = ""  # 業務的な理解（例: "2025秋展示会の接客記録"）
+    targets: list[TargetPlan] = []
+    unmapped_notes: str = ""  # 対応づけられなかった列・不明点（確認画面に出す）
+
+
+class DefaultEventPlan(BaseModel):
+    """バッチ既定イベントの提案。Confirm でユーザーが承認/変更/「なし」を選ぶ。"""
+
+    name: str
+    is_existing: bool = False  # 既存イベント照合の結果（P1 が計算。AI は設定しない）
+    evidence: str = ""  # AI の提案根拠（Confirm に表示）
+
+
+class BatchPlan(BaseModel):
+    """バッチ全体の変換仕様。/plan が返し、承認済みのものが /batches でそのまま実行される。"""
+
+    default_event: DefaultEventPlan | None = None
+    files: list[FilePlan] = []
+
+
+class SourceRecord(BaseModel):
+    """取り込みの着地ゾーン（source_records）。観測ブロック1件=1ドキュメント。
+
+    取り込み「プロセス」のデータであり OSI データセットではない（YAML には足さない）。
+    保留（pending）の置き場・再処理の入力・監査の突合先を兼ねる（ADR-015）。
+    """
+
+    record_id: str
+    space_id: str = ""
+    batch_id: str
+    filename: str
+    row_no: int = 0
+    raw: dict = {}  # {元列: 値}（文書は {"text": 全文}）
+    status: str = "pending"  # "bound" | "pending" | "skipped"
+    reason: str = ""
+    refs: dict[str, list[str]] = {}  # {"persons": [...], "event_attendances": [...]}
+    created_at: str = ""
+
+
 # ── 統合ジョブ（旧 DataLineage + integration_batches を統合）────────────────
 
 
