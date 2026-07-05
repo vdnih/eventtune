@@ -66,10 +66,6 @@ datasets:
         type: categorical
         description: "顧客の段階"
         context: "'LEAD' / 'MQL' / 'SQL' / 'CUSTOMER' / 'EXCLUDED' の値をとる。EXCLUDED は配信対象外。"
-      - name: engagement_level
-        type: categorical
-        description: "リード段階での温度感"
-        context: "'アポ獲得済み' / 'アポなし・感度高' / '通常リード' の値をとる。stage='LEAD' のときのみ意味を持つ。"
       - name: appeal_summary
         type: text
         description: "その人に何が訴求するか／抱える文脈・ニーズの要約文（監査可能テキスト）"

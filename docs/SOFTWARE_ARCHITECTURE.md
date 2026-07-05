@@ -16,7 +16,7 @@
 
 ```
 マスタ（各 appeal_summary / appeal_vector を持つ）:
-  Person       個人（旧 Contact を分解）。stage / engagement_level
+  Person       個人（旧 Contact を分解）。stage
   Account      企業マスター（Person を account_id で束ねる）
   Product      製品マスター
   Content      推薦可能なコンテンツ（資料・事例・セミナー等。旧 ContentAsset）
