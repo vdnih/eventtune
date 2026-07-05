@@ -129,6 +129,37 @@ BatchPlan
 旧 `DocumentPlan`（1ファイル=1種別・link_hints 方式）はこの構造に置換される。
 承認済み BatchPlan は `integration_jobs` に保存され、実行・監査・再実行の基準になる。
 
+### 解釈エンジンの実装方針（Interpret 段の中身）
+
+「変換仕様の機械適用」の実体は、次の**6種別の処理**である。実データ
+（`sample_data/event_2025_autumn/leads.csv`、21列）を棚卸しすると、全列がこのいずれかに落ちる:
+
+| 処理 | 例（leads.csv） | 何で決まるか |
+|---|---|---|
+| **direct（コピー）** | メアド→email、部署名→department、接客担当→owner_staff | column_map |
+| **合成（姓名結合）** | 姓＋名→name | observation モデルの name_last / name_first 宣言 |
+| **N:1 ラベル付き連結** | 温度感・お悩み・課題・要望・注意事項 → challenge_note / memo（「温度感: 高 / お悩み: ベテランのノウハウが…」の形式でロスレスに連結） | 複数の元列を同一フィールドへ map したら連結 |
+| **リンク列の分割** | 判定＿サービス→product_link_names（「A、B」区切りは既存 `_split_names` が分割）、イベント名→event_link_name | フィールドの list 型宣言・LinkSpec |
+| **normalizer** | 「150名」→150、「1,200,000円」→1200000.0、日付形式 | スペックの normalizers（登録制の純関数。既存 `_to_float` / 金額正規化を切り出して再利用） |
+| **enum 変換** | 「展示会」→TRADE_SHOW | Enum 値マップ＋未知値は既定値＋`TransformDecision` 記録（既存 `_build_event` / `_build_cost_item` の一般化） |
+
+処理種別は **observation モデルの型と宣言から導出**され、column_map 側は「元列→フィールド」を
+書くだけでよい。AI の言い換え・取りこぼしが起きない分、ラベル付き連結は行単位 AI 抽出より
+むしろロスレスである。
+
+**これは新規の賭けではない**。現行の行単位 AI 抽出も `column_map` を文脈として受け取り、
+実質この6種別と同じ詰め替えをしている（同じ対応表への依存を、実行時の運任せから
+レビュー可能な成果物に移すのが P3 の本質）。また費用 CSV パスは本番コードで既にこの方式
+（AI 呼び出しゼロの機械適用）で動いている先行例である。
+
+**行単位 AI に劣る点と受け皿**: 機械適用はセル単位の異常（1行だけの列ズレ・1セル内の混在値）を
+直せない。受け皿は3つ — ①生の行が `source_records` に残る ②件数異常・skip が報告に出るので
+気づける ③気づいたらその列だけ `ai_parse` に切り替えて再実行できる。
+
+**ゴールデンテスト**: 解釈エンジンは純粋関数（I/O なし。現行 OntologyMapper と同じ設計）とし、
+`sample_data/` の各 CSV をフィクスチャに「この入力はこの中間レコードになる」をスナップショットで
+固定する。出力が揺れる行単位 AI では不可能だった回帰検証が可能になる。
+
 ---
 
 ## 5. バッチ文脈とイベントリンク解決
@@ -227,6 +258,7 @@ REGISTRY: dict[str, IngestionSpec] = { ... }
    ハードコードの日本語 enum 対応表を、モデルの型情報から動く1つの汎用処理に置換する:
    column_map（または検証済み AI observation）を適用 → normalizers 実行 → enum 変換
    （語彙=Enum 値。未知値は既定値＋`TransformDecision` 監査記録）。
+   この汎用ビルダーの実体が §4「解釈エンジンの実装方針」の処理6種別である。
 4. **確定/結合の依存順ループ** — masters（role="master"）→ facts（role="fact"、LinkSpec を解決）→
    patches（patch_target へ畳む）の順は LinkSpec からトポロジカルに決まり、種別追加時に
    再設計不要。
