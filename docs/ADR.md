@@ -591,7 +591,7 @@ ADR-011 で設計した取り込みパイプラインには以下の問題があ
 
 ## ADR-015: 取り込み再建 — スペック駆動の統一パイプラインと確認済みバッチ文脈
 
-**ステータス**: 採用（概念設計フェーズ。実装は本 ADR と [INGESTION_MAPPING.md](INGESTION_MAPPING.md) 改稿のレビュー後）
+**ステータス**: 採用（実装済み — 2026-07。概念設計の正典は [INGESTION_MAPPING.md](INGESTION_MAPPING.md)）
 
 **背景**:
 取り込み層（DataIntegrationAgent）は ADR-008（Event-Centric 撤回）→ ADR-011（依存順の多段化・UUID 化）→ ADR-013（行単位 AI 抽出・業務判定排除）と3世代の再設計を経たが、各世代の考え方を統一する背骨がないまま産物が同居しており、処理方式がチグハグになっている。コード監査で確認した具体的問題:
@@ -648,7 +648,7 @@ ADR-011 の依存順の骨格（観測→確定→結合→導出）と ADR-013 
 
 **結果 / 将来課題**:
 - 本 ADR は以下を改訂する: ADR-013 決定2（行単位 AI 抽出の既定 → `ai_parse` 限定の opt-in）/ INGESTION_MAPPING 旧 §3 シグナル3（単一イベントフォールバック → 廃止）/ ADR-011 将来課題（観測の非永続 → source_records へ昇格）。ADR-008 の5マスタ対等・ADR-011 の依存順骨格・ADR-013 の業務判定排除は維持。
-- **実装フェーズのドリフト修正チェックリスト**（コードに触るため本 ADR の文書フェーズでは実施しない）: `data_integration_agent.py:9`（SchemaMapper）/ `integration.py:11-12`（/report /contacts）/ `README.md:46`（run_schema_mapper）/ `ontology.py:356`（ColumnMappingResult 削除）/ `osi_event_marketing_v1.yml:69`・`marketing_agent.py:115,117,179`・`segmentation.py:8,192`・PHILOSOPHY_AND_NAMING（EngagementLevel 残骸）/ README のパイプライン図・アーキテクチャ記述の新構成への同期。
+- **ドリフト修正チェックリスト**（実装フェーズで実施済み）: `data_integration_agent.py` docstring（SchemaMapper）/ `integration.py` docstring（/report /contacts）/ `README.md` パイプライン図・ディレクトリツリー / `ColumnMappingResult`・`DocumentPlan` 削除 / `osi_event_marketing_v1.yml`・`marketing_agent.py`・`segmentation.py`・PHILOSOPHY_AND_NAMING・SOFTWARE_ARCHITECTURE（EngagementLevel 残骸と取り込み記述の同期）。
 - グリーンフィールド: 既存 Firestore の取り込み系データは `reset_space_ingestion_data.py` の要領で破棄し、sample_data を再取り込みして検証する。
 - **実装フェーズの検証計画**: フィクスチャバッチとして最低限 ①イベント名の列が無い参加者 CSV（既定イベント提案と保留の両経路）②複数イベントを含むリスト CSV ③イベント概要 TXT＋参加者 CSV の同時投入 ④費用 CSV ⑤「これまでの指示を無視して…」を仕込んだカナリア CSV を用意し、承認済みプランどおりの取り込み・保留の可視化・カナリアの無害化を確認する。
 - **拡張トリガー**（発火するまで実装しない）: P4 前処理 = 宣言的仕様で表現できないファイル形状（ピボット表・複数シート結合・非定型帳票）が実利用で頻出したとき、BatchPlan に前処理コードを含め確認画面でコード自体を承認し ADR-009 のサンドボックスで実行する形で Read 段に差し込む / PDF multimodal 読み取り = PDF の取り込み需要が実際に発生したとき / Cloud Tasks 化 = ADR-002 の既存トリガーのまま。

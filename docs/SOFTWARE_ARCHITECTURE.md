@@ -46,19 +46,19 @@
 チャット駆動。バッチ2段（取り込み→生成）ではなく、ユーザーとの対話の中でエージェントが
 自律的にツールを選んで進める。
 
-### DataIntegrationAgent (`agents/data_integration_agent.py`)
+### DataIntegrationAgent (`agents/data_integration_agent.py` + `ingestion/`)
 
-カオスなファイル（CSV/Excel/PDF）をオントロジーへ分解・リンク解決して書き込む。
+カオスなファイル（CSV/Excel/テキスト。PDF は明示拒否）をオントロジーへ分解・リンク解決して
+書き込む。概念の正典は [INGESTION_MAPPING.md](INGESTION_MAPPING.md) / ADR-015。
 
 | 項目 | 内容 |
 |------|------|
-| トリガー | `POST /api/integration/batches`（BackgroundTask） |
-| 段階 | ①列マッピング/抽出（`ColumnMappingResult` / `DocumentExtractionResult`）→ ②変換・リンク解決 → Firestore 書き込み |
-| リンク解決 | 行ごとの link_columns / ファイル全体の default_links で Event/Account/Product を解決（`ontology_mapper.py`） |
-| 意味レイヤー付与 | 取り込み時に persons/products/events/contents へ `appeal_summary`/`appeal_vector` を付与（`semantic_search.build_appeal`、`_apply_appeal`） |
-| 監査 | `IntegrationJob` に column_mapping / transformations / skipped_records / resolved_links を残す |
-
-取り込みプランの事前提案は `POST /api/integration/plan`（`plans.py`）。
+| トリガー | `POST /api/integration/plan`（BatchPlan 生成）→ 確認 → `POST /api/integration/batches`（承認済み BatchPlan をそのまま実行。BackgroundTask + ハートビート/stale sweep） |
+| 段階 | Read（source_records 着地）→ Understand（AI×1回）→ Confirm（人間）→ Interpret（`ingestion/engine.py` の機械適用。ai_parse 宣言列のみ軽量AI）→ Conform → Bind → Derive → Report |
+| リンク解決 | 行の link_columns → 確認済み既定イベント（default_event）→ 保留（pending。ファクトを書かず理由を記録） |
+| スペック駆動 | `ingestion/specs.py` の IngestionSpec レジストリからプロンプト・抽出スキーマ・変換・確定/結合順を導出（種別追加 = モデル + 1エントリ） |
+| 意味レイヤー付与 | マスタは Conform で、person は Derive で `appeal_summary`/`appeal_vector` を付与（`semantic_search.build_appeal`） |
+| 監査 | `IntegrationJob` に plan / transformations / skipped_records / resolved_links / report_markdown、`source_records` に全観測ブロックの行き先（bound/pending/skipped + 理由）を残す |
 
 ### MarketingAgent (`agents/marketing_agent.py`)
 
