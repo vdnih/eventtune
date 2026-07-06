@@ -408,38 +408,6 @@ class SourceRecord(BaseModel):
 # ── 統合ジョブ（旧 DataLineage + integration_batches を統合）────────────────
 
 
-class ColumnMappingResult(BaseModel):
-    entity_type: str
-    column_map: dict[str, str]
-    unmapped_columns: list[str] = []
-    # 行ごとに異なるリンク先（マスタ）を識別する列。{kind: カラム名}。
-    # kind は "event" | "account" | "product"。旧 event_routing_column を一般化したもの。
-    link_columns: dict[str, str] = {}
-    # ファイル全体に適用するリンク先（行に列が無いとき）。{kind: マスタ名}。
-    # ヒントやファイル文脈から AI が推定する（例 {"event": "2025秋展示会"}）。
-    default_links: dict[str, str] = {}
-
-
-class DocumentPlan(BaseModel):
-    """AI Extract Step1 の出力。1ファイルの業務的理解結果。integration_jobs に保存する。"""
-
-    business_context: str = ""  # "2025秋展示会の参加者接客記録"
-    entity_type: str = ""  # "persons" | "events" | "products" | ...
-    source_file_role: str = ""  # "participant_list" | "event_master" | "costs" | ...
-    link_hints: dict[str, str] = {}  # {"event": "2025秋展示会"}
-    column_map: dict[str, str] = {}  # {"氏名": "name", "社名": "account_name", ...}
-    unmapped_notes: str = ""
-
-
-class DocumentExtractionResult(BaseModel):
-    detected_entity_types: list[str]
-    events: list[dict] = []
-    event_kpi: dict | None = None
-    cost_items: list[dict] | None = None
-    survey_response: dict | None = None
-    content_assets: list[dict] | None = None
-
-
 class TransformDecision(BaseModel):
     field: str
     value: str
@@ -460,29 +428,29 @@ class SkippedRecord(BaseModel):
     detail: str = ""
 
 
-class TransformationSummary(BaseModel):
-    entity_counts: dict[str, int] = {}
-    product_breakdown: dict[str, int] = {}
-    skipped_count: int = 0
-
-
 class IntegrationJob(BaseModel):
-    """データ統合ジョブ（旧 DataLineage + integration_batches を統合）。"""
+    """データ統合バッチのジョブ記録（旧 DataLineage + integration_batches を統合）。
+
+    ADR-015: 承認済み BatchPlan（承認と実行の契約）・ステージのハートビート・
+    保留/スキップ集計・バッチ報告（Markdown）をバッチ単位で保持する。
+    """
 
     job_id: str
     space_id: str
     filenames: list[str] = []
-    # ユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正に使う）。
+    # ユーザーの自然言語ヒント（Understand への曖昧解消の補助入力）。
     hint: str = ""
-    status: str = "queued"  # "queued" | "running" | "done" | "error"
+    status: str = "queued"  # "queued" | "processing" | "done" | "error"
+    stage: str = ""  # "read" | "interpret" | "conform" | "bind" | "derive" | "report"
+    heartbeat_at: str = ""  # ステージ毎に更新。停滞検知（stale sweep）に使う
+    plan: BatchPlan | None = None  # 承認済みの変換仕様（実行されたものそのもの）
     created_entities: dict[str, int] = {}
-    # このジョブで解決・生成したリンク先マスタの要約 [{kind, name, id}]。
+    pending_count: int = 0  # リンク未解決の保留観測（source_records.status=pending）
+    skipped_count: int = 0
+    report_markdown: str = ""  # バッチ報告（P1 集計を AI が整形。チャットに表示）
+    # このジョブで解決・生成したリンク先マスタの要約 [{kind, name, id, resolved_by}]。
     resolved_links: list[dict] = []
-    column_mapping: DocumentPlan | None = None
-    raw_extraction: dict | None = None
     transformations: list[EntityTransformation] = []
     skipped_records: list[SkippedRecord] = []
-    transformation_summary: TransformationSummary | None = None
-    partial: bool = False
     error: str | None = None
     created_at: str = ""

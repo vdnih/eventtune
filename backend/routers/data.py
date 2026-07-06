@@ -58,6 +58,7 @@ VIEWS: dict[str, tuple[str, str, Callable[[SpaceContext], Iterator[dict]]]] = {
     "event_attendances": ("イベント参加", "ファクト", _list_collection("event_attendances")),
     "product_interests": ("製品関心", "ファクト", _list_collection("product_interests")),
     "cost_items": ("費用明細", "ファクト", _list_collection("cost_items")),
+    "source_records": ("取り込み行（着地）", "取り込み", _list_collection("source_records")),
     "segments": ("セグメント", "分析", _list_collection("segments")),
     "marketing_runs": ("生成ジョブ", "生成", _list_collection("marketing_runs")),
     "deliverables": ("生成成果物", "生成", _list_deliverables),

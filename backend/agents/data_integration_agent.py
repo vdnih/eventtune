@@ -1,64 +1,56 @@
 """
-DataIntegrationAgent — Layer 1: データ統合パイプライン（OSI 星座型・依存順の多段）
+DataIntegrationAgent — Layer 1: データ統合パイプライン（ADR-015 / docs/INGESTION_MAPPING.md）
 
-入力ファイルを読み、含まれるエンティティ（5マスタ＋ファクト）へ分解して Firestore に保存する。
-ADR-011 / docs/INGESTION_MAPPING.md に従い、取り込みを依存順の多段で行う:
+8ステージ: Read（着地）→ Understand（AI×1回で BatchPlan 生成）→ Confirm（ルーター/UI の
+ゲート。承認済み BatchPlan がそのまま実行される）→ Interpret（承認済み仕様の機械適用。
+ai_parse 宣言列のみ軽量 AI）→ Conform（マスタ確定）→ Bind（ファクト結合。イベントリンクは
+行の列値 → 確認済み既定イベント → 保留）→ Derive（person appeal 集約）→ Report（P1 集計 +
+AI 整形 Markdown）。
 
-  観測着地+解釈（並列） → 確定(conform: マスタ) → 結合(bind: person＋ファクト) → 導出(derive)
-
-  パス A (表形式 CSV/Excel): SchemaMapper でカラム/リンクを判定 → OntologyMapper で観測へ解釈
-  パス B (非構造化 TXT):      DocumentExtractor でエンティティ抽出 → OntologyMapper で解釈
-
-AI=解釈（種別/列写像/抽出）、決定論 Python=正規化照合・find-or-create・永続。マスタ・リンクの
-同一性は安定ID（名前ハッシュ）ではなく「スペース内の実在エンティティを自然キーで検索する
-find-or-create」（EntityResolver）に一本化した。Person.appeal は全 attendance を集約して導出する。
+責務の割り方は「AI か Python か」ではなく実行形態（INGESTION_MAPPING §3）:
+骨格・永続・名寄せ = 基盤コード（P1）/ 変換 = AI 生成仕様の機械適用（P3）/
+仕様で表現できない列のみ宣言された範囲の AI 行抽出。全観測ブロックは source_records に
+着地し、行き先（bound / pending / skipped + 理由）が必ず記録される（黙って捨てない）。
 """
 
 import asyncio
-import io
 import json
 import logging
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-import pandas as pd
 from google import genai
 from google.cloud.firestore import FieldFilter
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model
 
 import semantic_search
-from agents.ontology_mapper import (
-    MapResult,
-    OntologyMapper,
-    PersonObservation,
-    SkippedRecord,
-    _normalize_name,
-)
 from config import get_settings
+from ingestion import engine, prompts, readers
+from ingestion.engine import InterpretedRow, _enum_default, enum_fields_of
+from ingestion.normalize import _normalize_name
+from ingestion.specs import REGISTRY, IngestionSpec, file_target_kinds
 from metering import record_llm_response
 from ontology import (
-    Account,
+    BatchPlan,
     ContactStage,
-    Content,
-    CostItem,
-    DocumentExtractionResult,
-    DocumentPlan,
-    Event,
+    DefaultEventPlan,
+    EntityTransformation,
     EventAttendance,
-    IntegrationJob,
+    FilePlan,
     Person,
-    Product,
     ProductInterest,
-    TransformationSummary,
+    SkippedRecord,
+    SourceRecord,
+    TargetPlan,
 )
 from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
-_mapper = OntologyMapper()
 _client: genai.Client | None = None
 
 
@@ -77,151 +69,81 @@ def _new_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
-def _hint_block(hint: str | None) -> str:
-    hint = (hint or "").strip()
-    return f"\n\n【ユーザーのヒント（リンク解決・種別判定の補正に使う）】\n{hint}\n" if hint else ""
+class UnderstandError(RuntimeError):
+    """Understand（BatchPlan 生成）の失敗。空プランで黙って続行しない（§4 ステージ2）。"""
 
 
-# ── パスA: バッチ横断理解 + 行単位並列抽出（ADR-013）────────────────────────────
+# ── Understand: バッチ横断理解（AI フルモデル × 1回 → BatchPlan）──────────────────
 
 
-_ONTOLOGY_DEFINITION = """\
-【オントロジー定義（エンティティ間の関係・各フィールドの業務的意味）】
-OSI セマンティックレイヤー: 5マスタ（persons/accounts/events/products/contents）+ 3ファクト
-
-persons（人物マスタ）: name / email / company_name / department / job_title
-  ※ 感度・ステータス等の業務的判定は行わない。観測事実のみ格納。
-
-event_attendances（接客ファクト / persons×events）:
-  action_type（参加/商談/問合せ等） / owner_staff（接客担当者名）
-  challenge_note（接客時に把握した課題感。担当者主観の興味レベルもここに含める）
-  memo（その他メモ・所感）
-  ※ challenge_note には「感度A」「関心高め」等のテキストもそのまま含める（分類しない）
-
-product_interests（製品関心ファクト / persons×products）
-
-cost_items（費用ファクト / events の費用明細。展示会・セミナー共通）:
-  category（会場費・出展費/ブース装飾・設営/集客/登壇者/人件費・派遣/交通・宿泊/印刷・販促物・ノベルティ/運営/飲食・接待/その他）
-  description / amount_jpy（数値のみ）/ vendor_name / invoice_date（YYYY-MM-DD）
-  ※ 必ず特定の event にリンクされる。link_hints に {"event": "イベント名"} を設定する。
-
-events（イベントマスタ）: name / event_type / event_date / venue / description 等
-accounts（企業マスタ）: account_name / industry_type / company_size
-products（製品マスタ）: product_name / product_category
-contents（コンテンツマスタ）: content_name / content_type / url
-"""
-
-_BATCH_UNDERSTAND_PROMPT = """\
-あなたは EventTune のイベントマーケティングデータ統合の専門家です。
-バッチ内の全ファイルのヘッダーとサンプル行を読み、各ファイルの業務的な役割・内容・相互関係を把握して
-1ファイルごとの DocumentPlan を生成してください。
-
-{ontology}
-
-【ルール】
-- entity_type: persons / events / accounts / products / contents / cost_items のいずれか
-- link_hints: このファイルに含まれるデータが関連するマスタ名 {{"event": "展示会名"}} 等
-  （バッチ内の別ファイル（イベント概要等）から推定できる場合は積極的に設定する）
-- column_map: CSVカラム名 → オントロジーフィールド名のマッピング
-  persons の場合のフィールド: name/name_last/name_first/email/company_name/department/job_title
-    接客事実: owner_staff/challenge_note/memo/action_type
-    製品リンク: product_link_names（複数可）
-- unmapped_notes: マッピングできなかったカラムや不明な点の説明
-- source_file_role: participant_list / event_master / cost_list / content_list 等
-
-【出力形式】ファイル名をキーとした JSON オブジェクト:
-{{
-  "ファイル名.csv": {{
-    "business_context": "...",
-    "entity_type": "...",
-    "source_file_role": "...",
-    "link_hints": {{"event": "..."}},
-    "column_map": {{"CSVカラム名": "オントロジーフィールド名"}},
-    "unmapped_notes": "..."
-  }},
-  ...
-}}
-"""
-
-_ROW_EXTRACT_PROMPT = """\
-あなたは EventTune のイベントマーケティングデータ統合の専門家です。
-1件の接客記録（CSVの1行）を構造化データへ変換してください。
-
-{ontology_short}
-
-【このファイルの業務文脈】
-{business_context}
-エンティティ種別: {entity_type}
-リンク先: {link_hints}
-カラムマッピング: {column_map}
-
-【変換対象の行データ】
-{row_json}
-
-【ルール】
-- challenge_note には担当者主観の興味度（「感度A」「関心高め」等）もテキストのまま含める
-- product_link_names には関連製品名をリストで（複数可）
-- event_link_name はリンク先イベント名（行データに無ければ link_hints から補完）
-- 名前が空の場合は skip_reason を設定する
-- 推測で値を埋めない
-"""
-
-_ONTOLOGY_SHORT = """\
-persons フィールド: name/email/company_name/department/job_title/owner_staff/challenge_note/memo/action_type/product_link_names/event_link_name
-"""
+def _files_block(files: list[tuple[str, bytes]]) -> str:
+    """全ファイルのヘッダー+サンプル（表）/ 冒頭（文書）をプロンプト用に描画する。"""
+    parts: list[str] = []
+    for filename, content in files:
+        if readers.is_tabular(filename):
+            try:
+                headers, rows = readers.read_tabular(filename, content)
+                sample = json.dumps(rows[:5], ensure_ascii=False)
+                parts.append(f"--- {filename} ---\nヘッダー: {headers}\nサンプル: {sample}")
+            except Exception as e:
+                parts.append(f"--- {filename} ---\n読み込みエラー: {e}")
+        else:
+            parts.append(f"--- {filename} ---\n{readers.read_text(content)[:800]}")
+    return "\n\n".join(parts)
 
 
-class _PersonObservationExtraction(BaseModel):
-    name: str | None = None
-    email: str | None = None
-    company_name: str | None = None
-    department: str | None = None
-    job_title: str | None = None
-    owner_staff: str | None = None
-    challenge_note: str | None = None
-    memo: str | None = None
-    action_type: str | None = None
-    product_link_names: list[str] = []
-    event_link_name: str | None = None
-    skip_reason: str | None = None
+def _parse_batch_plan(raw: dict) -> BatchPlan:
+    """Understand の JSON 出力を BatchPlan に検証する。未知の entity_type は捨てて警告。"""
+    valid_kinds = set(file_target_kinds())
+    default_event = None
+    de = raw.get("default_event")
+    if isinstance(de, dict) and str(de.get("name") or "").strip():
+        default_event = DefaultEventPlan(
+            name=str(de["name"]).strip(), evidence=str(de.get("evidence") or "")
+        )
+    file_plans: list[FilePlan] = []
+    for f in raw.get("files") or []:
+        if not isinstance(f, dict) or not f.get("filename"):
+            continue
+        targets: list[TargetPlan] = []
+        for t in f.get("targets") or []:
+            if not isinstance(t, dict):
+                continue
+            kind = str(t.get("entity_type") or "")
+            if kind not in valid_kinds:
+                logger.warning(
+                    "understand: 未知の entity_type '%s' を無視 (%s)", kind, f["filename"]
+                )
+                continue
+            targets.append(
+                TargetPlan(
+                    entity_type=kind,
+                    column_map={str(k): str(v) for k, v in (t.get("column_map") or {}).items()},
+                    column_modes={str(k): str(v) for k, v in (t.get("column_modes") or {}).items()},
+                    link_columns={str(k): str(v) for k, v in (t.get("link_columns") or {}).items()},
+                )
+            )
+        file_plans.append(
+            FilePlan(
+                filename=str(f["filename"]),
+                business_context=str(f.get("business_context") or ""),
+                targets=targets,
+                unmapped_notes=str(f.get("unmapped_notes") or ""),
+            )
+        )
+    return BatchPlan(default_event=default_event, files=file_plans)
 
 
 async def understand_batch(
     files: list[tuple[str, bytes]],
     hint: str | None,
+    existing_event_names: list[str],
     space: SpaceContext | None = None,
-) -> dict[str, DocumentPlan]:
-    """バッチ内全ファイルのヘッダー+サンプルをフルモデルに渡し、各ファイルの DocumentPlan を生成する。"""
+) -> BatchPlan:
+    """バッチ内全ファイルを1回のフルモデル呼び出しで理解し、BatchPlan（変換仕様）を生成する。"""
     if not files:
-        return {}
-
-    files_block_parts: list[str] = []
-    for filename, content in files:
-        if _is_tabular(filename):
-            try:
-                headers, rows = _read_tabular(filename, content)
-                sample = json.dumps(rows[:5], ensure_ascii=False)
-                files_block_parts.append(
-                    f"--- {filename} ---\nヘッダー: {headers}\nサンプル: {sample}"
-                )
-            except Exception as e:
-                files_block_parts.append(f"--- {filename} ---\n読み込みエラー: {e}")
-        else:
-            try:
-                text = _read_text(content)
-                files_block_parts.append(f"--- {filename} ---\n{text[:800]}")
-            except Exception:
-                pass
-
-    if not files_block_parts:
-        return {}
-
-    prompt = (
-        _BATCH_UNDERSTAND_PROMPT.format(ontology=_ONTOLOGY_DEFINITION)
-        + _hint_block(hint)
-        + "\n\n【バッチ内ファイル一覧】\n"
-        + "\n\n".join(files_block_parts)
-    )
+        return BatchPlan()
+    prompt = prompts.render_understand_prompt(_files_block(files), existing_event_names, hint)
     try:
         _model = get_settings().model_ingestion
         response = await _get_client().aio.models.generate_content(
@@ -233,302 +155,103 @@ async def understand_batch(
             record_llm_response(space, _model, response)
         raw = json.loads(response.text)
         if not isinstance(raw, dict):
-            return {}
-        result: dict[str, DocumentPlan] = {}
-        for fname, plan_dict in raw.items():
-            if isinstance(plan_dict, dict):
-                result[fname] = DocumentPlan(
-                    business_context=str(plan_dict.get("business_context", "")),
-                    entity_type=str(plan_dict.get("entity_type", "")),
-                    source_file_role=str(plan_dict.get("source_file_role", "")),
-                    link_hints={
-                        str(k): str(v) for k, v in (plan_dict.get("link_hints") or {}).items()
-                    },
-                    column_map={
-                        str(k): str(v) for k, v in (plan_dict.get("column_map") or {}).items()
-                    },
-                    unmapped_notes=str(plan_dict.get("unmapped_notes", "")),
-                )
-        logger.info(
-            "understand_batch: files=%s plans=%s", [f for f, _ in files], list(result.keys())
-        )
-        return result
-    except Exception:
+            raise ValueError("BatchPlan の JSON がオブジェクトでない")
+        plan = _parse_batch_plan(raw)
+    except Exception as e:
         logger.exception("understand_batch failed")
-        return {}
-
-
-async def _extract_single_row(
-    row: dict, plan: DocumentPlan, space: SpaceContext | None = None
-) -> PersonObservation | None:
-    """1行の CSV データから PersonObservation を軽量モデルで抽出する。"""
-    prompt = _ROW_EXTRACT_PROMPT.format(
-        ontology_short=_ONTOLOGY_SHORT,
-        business_context=plan.business_context or "(不明)",
-        entity_type=plan.entity_type,
-        link_hints=json.dumps(plan.link_hints, ensure_ascii=False),
-        column_map=json.dumps(plan.column_map, ensure_ascii=False),
-        row_json=json.dumps(row, ensure_ascii=False),
+        raise UnderstandError(f"取り込みプランの生成に失敗しました: {e}") from e
+    logger.info(
+        "understand_batch: files=%s planned=%s default_event=%s",
+        [f for f, _ in files],
+        [fp.filename for fp in plan.files],
+        plan.default_event.name if plan.default_event else None,
     )
+    return plan
+
+
+# ── Interpret: 文書抽出（スペック導出スキーマ）・ai_parse 列の行単位抽出 ──────────────
+
+
+def _document_response_model(kinds: list[str]) -> type[BaseModel]:
+    """FilePlan.targets の種別から、文書抽出のレスポンススキーマを組み立てる。"""
+    fields: dict[str, Any] = {}
+    for k in kinds:
+        spec = REGISTRY[k]
+        if spec.observation is None:
+            continue
+        if spec.role == "patch":
+            fields[k] = (spec.observation | None, None)
+        else:
+            fields[k] = (list[spec.observation], [])
+    return create_model("_DocumentResponse", **fields)
+
+
+async def run_document_extractor(
+    text: str,
+    target_kinds: list[str],
+    business_context: str,
+    space: SpaceContext | None = None,
+) -> dict[str, list[dict]]:
+    """文書1件から観測を抽出する（フルモデル×1回）。戻り値は {kind: [observation dict]}。"""
+    kinds = [k for k in target_kinds if k in REGISTRY and REGISTRY[k].observation is not None]
+    if not kinds:
+        return {}
+    response_model = _document_response_model(kinds)
+    prompt = prompts.render_document_extractor_prompt(kinds, business_context, text)
+    _model = get_settings().model_ingestion
+    response = await _get_client().aio.models.generate_content(
+        model=_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json", response_schema=response_model
+        ),
+    )
+    if space is not None:
+        record_llm_response(space, _model, response)
+    parsed = response_model.model_validate_json(response.text)
+    out: dict[str, list[dict]] = {}
+    for kind in kinds:
+        value = getattr(parsed, kind, None)
+        if value is None:
+            continue
+        items = value if isinstance(value, list) else [value]
+        dumps = [v.model_dump() for v in items]
+        if dumps:
+            out[kind] = dumps
+    return out
+
+
+async def _ai_parse_cells(
+    spec: IngestionSpec,
+    business_context: str,
+    allowed_fields: list[str],
+    cells: dict[str, str],
+    space: SpaceContext | None = None,
+) -> dict | None:
+    """ai_parse 宣言列のセル群から、許可フィールドのみを軽量モデルで抽出する。"""
+    prompt = prompts.render_ai_parse_prompt(spec, business_context, allowed_fields, cells)
     try:
         _model = get_settings().model_batch
         response = await _get_client().aio.models.generate_content(
             model=_model,
             contents=prompt,
             config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=_PersonObservationExtraction,
+                response_mime_type="application/json", response_schema=spec.observation
             ),
         )
         if space is not None:
             record_llm_response(space, _model, response)
-        ext = _PersonObservationExtraction.model_validate_json(response.text)
-        if ext.skip_reason or not (ext.name or "").strip():
+        obs = json.loads(response.text)
+        if not isinstance(obs, dict):
             return None
-        return PersonObservation(
-            name=(ext.name or "").strip(),
-            email=(ext.email or "").strip(),
-            company_name=(ext.company_name or "").strip(),
-            department=(ext.department or "").strip(),
-            job_title=(ext.job_title or "").strip(),
-            event_link_name=(ext.event_link_name or "").strip(),
-            action_type=(ext.action_type or "参加").strip(),
-            product_link_names=ext.product_link_names or [],
-            owner_staff=(ext.owner_staff or "").strip(),
-            challenge_note=(ext.challenge_note or "").strip(),
-            memo=(ext.memo or "").strip(),
-            source_label=(ext.name or "").strip(),
-        )
+        # 宣言された範囲（ai_parse 列が写る先）以外は捨てる
+        return {k: v for k, v in obs.items() if k in allowed_fields}
     except Exception:
-        logger.exception("_extract_single_row failed: row=%s", str(row)[:200])
+        logger.exception("_ai_parse_cells failed: cells=%s", str(cells)[:200])
         return None
 
 
-async def _extract_rows_parallel(
-    filename: str,
-    rows: list[dict],
-    plan: DocumentPlan,
-    space: SpaceContext | None = None,
-    job_id: str = "",
-) -> "MapResult":
-    """全行を並列で AI 抽出し MapResult へまとめる。"""
-    sem = asyncio.Semaphore(20)
-
-    async def _bounded(row: dict) -> "PersonObservation | None":
-        async with sem:
-            return await _extract_single_row(row, plan, space)
-
-    results = await asyncio.gather(*[_bounded(row) for row in rows])
-    mr = MapResult()
-    for obs, row in zip(results, rows, strict=False):
-        if obs is not None:
-            mr.person_observations.append(obs)
-        else:
-            mr.skipped.append(
-                SkippedRecord(entity_type="Person", reason="AI抽出スキップ", detail=str(row)[:200])
-            )
-    logger.info(
-        "_extract_rows_parallel: file=%s rows=%d persons=%d skipped=%d",
-        filename,
-        len(rows),
-        len(mr.person_observations),
-        len(mr.skipped),
-    )
-    return mr
-
-
-# ── パスB: DocumentExtractor ─────────────────────────────────────────────────
-
-
-class _EventExtraction(BaseModel):
-    name: str | None = None
-    event_type: str | None = None
-    status: str | None = None
-    venue: str | None = None
-    event_date: str | None = None
-    event_date_end: str | None = None
-    booth_number: str | None = None
-    total_budget: float | None = None
-    target_contact_count: int | None = None
-    description: str | None = None
-
-
-class _EventKPIExtraction(BaseModel):
-    total_visitors_to_booth: int | None = None
-    total_contacts_collected: int | None = None
-    appointments_booked: int | None = None
-    demo_sessions_held: int | None = None
-    follow_email_open_rate: float | None = None
-    follow_email_reply_rate: float | None = None
-    pipeline_value_jpy: float | None = None
-    closed_deals_3m: int | None = None
-    closed_revenue_3m_jpy: float | None = None
-
-
-class _CostItemExtraction(BaseModel):
-    category: str | None = None
-    description: str | None = None
-    amount_jpy: float | None = None
-    vendor_name: str | None = None
-    invoice_date: str | None = None
-
-
-class _SatisfactionScoreExtraction(BaseModel):
-    category: str | None = None
-    avg_score: float | None = None
-    response_count: int | None = None
-
-
-class _SurveyResponseExtraction(BaseModel):
-    total_responses: int | None = None
-    nps_score: float | None = None
-    nps_promoters: int | None = None
-    nps_passives: int | None = None
-    nps_detractors: int | None = None
-    satisfaction_scores: list[_SatisfactionScoreExtraction] = []
-    verbatim_positives: list[str] = []
-    verbatim_negatives: list[str] = []
-    verbatim_suggestions: list[str] = []
-
-
-class _ContentAssetExtraction(BaseModel):
-    asset_id: str | None = None
-    content_type: str | None = None
-    name: str | None = None
-    description: str | None = None
-    url: str | None = None
-    linked_event_id: str | None = None
-
-
-class _DocumentExtractionResponse(BaseModel):
-    detected_entity_types: list[str] = []
-    events: list[_EventExtraction] = []
-    event_kpi: _EventKPIExtraction | None = None
-    cost_items: list[_CostItemExtraction] | None = None
-    survey_response: _SurveyResponseExtraction | None = None
-    content_assets: list[_ContentAssetExtraction] | None = None
-
-
-_DOCUMENT_EXTRACTOR_PROMPT = """\
-あなたは EventTune のイベントマーケティングデータの統合専門家です。
-以下のドキュメントを読み、含まれる情報をオントロジーのエンティティに変換してください。
-1つのドキュメントから複数のエンティティが抽出されることがあります。
-イベントは複数記載されている場合もあります（例: 年間イベント計画書）。その場合はすべて抽出してください。
-
-【オントロジーのエンティティとフィールド】
-
-Event（複数可）:
-  name, event_type（展示会/セミナー/プライベートイベント）, status（計画中/開催中/終了）,
-  venue, event_date（YYYY-MM-DD）, event_date_end（YYYY-MM-DD）, booth_number,
-  total_budget（数値のみ）, target_contact_count（数値）, description（所感・目的・担当者メモ等）
-
-EventKPI:
-  total_visitors_to_booth, total_contacts_collected, appointments_booked, demo_sessions_held,
-  follow_email_open_rate（0.0〜1.0）, follow_email_reply_rate（0.0〜1.0）,
-  pipeline_value_jpy, closed_deals_3m, closed_revenue_3m_jpy,
-  contacts_by_engagement: { appointment_booked, high_intent, nurturing }
-
-CostItem（複数可）:
-  category（会場費・出展費/ブース装飾・設営/集客/登壇者/人件費・派遣/交通・宿泊/印刷・販促物・ノベルティ/運営/飲食・接待/その他）,
-  description, amount_jpy（数値のみ）, vendor_name, invoice_date（YYYY-MM-DD）
-
-SurveyResponse:
-  total_responses, nps_score（-100〜100）, nps_promoters, nps_passives, nps_detractors,
-  satisfaction_scores: [{ category, avg_score, response_count }],
-  verbatim_positives/negatives/suggestions: [コメント文字列]
-
-ContentAsset（複数可）:
-  asset_id, content_type（未来のセミナー（募集中）/未来のイベント（募集中）/資料・ホワイトペーパー/導入事例）,
-  name, description, url, linked_event_id
-
-【ルール】
-- ドキュメントに含まれるエンティティのみ detected_entity_types に列挙する
-- 数値のカンマ・通貨記号・単位を除去し、パーセント(61%)は小数(0.61)に変換する
-- 構造化できない文脈・所感・メモは Event.description に集約する
-- 含まれない情報は null にする（推測で埋めない）
-"""
-
-
-async def run_document_extractor(
-    text: str,
-    space: SpaceContext | None = None,
-    hint: str | None = None,
-) -> DocumentExtractionResult:
-    prompt = f"{_DOCUMENT_EXTRACTOR_PROMPT}{_hint_block(hint)}\n\n【ドキュメント】\n{text}"
-    _model = get_settings().model_ingestion
-    response = await _get_client().aio.models.generate_content(
-        model=_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=_DocumentExtractionResponse,
-        ),
-    )
-    if space is not None:
-        record_llm_response(space, _model, response)
-    parsed = _DocumentExtractionResponse.model_validate_json(response.text)
-    return DocumentExtractionResult(
-        detected_entity_types=parsed.detected_entity_types,
-        events=[e.model_dump() for e in parsed.events] if parsed.events else [],
-        event_kpi=parsed.event_kpi.model_dump() if parsed.event_kpi else None,
-        cost_items=[c.model_dump() for c in parsed.cost_items] if parsed.cost_items else None,
-        survey_response=parsed.survey_response.model_dump() if parsed.survey_response else None,
-        content_assets=(
-            [a.model_dump() for a in parsed.content_assets] if parsed.content_assets else None
-        ),
-    )
-
-
-def _extract_cost_rows_from_csv(rows: list[dict], plan: DocumentPlan) -> MapResult:
-    """費用CSVを column_map で決定論的に InterpretedRecord へ変換する（AI呼び出しなし）。
-
-    ADR-013: AI は構造を解釈（understand_batch）、Python は決定論的にマップ。
-    OntologyMapper._build_cost_item を再利用するため正規化ロジックの重複なし。
-    """
-    result = MapResult()
-    col_map = plan.column_map
-    event_link = plan.link_hints.get("event", "")
-
-    for row in rows:
-        mapped: dict = {}
-        for csv_col, onto_field in col_map.items():
-            if csv_col in row:
-                mapped[onto_field] = row[csv_col]
-        rec, skip = _mapper._build_cost_item(mapped, event_name=event_link)
-        if rec is not None:
-            result.records.append(rec)
-            if rec.transform is not None:
-                result.transformations.append(rec.transform)
-        if skip is not None:
-            result.skipped.append(skip)
-    return result
-
-
-# ── ファイル種別判定・読み込み ────────────────────────────────────────────────
-
-
-def _is_tabular(filename: str) -> bool:
-    return filename.lower().endswith((".csv", ".xlsx", ".xls"))
-
-
-def _read_tabular(filename: str, content: bytes) -> tuple[list[str], list[dict]]:
-    if filename.lower().endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig", dtype=str)
-    else:
-        df = pd.read_excel(io.BytesIO(content), dtype=str)
-    df = df.fillna("")
-    return list(df.columns), df.to_dict(orient="records")
-
-
-def _read_text(content: bytes) -> str:
-    return content.decode("utf-8", errors="replace")
-
-
-# ── 同一性解決（EntityResolver）─────────────────────────────────────────────────
-#
-# 安定ID（名前ハッシュ）を廃し、スペース内の実在エンティティを自然キーで検索する
-# find-or-create に一本化（ADR-011）。表記揺れは _normalize_name で吸収し、完全一致 →
-# 一意な包含一致（fuzzy）→ 新規 UUID 採番、の順で解決する。小規模 O(N) で十分。
+# ── 同一性解決（EntityResolver。ADR-011 のまま。曖昧一致の根拠ログのみ拡張）────────
 
 
 class EntityResolver:
@@ -536,6 +259,7 @@ class EntityResolver:
 
     seed: 既存マスタの [(自然キー文字列, uuid)]。コンストラクタでスペースから読み込む。
     fuzzy=True のときのみ包含一致のフォールバックを行う（マスタ向け。person/fact は False）。
+    log には新規採番（resolved_by=created）と包含一致（resolved_by=containment）を残す。
     """
 
     def __init__(self, kind: str, seed: list[tuple[str, str]], id_prefix: str, fuzzy: bool = True):
@@ -570,12 +294,22 @@ class EntityResolver:
             if len(cands) == 1:
                 _id = next(iter(cands))
                 self._by_key[key] = _id  # 以降の照合を高速化
+                self.log.append(
+                    {
+                        "kind": self.kind,
+                        "id": _id,
+                        "name": display or name,
+                        "resolved_by": "containment",
+                    }
+                )
                 return _id, False
         new_id = _new_id(self._id_prefix)
         self._by_key[key] = new_id
         self._entries.append((key, new_id))
         self.created[new_id] = display or name
-        self.log.append({"kind": self.kind, "id": new_id, "name": display or name})
+        self.log.append(
+            {"kind": self.kind, "id": new_id, "name": display or name, "resolved_by": "created"}
+        )
         return new_id, True
 
 
@@ -621,272 +355,334 @@ def _load_existing_persons(db: Any) -> list[tuple[str, str]]:
     return out
 
 
-# ── 解釈（観測着地）─────────────────────────────────────────────────────────────
+def _build_resolvers(db: Any) -> dict[str, EntityResolver]:
+    """マスタ種別ごとの resolver をレジストリ駆動で構築する。"""
+    resolvers: dict[str, EntityResolver] = {}
+    for kind, spec in REGISTRY.items():
+        if spec.role != "master":
+            continue
+        if kind == "persons":
+            seed = _load_existing_persons(db)
+        else:
+            seed = _load_existing(db, spec.collection, spec.natural_key[0], spec.id_field)
+        resolvers[kind] = EntityResolver(kind, seed, spec.id_prefix, fuzzy=spec.fuzzy)
+    return resolvers
+
+
+# ── source_records の行き先追跡 ──────────────────────────────────────────────────
 
 
 @dataclass
-class _FileInterpretation:
-    """1ファイルの解釈結果（中間レコード）。永続はバッチ横断の conform/bind が行う。"""
+class _Source:
+    """着地済みの観測ブロック1件（source_records のメモリ上の対応物）。"""
 
+    record_id: str
     filename: str
-    job_id: str | None = None
-    map_result: MapResult | None = None
-    counts: dict[str, int] = field(default_factory=dict)
-    error: str | None = None
+    row_no: int
+    raw: dict
+    bound_refs: dict[str, list[str]] = field(default_factory=dict)
+    pending_reasons: list[str] = field(default_factory=list)
+    skipped_reasons: list[str] = field(default_factory=list)
+
+    def bind(self, ref_kind: str, ref_id: str) -> None:
+        self.bound_refs.setdefault(ref_kind, []).append(ref_id)
+
+    def status(self) -> tuple[str, str]:
+        """最終ステータス。保留 > 結合済み > スキップ の優先で決める。"""
+        if self.pending_reasons:
+            return "pending", " / ".join(dict.fromkeys(self.pending_reasons))
+        if self.bound_refs:
+            return "bound", ""
+        reasons = " / ".join(dict.fromkeys(self.skipped_reasons)) or "解釈結果なし"
+        return "skipped", reasons
 
 
-_KIND_LABEL = {
-    "events": "Event",
-    "accounts": "Account",
-    "products": "Product",
-    "contents": "Content",
-    "cost_items": "CostItem",
-    "event_patch": "EventPatch",
-}
+# ── パイプライン本体 ─────────────────────────────────────────────────────────────
 
 
-def _summarize(result: MapResult) -> TransformationSummary:
-    entity_counts: dict[str, int] = {}
-    if result.person_observations:
-        entity_counts["Person"] = len(result.person_observations)
-    for rec in result.records:
-        label = _KIND_LABEL.get(rec.kind, rec.kind)
-        entity_counts[label] = entity_counts.get(label, 0) + 1
-    return TransformationSummary(
-        entity_counts=entity_counts,
-        product_breakdown={},
-        skipped_count=len(result.skipped),
-    )
+@dataclass
+class BatchResult:
+    """process_batch の結果（バッチ doc にも同内容を書き込む）。"""
+
+    created_entities: dict[str, int] = field(default_factory=dict)
+    pending_count: int = 0
+    skipped_count: int = 0
+    report_markdown: str = ""
 
 
-async def _interpret_file(
-    filename: str,
-    content: bytes,
-    hint: str | None,
-    db: Any,
-    space: SpaceContext | None = None,
-    document_plan: DocumentPlan | None = None,
-) -> _FileInterpretation:
-    """1ファイルを読み・AI 解釈し、中間レコード（MapResult）を返す。永続しない。
-
-    CSVパス: document_plan（understand_batch 出力）を受け取り、行単位並列 AI 抽出を行う。
-    TXTパス: DocumentExtractor で直接エンティティを抽出する。
-    解釈の監査（column_mapping / raw_extraction）は integration_jobs に子ジョブとして残す。
-    """
-    job_id = _new_id("job_")
-    space_id = space.space_id if space is not None else ""
+def _heartbeat(db: Any, batch_id: str, stage: str) -> None:
+    """ステージ毎の進捗を刻む（stale sweep の生存信号）。"""
     try:
-        column_mapping: DocumentPlan | None = None
-        raw_extraction_dict = None
-        if _is_tabular(filename):
-            _, rows = _read_tabular(filename, content)
-            plan = document_plan or DocumentPlan()
-            column_mapping = plan
-            if plan.entity_type == "cost_items":
-                logger.info(
-                    "extract_cost_rows_from_csv: file=%s link_hints=%s", filename, plan.link_hints
-                )
-                result = _extract_cost_rows_from_csv(rows, plan)
-            else:
-                logger.info(
-                    "extract_rows_parallel: file=%s entity_type=%s link_hints=%s",
-                    filename,
-                    plan.entity_type,
-                    plan.link_hints,
-                )
-                result = await _extract_rows_parallel(
-                    filename, rows, plan, space=space, job_id=job_id
-                )
-        else:
-            text = _read_text(content)
-            extraction = await run_document_extractor(text, space=space, hint=hint)
-            raw_extraction_dict = extraction.model_dump()
-            logger.info(
-                "document_extractor: file=%s detected=%s",
-                filename,
-                extraction.detected_entity_types,
+        db.document(f"integration_jobs/{batch_id}").set(
+            {"stage": stage, "heartbeat_at": _now_iso()}, merge=True
+        )
+    except Exception:
+        logger.exception("heartbeat failed: batch_id=%s stage=%s", batch_id, stage)
+
+
+async def _read_stage(
+    db: Any, space_id: str, batch_id: str, files: list[tuple[str, bytes]]
+) -> dict[str, list[_Source]]:
+    """Read: 全ファイルを観測ブロックに変換し source_records に着地させる。"""
+    by_file: dict[str, list[_Source]] = {}
+    for filename, content in files:
+        sources: list[_Source] = []
+        for block in readers.read_blocks(filename, content):
+            rid = _new_id("src_")
+            src = _Source(record_id=rid, filename=filename, row_no=block.row_no, raw=block.raw)
+            if block.read_error:
+                src.skipped_reasons.append(block.read_error)
+            record = SourceRecord(
+                record_id=rid,
+                space_id=space_id,
+                batch_id=batch_id,
+                filename=filename,
+                row_no=block.row_no,
+                raw=block.raw,
+                status="pending",
+                reason="処理中",
+                created_at=_now_iso(),
             )
-            result = _mapper.map_extraction(extraction, space_id=space_id, job_id=job_id)
+            db.document(f"source_records/{rid}").set(record.model_dump())
+            sources.append(src)
+        by_file[filename] = sources
+    return by_file
 
-        summary = _summarize(result)
-        job = IntegrationJob(
-            job_id=job_id,
-            space_id=space_id,
-            filenames=[filename],
-            hint=hint or "",
-            status="done",
-            created_entities=summary.entity_counts,
-            column_mapping=column_mapping,
-            raw_extraction=raw_extraction_dict,
-            transformations=result.transformations,
-            skipped_records=result.skipped,
-            transformation_summary=summary,
-            created_at=_now_iso(),
-        )
-        db.collection("integration_jobs").document(job_id).set(job.model_dump())
-        return _FileInterpretation(
-            filename=filename,
-            job_id=job_id,
-            map_result=result,
-            counts=summary.entity_counts,
-        )
+
+async def _merge_ai_parse_columns(
+    spec: IngestionSpec,
+    business_context: str,
+    ai_cols: list[str],
+    allowed_fields: list[str],
+    rows: list[dict],
+    irows: list[InterpretedRow],
+    space: SpaceContext | None,
+) -> None:
+    """ai_parse 宣言列を行単位で軽量 AI 抽出し、機械適用済みの行へマージする。"""
+    sem = asyncio.Semaphore(20)
+
+    async def _one(row_raw: dict, irow: InterpretedRow) -> None:
+        cells = {c: str(row_raw.get(c, "")).strip() for c in ai_cols}
+        cells = {c: v for c, v in cells.items() if v}
+        if not cells:
+            return
+        async with sem:
+            obs = await _ai_parse_cells(spec, business_context, allowed_fields, cells, space=space)
+        if obs:
+            engine.merge_observation(irow, spec, obs)
+
+    await asyncio.gather(*[_one(r, ir) for r, ir in zip(rows, irows, strict=True)])
+
+
+async def _interpret_tabular_file(
+    fp: FilePlan,
+    sources: list[_Source],
+    space: SpaceContext | None,
+) -> list[tuple[_Source, InterpretedRow]]:
+    """表形式1ファイルの解釈: 承認済み仕様の機械適用 + ai_parse 宣言列のみ軽量 AI。"""
+    rows = [s.raw for s in sources if not s.skipped_reasons]
+    live_sources = [s for s in sources if not s.skipped_reasons]
+    out: list[tuple[_Source, InterpretedRow]] = []
+    for target in fp.targets:
+        spec = REGISTRY[target.entity_type]
+        irows = engine.interpret_rows(spec, target, rows)
+        ai_cols = [
+            c
+            for c, mode in target.column_modes.items()
+            if mode == engine.AI_PARSE and c in target.column_map
+        ]
+        if ai_cols:
+            allowed = sorted({target.column_map[c] for c in ai_cols})
+            await _merge_ai_parse_columns(
+                spec, fp.business_context, ai_cols, allowed, rows, irows, space
+            )
+        out.extend(zip(live_sources, irows, strict=True))
+    return out
+
+
+async def _interpret_text_file(
+    fp: FilePlan,
+    sources: list[_Source],
+    space: SpaceContext | None,
+) -> list[tuple[_Source, InterpretedRow]]:
+    """文書1ファイルの解釈: スペック導出スキーマで抽出 → 同一経路（interpret_observation）へ。"""
+    if not sources or sources[0].skipped_reasons:
+        return []
+    source = sources[0]
+    text = str(source.raw.get("text", ""))
+    kinds = [t.entity_type for t in fp.targets]
+    try:
+        obs_map = await run_document_extractor(text, kinds, fp.business_context, space=space)
     except Exception as e:
-        logger.exception("interpret_file failed: filename=%s error=%s", filename, e)
-        return _FileInterpretation(filename=filename, error=str(e)[:500])
+        logger.exception("document extractor failed: file=%s", fp.filename)
+        source.skipped_reasons.append(f"文書抽出に失敗: {str(e)[:200]}")
+        return []
+    out: list[tuple[_Source, InterpretedRow]] = []
+    # 同一文書に単一イベントが記載されている場合、そのイベントを同文書内の観測のリンク既定にする
+    # （文書内の文脈による決定論的な補完。バッチ横断のフォールバックではない）
+    event_names = [str(o.get("name") or "").strip() for o in obs_map.get("events", [])]
+    event_names = [n for n in event_names if n]
+    doc_event = event_names[0] if len(event_names) == 1 else ""
+    for kind, obs_list in obs_map.items():
+        spec = REGISTRY[kind]
+        for obs in obs_list:
+            row = engine.interpret_observation(spec, obs)
+            if "event" in spec.links and not row.links.get("event") and doc_event:
+                row.links["event"] = doc_event
+            out.append((source, row))
+    return out
 
 
-# ── 確定（conform）: マスタを実在検索 find-or-create で確定・永続 ────────────────
+def _fill_required_fields(spec: IngestionSpec, payload: dict) -> None:
+    """モデルの必須フィールドの欠けを既定値で埋める（str→空文字、Enum→既定メンバー）。"""
+    enum_fields = enum_fields_of(spec.model)
+    for fname, fobj in spec.model.model_fields.items():
+        if not fobj.is_required() or fname in payload:
+            continue
+        if fname in (spec.id_field, "space_id"):
+            continue
+        if fname in enum_fields:
+            payload[fname] = _enum_default(spec, fname, enum_fields[fname])
+        elif fobj.annotation is str:
+            payload[fname] = ""
 
 
-def _master_appeal_spec(kind: str, entity: Any) -> tuple[str, dict] | None:
-    """マスタの appeal 生成スペック (summary_kind, payload)。account は appeal を持たない。"""
-    if kind == "events":
-        return "event", {
-            "name": entity.name,
-            "event_type": entity.event_type.value,
-            "venue": entity.venue,
-            "description": entity.description,
-        }
-    if kind == "products":
-        return "product", {
-            "product_name": entity.product_name,
-            "product_category": entity.product_category,
-        }
-    if kind == "contents":
-        return "content", {
-            "content_name": entity.content_name,
-            "content_type": entity.content_type.value,
-            "description": entity.description,
-        }
-    return None
-
-
-async def _appeal_or_empty(
-    spec: tuple[str, dict] | None, space: SpaceContext | None
-) -> tuple[str, list[float]]:
-    if not spec:
-        return "", []
-    return await semantic_search.build_appeal(spec[0], spec[1], space=space)
+def _appeal_payload(spec: IngestionSpec, entity: BaseModel) -> tuple[str, dict] | None:
+    if spec.appeal is None:
+        return None
+    payload = {}
+    for f in spec.appeal.payload_fields:
+        v = getattr(entity, f, "")
+        payload[f] = v.value if hasattr(v, "value") else v
+    return spec.appeal.kind, payload
 
 
 async def _conform_masters(
     db: Any,
     space: SpaceContext | None,
-    interps: list[_FileInterpretation],
+    interpreted: list[tuple[_Source, InterpretedRow]],
     default_event: str,
     resolvers: dict[str, EntityResolver],
-) -> set[str]:
-    """全ファイルのマスタ（events/accounts/products/contents）を確定・永続する。
+    counts: Counter,
+) -> None:
+    """Conform: マスタを実在検索 find-or-create で確定・永続する（レジストリ駆動）。
 
-    詳細レコードと観測からの参照を resolver で同一 UUID に畳み、payload を蓄積してから
-    1 マスタ 1 回だけ永続＋appeal 生成する（表記揺れ・依存順に依らず収束）。
-
-    Returns: このバッチで確定した event の uuid 集合（bind の単一イベントフォールバック判定に使う）。
+    詳細レコード（マスタ行）・パッチ（KPI/アンケート）・観測からの参照名を同一 UUID に畳み、
+    1 マスタ 1 回だけ永続 + appeal 生成する。
     """
     space_id = space.space_id if space is not None else ""
-    # masters[kind] = { uuid: payload }
-    masters: dict[str, dict[str, dict]] = {
-        "events": {},
-        "accounts": {},
-        "products": {},
-        "contents": {},
-    }
+    master_kinds = [k for k, s in REGISTRY.items() if s.role == "master" and k != "persons"]
+    masters: dict[str, dict[str, dict]] = {k: {} for k in master_kinds}
 
-    # 1) 詳細レコード（フルの payload）
-    for itp in interps:
-        if not itp.map_result:
+    def _resolve_into(kind: str, name: str) -> str | None:
+        uid, _ = resolvers[kind].resolve(name, display=name)
+        return uid
+
+    # 1) マスタ詳細行（フルの payload）+ パッチ行（イベントへの畳み込み）
+    for src, row in interpreted:
+        if row.skip_reason:
+            src.skipped_reasons.append(row.skip_reason)
             continue
-        for rec in itp.map_result.records:
-            if rec.kind in ("events", "accounts", "products"):
-                uid, _ = resolvers[rec.kind].resolve(rec.name, display=rec.name)
-                if uid:
-                    masters[rec.kind].setdefault(uid, {}).update(rec.payload)
-            elif rec.kind == "contents":
-                uid, _ = resolvers["contents"].resolve(rec.name, display=rec.name)
-                if not uid:
-                    continue
-                ev = rec.links.get("event", "")
-                ev_id = resolvers["events"].resolve(ev, display=ev)[0] if ev else None
-                payload = {**rec.payload}
-                if ev_id:
-                    payload["linked_event_id"] = ev_id
-                masters["contents"].setdefault(uid, {}).update(payload)
-            elif rec.kind == "event_patch":
-                ev = rec.links.get("event", "")
-                ev_id = resolvers["events"].resolve(ev, display=ev)[0] if ev else None
-                if ev_id:
-                    patch = {k: v for k, v in rec.payload.items() if v is not None}
-                    masters["events"].setdefault(ev_id, {}).update(patch)
+        spec = REGISTRY[row.kind]
+        if spec.role == "master" and row.kind in masters:
+            name = str(row.data.get(spec.natural_key[0]) or "")
+            uid = _resolve_into(row.kind, name)
+            if not uid:
+                continue
+            payload = dict(row.data)
+            # マスタのリンク（contents→event 等）は linked_{kind}_id へ解決
+            for link_kind in spec.links:
+                link_name = row.links.get(link_kind)
+                if isinstance(link_name, str) and link_name:
+                    linked_field = f"linked_{link_kind}_id"
+                    if linked_field in spec.model.model_fields:
+                        payload[linked_field] = _resolve_into(
+                            spec.links[link_kind].target, link_name
+                        )
+            masters[row.kind].setdefault(uid, {}).update(payload)
+            src.bind(row.kind, uid)
+        elif spec.role == "patch":
+            ev_name = (row.links.get("event") or "") or default_event
+            if not ev_name:
+                src.pending_reasons.append(
+                    f"イベントリンク未解決（{row.kind} の畳み込み先が決められない）"
+                )
+                continue
+            ev_id = _resolve_into("events", str(ev_name))
+            if not ev_id:
+                continue
+            patch = {k: v for k, v in row.data.items() if v is not None}
+            patch["updated_at"] = _now_iso()
+            masters["events"].setdefault(ev_id, {}).update(patch)
+            src.bind("events", ev_id)
 
-    # 2) 観測・費用からの参照（リンク名のみ）→ 最低限のマスタを保証（find-or-create の発見）
-    def _ensure(kind: str, name: str, name_field: str) -> None:
+    # 2) 観測・費用からの参照名 → 最低限のマスタを保証（find-or-create の発見）
+    def _ensure(kind: str, name: str) -> None:
         if not name:
             return
-        uid, _ = resolvers[kind].resolve(name, display=name)
+        spec = REGISTRY[kind]
+        uid = _resolve_into(kind, name)
         if uid:
-            masters[kind].setdefault(uid, {}).setdefault(name_field, name)
+            masters[kind].setdefault(uid, {}).setdefault(spec.natural_key[0], name)
 
-    for itp in interps:
-        if not itp.map_result:
+    if default_event:
+        _ensure("events", default_event)  # 確認済み既定イベントは必ず実在させる
+    for _src, row in interpreted:
+        if row.skip_reason or REGISTRY[row.kind].role == "master":
             continue
-        for obs in itp.map_result.person_observations:
-            _ensure("events", obs.event_link_name or default_event, "name")
-            _ensure("accounts", obs.company_name, "account_name")
-            for pn in obs.product_link_names:
-                _ensure("products", pn, "product_name")
-        for rec in itp.map_result.records:
-            if rec.kind == "cost_items":
-                _ensure("events", rec.links.get("event", ""), "name")
+        ev = row.links.get("event") or ""
+        if isinstance(ev, str):
+            _ensure("events", ev)
+        account = row.links.get("account") or ""
+        if isinstance(account, str):
+            _ensure("accounts", account)
+        for pn in row.links.get("product") or []:
+            _ensure("products", pn)
 
     # 3) エンティティ構築 → appeal 生成（並列）→ 永続
-    builders = {
-        "events": (Event, "event_id", "events"),
-        "accounts": (Account, "account_id", "accounts"),
-        "products": (Product, "product_id", "products"),
-        "contents": (Content, "content_id", "contents"),
-    }
-    pending: list[tuple[str, str, Any, tuple[str, dict] | None]] = []
+    pending: list[tuple[IngestionSpec, str, BaseModel, tuple[str, dict] | None]] = []
     for kind, items in masters.items():
-        Model, id_field, collection = builders[kind]
+        spec = REGISTRY[kind]
         for uid, payload in items.items():
+            payload.setdefault("created_at", _now_iso())
+            _fill_required_fields(spec, payload)
             try:
-                entity = Model(**{id_field: uid, "space_id": space_id, **payload})
+                entity = spec.model(**{spec.id_field: uid, "space_id": space_id, **payload})
             except Exception:
                 logger.exception(
                     "conform build failed: kind=%s uid=%s payload=%s", kind, uid, payload
                 )
                 continue
-            pending.append((collection, uid, entity, _master_appeal_spec(kind, entity)))
+            pending.append((spec, uid, entity, _appeal_payload(spec, entity)))
 
-    appeals = await asyncio.gather(*[_appeal_or_empty(spec, space) for *_, spec in pending])
-    for (collection, uid, entity, spec), (summary, vector) in zip(pending, appeals, strict=False):
-        if spec:
+    async def _appeal_or_empty(spec_payload: tuple[str, dict] | None) -> tuple[str, list[float]]:
+        if not spec_payload:
+            return "", []
+        return await semantic_search.build_appeal(spec_payload[0], spec_payload[1], space=space)
+
+    appeals = await asyncio.gather(*[_appeal_or_empty(ap) for *_, ap in pending])
+    for (spec, uid, entity, ap), (summary, vector) in zip(pending, appeals, strict=True):
+        if ap:
             entity.appeal_summary = summary
             entity.appeal_vector = vector
-        db.document(f"{collection}/{uid}").set(entity.model_dump(), merge=True)
+        db.document(f"{spec.collection}/{uid}").set(entity.model_dump(), merge=True)
+        counts[spec.kind] += 1
     logger.info("conform done: %s", {k: len(v) for k, v in masters.items()})
-    return set(masters["events"].keys())
-
-
-# ── 結合（bind）: person を確定し、ファクトを確定 UUID へ束ねて永続 ──────────────
 
 
 async def _bind_facts(
     db: Any,
     space: SpaceContext | None,
-    interps: list[_FileInterpretation],
+    interpreted: list[tuple[_Source, InterpretedRow]],
     resolvers: dict[str, EntityResolver],
     default_event: str,
-    job_id: str,
-    batch_event_ids: set[str] | None = None,
+    batch_id: str,
+    counts: Counter,
 ) -> set[str]:
-    """person を find-or-create し、event_attendances / product_interests / cost を永続する。
+    """Bind: person を確定し、ファクトを確定済み UUID へ束ねて永続する。
 
-    イベントリンクの解決順: 行の列/AI 既定（obs.event_link_name）→ 明示の既定イベント名
-    （default_event）→ バッチが単一イベントのみのときのフォールバック。参加者ファイルに
-    イベント列が無く（よくある）、かつそのイベントの概要等を同じバッチで取り込んだケースを救う。
-
-    Returns: 触れた person_id 集合（appeal 導出の対象）。
+    イベントリンクの優先順位: 行の列値（row.links）→ 確認済み既定イベント → 保留（pending）。
+    未解決はファクトを書かず source_record に理由を残す（黙って捨てない。person 自体は作る）。
     """
     space_id = space.space_id if space is not None else ""
     person_res = resolvers["persons"]
@@ -894,35 +690,41 @@ async def _bind_facts(
     att_res = EntityResolver("attendance", [], "att_", fuzzy=False)
     int_res = EntityResolver("interest", [], "int_", fuzzy=False)
     touched: set[str] = set()
-    # バッチに単一イベントしか無ければ、リンク未指定の観測をそのイベントへ束ねる
-    solo_event_id = (
-        next(iter(batch_event_ids)) if batch_event_ids and len(batch_event_ids) == 1 else None
-    )
-    fallback_used = 0
 
-    for itp in interps:
-        if not itp.map_result:
+    def _event_id_for(row: InterpretedRow) -> str | None:
+        ev_name = str(row.links.get("event") or "") or default_event
+        if not ev_name:
+            return None
+        return resolvers["events"].resolve(ev_name)[0]
+
+    for src, row in interpreted:
+        if row.skip_reason:
+            continue  # conform で記録済み
+        spec = REGISTRY[row.kind]
+        if spec.role != "fact":
             continue
-        for obs in itp.map_result.person_observations:
-            now = _now_iso()
-            account_id = None
-            if obs.company_name:
-                account_id = resolvers["accounts"].resolve(obs.company_name)[0]
+        now = _now_iso()
 
-            pkey = _person_key(obs.name, obs.email, obs.company_name)
-            pid, _created = person_res.resolve(pkey, display=obs.name)
+        if row.kind == "event_attendances":
+            company = str(row.links.get("account") or "")
+            account_id = resolvers["accounts"].resolve(company)[0] if company else None
+            pkey = _person_key(
+                str(row.data.get("name") or ""), str(row.data.get("email") or ""), company
+            )
+            pid, _created = person_res.resolve(pkey, display=str(row.data.get("name") or ""))
             if not pid:
+                src.skipped_reasons.append("person の自然キーが空")
                 continue
             person = Person(
                 person_id=pid,
                 space_id=space_id,
                 account_id=account_id,
-                name=obs.name,
-                email=obs.email or None,
-                department=obs.department,
-                job_title=obs.job_title,
+                name=str(row.data.get("name") or ""),
+                email=(row.data.get("email") or None),
+                department=str(row.data.get("department") or ""),
+                job_title=str(row.data.get("job_title") or ""),
                 stage=ContactStage.LEAD,
-                source_job_id=job_id,
+                source_job_id=batch_id,
                 created_at=now,
             )
             # appeal_* は導出ステージで全 attendance を集約して付与する（ここでは温存）
@@ -930,73 +732,81 @@ async def _bind_facts(
                 person.model_dump(exclude={"appeal_summary", "appeal_vector"}), merge=True
             )
             touched.add(pid)
+            counts["persons"] += 1
+            src.bind("persons", pid)
 
-            # 参加ファクト（接客事実つき）
-            ev_name = obs.event_link_name or default_event
-            ev_id = resolvers["events"].resolve(ev_name)[0] if ev_name else None
-            if not ev_id and solo_event_id:
-                ev_id = solo_event_id  # 単一イベントバッチのフォールバック
-                fallback_used += 1
+            ev_id = _event_id_for(row)
             if ev_id:
-                aid, _ac = att_res.resolve(f"{pid}|{ev_id}|{obs.action_type}")
+                aid, _ = att_res.resolve(f"{pid}|{ev_id}|{row.data.get('action_type') or '参加'}")
                 att = EventAttendance(
                     attendance_id=aid,
                     space_id=space_id,
                     person_id=pid,
                     event_id=ev_id,
-                    action_type=obs.action_type,
-                    owner_staff=obs.owner_staff,
-                    challenge_note=obs.challenge_note,
-                    memo=obs.memo,
-                    source_job_id=job_id,
+                    action_type=str(row.data.get("action_type") or "参加"),
+                    owner_staff=str(row.data.get("owner_staff") or ""),
+                    challenge_note=str(row.data.get("challenge_note") or ""),
+                    memo=str(row.data.get("memo") or ""),
+                    source_job_id=batch_id,
                     created_at=now,
                 )
                 db.document(f"event_attendances/{aid}").set(att.model_dump(), merge=True)
+                counts["event_attendances"] += 1
+                src.bind("event_attendances", aid)
+            else:
+                src.pending_reasons.append("イベントリンク未解決（行に列値なし・既定イベントなし）")
 
-            # 製品関心ファクト
-            for pn in obs.product_link_names:
+            for pn in row.links.get("product") or []:
                 pr_id = resolvers["products"].resolve(pn)[0]
                 if not pr_id:
                     continue
-                iid, _ic = int_res.resolve(f"{pid}|{pr_id}")
+                iid, _ = int_res.resolve(f"{pid}|{pr_id}")
                 pi = ProductInterest(
                     interest_id=iid,
                     space_id=space_id,
                     person_id=pid,
                     product_id=pr_id,
-                    source_job_id=job_id,
+                    source_job_id=batch_id,
                     created_at=now,
                 )
                 db.document(f"product_interests/{iid}").set(pi.model_dump(), merge=True)
-
-        # 費用ファクト（event 解決）
-        for rec in itp.map_result.records:
-            if rec.kind != "cost_items":
+                counts["product_interests"] += 1
+                src.bind("product_interests", iid)
+        else:
+            # 汎用ファクト（cost_items 等）: リンクを解決してモデルへ
+            ev_id = _event_id_for(row) if "event" in spec.links else None
+            if "event" in spec.links and spec.links["event"].required and not ev_id:
+                src.pending_reasons.append(
+                    f"イベントリンク未解決（{row.kind} の紐づけ先が決められない）"
+                )
                 continue
-            ev = rec.links.get("event", "")
-            ev_id = resolvers["events"].resolve(ev)[0] if ev else None
-            if not ev_id:
-                continue
-            cost_id = _new_id("cost_")
+            fact_id = _new_id(spec.id_prefix)
+            payload = dict(row.data)
+            _fill_required_fields(spec, payload)
             try:
-                cost = CostItem(
-                    cost_id=cost_id,
-                    space_id=space_id,
-                    event_id=ev_id,
-                    source_job_id=job_id,
-                    created_at=_now_iso(),
-                    **rec.payload,
+                fact = spec.model(
+                    **{
+                        spec.id_field: fact_id,
+                        "space_id": space_id,
+                        "event_id": ev_id,
+                        "source_job_id": batch_id,
+                        "created_at": now,
+                        **payload,
+                    }
                 )
             except Exception:
-                logger.exception("cost build failed: payload=%s", rec.payload)
+                logger.exception("fact build failed: kind=%s payload=%s", row.kind, payload)
+                src.skipped_reasons.append(f"{row.kind} の構築に失敗")
                 continue
-            db.document(f"cost_items/{cost_id}").set(cost.model_dump(), merge=True)
+            db.document(f"{spec.collection}/{fact_id}").set(fact.model_dump(), merge=True)
+            counts[row.kind] += 1
+            src.bind(row.kind, fact_id)
 
-    logger.info("bind done: touched_persons=%d solo_event_fallback=%d", len(touched), fallback_used)
+    logger.info("bind done: touched_persons=%d", len(touched))
     return touched
 
 
-# ── 導出（derive）: person.appeal を全 attendance から集約再生成 ──────────────────
+# ── Derive: person.appeal を全 attendance から集約再生成（ADR-011 のまま）───────────
 
 
 def _person_appeal_payload(person: dict, encounters: list[dict], interests: list[str]) -> dict:
@@ -1097,104 +907,160 @@ async def _derive_person_appeal(db: Any, space: SpaceContext | None, person_ids:
     logger.info("derive done: persons=%d", len(person_ids))
 
 
+# ── Report: P1 集計 + AI 整形 Markdown ─────────────────────────────────────────────
+
+
+async def _render_report(aggregate: dict, space: SpaceContext | None) -> str:
+    """集計を AI で Markdown に整形する。失敗時は素の集計 JSON を返す（事実は失わない）。"""
+    try:
+        _model = get_settings().model_ingestion
+        response = await _get_client().aio.models.generate_content(
+            model=_model, contents=prompts.render_report_prompt(aggregate)
+        )
+        if space is not None:
+            record_llm_response(space, _model, response)
+        text = (response.text or "").strip()
+        if text:
+            return text
+    except Exception:
+        logger.exception("_render_report failed")
+    return "```json\n" + json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n```"
+
+
 # ── バッチ処理（依存順の多段オーケストレーション）─────────────────────────────────
-
-
-@dataclass
-class BatchFileResult:
-    """バッチ内の1ファイルの処理結果。"""
-
-    filename: str
-    status: str  # "done" | "error"
-    job_id: str | None = None
-    created_entities: dict[str, int] = field(default_factory=dict)
-    error: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "filename": self.filename,
-            "status": self.status,
-            "job_id": self.job_id,
-            "created_entities": self.created_entities,
-            "error": self.error,
-        }
 
 
 async def process_batch(
     files: list[tuple[str, bytes]],
     batch_id: str,
     db: Any,  # space.ScopedClient（スペース前置済み）
-    hint: str | None = None,
+    plan: BatchPlan,
     space: SpaceContext | None = None,
-    event: str | None = None,
-) -> list[BatchFileResult]:
-    """複数ファイルを依存順の多段で統合する（ADR-011）。
+) -> BatchResult:
+    """承認済み BatchPlan（変換仕様）をそのまま実行する（承認と実行の一致。ADR-015）。
 
-    観測着地+解釈（並列）→ 確定(conform: マスタ)→ 結合(bind: person＋ファクト)→
-    導出(derive: person.appeal の集約再生成)。
-
-    hint はユーザーの自然言語ヒント。event は明示的な既定イベント名（hint より強いシグナル）。
-    space は LLM トークン計測に使う（None なら計測しない）。
+    Read → Interpret → Conform → Bind → Derive → Report。各段頭でハートビートを刻み、
+    全観測ブロックの行き先（bound / pending / skipped + 理由）を source_records に確定する。
     """
-    default_event = (event or "").strip()
+    space_id = space.space_id if space is not None else ""
+    default_event = plan.default_event.name.strip() if plan.default_event else ""
+    counts: Counter = Counter()
 
-    # 1) バッチ横断 AI 理解（Step1: 全ファイルのヘッダー+サンプルをフルモデルへ一括投入）
-    document_plans = await understand_batch(files, hint, space=space)
+    # 1) Read: 観測ブロックへ変換し source_records に着地
+    _heartbeat(db, batch_id, "read")
+    by_file = await _read_stage(db, space_id, batch_id, files)
 
-    # 2) 観測着地 + 解釈（ファイル並列）
-    interps = list(
-        await asyncio.gather(
-            *[
-                _interpret_file(
-                    fn, content, hint, db, space=space, document_plan=document_plans.get(fn)
-                )
-                for fn, content in files
-            ]
-        )
-    )
+    # 2) Interpret: 承認済み仕様の機械適用（ai_parse 宣言列と文書のみ AI）
+    _heartbeat(db, batch_id, "interpret")
+    plans_by_file = {fp.filename: fp for fp in plan.files}
+    interpreted: list[tuple[_Source, InterpretedRow]] = []
+    for filename, sources in by_file.items():
+        fp = plans_by_file.get(filename)
+        if fp is None or not fp.targets:
+            for s in sources:
+                s.skipped_reasons.append("変換仕様なし（承認済みプランに含まれないファイル）")
+            continue
+        if readers.is_tabular(filename):
+            interpreted.extend(await _interpret_tabular_file(fp, sources, space))
+        else:
+            interpreted.extend(await _interpret_text_file(fp, sources, space))
 
-    # resolver を既存マスタからシード
-    resolvers = {
-        "events": EntityResolver(
-            "event", _load_existing(db, "events", "name", "event_id"), "event_"
-        ),
-        "accounts": EntityResolver(
-            "account", _load_existing(db, "accounts", "account_name", "account_id"), "account_"
-        ),
-        "products": EntityResolver(
-            "product", _load_existing(db, "products", "product_name", "product_id"), "product_"
-        ),
-        "contents": EntityResolver(
-            "content", _load_existing(db, "contents", "content_name", "content_id"), "content_"
-        ),
-        "persons": EntityResolver("person", _load_existing_persons(db), "person_", fuzzy=False),
-    }
+    # 3) Conform → 4) Bind → 5) Derive（依存順。マスタ確定がファクト結合に先行する）
+    _heartbeat(db, batch_id, "conform")
+    resolvers = _build_resolvers(db)
+    await _conform_masters(db, space, interpreted, default_event, resolvers, counts)
 
-    job_id = _new_id("job_")  # conform/bind の由来として facts に刻む
+    _heartbeat(db, batch_id, "bind")
+    touched = await _bind_facts(db, space, interpreted, resolvers, default_event, batch_id, counts)
 
-    # 3) 確定（conform）→ 4) 結合（bind）→ 5) 導出（derive）
-    batch_event_ids = await _conform_masters(db, space, interps, default_event, resolvers)
-    touched = await _bind_facts(
-        db, space, interps, resolvers, default_event, job_id, batch_event_ids=batch_event_ids
-    )
+    _heartbeat(db, batch_id, "derive")
     await _derive_person_appeal(db, space, touched)
 
-    # 解決・新規採番したリンク先マスタをバッチ doc に監査記録
+    # 6) Report: 行き先の確定・集計・AI 整形
+    _heartbeat(db, batch_id, "report")
+    pending_count = 0
+    skipped_count = 0
+    pending_details: list[dict] = []
+    skipped_records: list[SkippedRecord] = []
+    all_sources = [s for sources in by_file.values() for s in sources]
+    for src in all_sources:
+        status, reason = src.status()
+        db.document(f"source_records/{src.record_id}").set(
+            {"status": status, "reason": reason, "refs": src.bound_refs}, merge=True
+        )
+        if status == "pending":
+            pending_count += 1
+            if len(pending_details) < 50:
+                pending_details.append(
+                    {"filename": src.filename, "row_no": src.row_no, "reason": reason}
+                )
+        elif status == "skipped":
+            skipped_count += 1
+            if len(skipped_records) < 200:
+                skipped_records.append(
+                    SkippedRecord(
+                        entity_type=src.filename, reason=reason, detail=str(src.raw)[:200]
+                    )
+                )
+
     resolved_links: list[dict] = []
+    new_masters: list[dict] = []
+    fuzzy_matches: list[dict] = []
     for r in resolvers.values():
         resolved_links.extend(r.log)
-    try:
-        db.document(f"integration_jobs/{batch_id}").set(
-            {"resolved_links": resolved_links}, merge=True
-        )
-    except Exception:
-        logger.exception("write resolved_links failed: batch_id=%s", batch_id)
+        for entry in r.log:
+            if entry.get("resolved_by") == "created" and entry["kind"] != "persons":
+                new_masters.append({"kind": entry["kind"], "name": entry["name"]})
+            elif entry.get("resolved_by") == "containment":
+                fuzzy_matches.append(entry)
 
-    return [
-        BatchFileResult(filename=itp.filename, status="error", error=itp.error)
-        if itp.error
-        else BatchFileResult(
-            filename=itp.filename, status="done", job_id=itp.job_id, created_entities=itp.counts
-        )
-        for itp in interps
-    ]
+    transformations: list[EntityTransformation] = []
+    for src, row in interpreted:
+        if row.decisions and len(transformations) < 200:
+            transformations.append(
+                EntityTransformation(
+                    entity_type=row.kind,
+                    entity_id="",
+                    source_label=f"{src.filename}:{src.row_no}",
+                    decisions=row.decisions,
+                )
+            )
+
+    aggregate = {
+        "created": dict(counts),
+        "pending_count": pending_count,
+        "pending": pending_details,
+        "skipped_count": skipped_count,
+        "skipped": [s.model_dump() for s in skipped_records[:20]],
+        "new_masters": new_masters,
+        "fuzzy_matches": fuzzy_matches,
+        "default_event": plan.default_event.model_dump() if plan.default_event else None,
+    }
+    report_markdown = await _render_report(aggregate, space)
+
+    db.document(f"integration_jobs/{batch_id}").set(
+        {
+            "plan": plan.model_dump(),
+            "created_entities": dict(counts),
+            "pending_count": pending_count,
+            "skipped_count": skipped_count,
+            "report_markdown": report_markdown,
+            "resolved_links": resolved_links,
+            "transformations": [t.model_dump() for t in transformations],
+            "skipped_records": [s.model_dump() for s in skipped_records],
+        },
+        merge=True,
+    )
+    logger.info(
+        "process_batch done: batch_id=%s created=%s pending=%d skipped=%d",
+        batch_id,
+        dict(counts),
+        pending_count,
+        skipped_count,
+    )
+    return BatchResult(
+        created_entities=dict(counts),
+        pending_count=pending_count,
+        skipped_count=skipped_count,
+        report_markdown=report_markdown,
+    )

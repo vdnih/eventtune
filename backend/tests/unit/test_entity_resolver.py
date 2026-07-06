@@ -34,6 +34,9 @@ def test_unique_containment_fallback():
     uid, created = res.resolve("2025秋展示会 IT EXPO 東京")
     assert uid == "event_full"
     assert created is False
+    # 曖昧一致の判断はバッチ報告に出すため、根拠付きでログに残る
+    entry = next(e for e in res.log if e["id"] == "event_full")
+    assert entry["resolved_by"] == "containment"
 
 
 def test_no_fuzzy_for_persons_creates_distinct():

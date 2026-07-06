@@ -1,14 +1,37 @@
 """Integration ルーター（/api/integration）の統合テスト。
 
 アップロード→バッチ作成→バックグラウンド処理→状態取得のフローを検証する。
-AI パイプライン（process_batch）は LLM を呼ぶためフェイクに差し替え、
-ルーターの責務（ジョブドキュメントのライフサイクル・結果マージ）に焦点を当てる。
+AI パイプライン（process_batch / understand_batch）は LLM を呼ぶためフェイクに差し替え、
+ルーターの責務（プラン契約・ジョブドキュメントのライフサイクル・stale sweep）に焦点を当てる。
 パイプライン内部のロジックは tests/unit/test_ingestion_pipeline.py が担う。
 """
+
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 pytestmark = pytest.mark.integration
+
+
+_APPROVED_PLAN = {
+    "default_event": {"name": "展示会X", "is_existing": False, "evidence": "ヒントより"},
+    "files": [
+        {
+            "filename": "attendees.csv",
+            "business_context": "展示会Xの参加者",
+            "targets": [
+                {
+                    "entity_type": "event_attendances",
+                    "column_map": {"name": "name", "email": "email"},
+                    "column_modes": {},
+                    "link_columns": {},
+                }
+            ],
+            "unmapped_notes": "",
+        }
+    ],
+}
 
 
 @pytest.fixture
@@ -19,42 +42,49 @@ def fake_process_batch(monkeypatch):
     のため、モジュール属性の差し替えが呼び出し時に反映される。
     """
     import agents.data_integration_agent as agent
-    from agents.data_integration_agent import BatchFileResult
+    from agents.data_integration_agent import BatchResult
 
     calls: list[dict] = []
 
-    async def _fake(files, batch_id, db, hint=None, space=None, event=None):
-        calls.append({"files": [f for f, _ in files], "hint": hint, "event": event})
-        return [
-            BatchFileResult(
-                filename=name,
-                status="done",
-                job_id=f"job_{i}",
-                created_entities={"persons": 2, "events": 1},
-            )
-            for i, (name, _) in enumerate(files)
-        ]
+    async def _fake(files, batch_id, db, plan, space=None):
+        calls.append(
+            {
+                "files": [f for f, _ in files],
+                "plan": plan.model_dump() if plan else None,
+            }
+        )
+        return BatchResult(
+            created_entities={"persons": 2, "events": 1},
+            pending_count=1,
+            skipped_count=0,
+            report_markdown="# 取り込み結果\n保留 1 件",
+        )
 
     monkeypatch.setattr(agent, "process_batch", _fake)
     return calls
 
 
-def test_upload_creates_batch_and_processes(make_client, seeded_space, db, fake_process_batch):
+def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, fake_process_batch):
+    """承認済み BatchPlan がそのまま process_batch に渡る（承認と実行の一致。ADR-015）。"""
     client = make_client(uid="uid_member")
     res = client.post(
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("attendees.csv", b"name,email\nA,a@example.com\n", "text/csv"))],
-        data={"hint": "展示会Xの参加者リスト"},
+        data={"plan": json.dumps(_APPROVED_PLAN), "hint": "展示会Xの参加者リスト"},
     )
     assert res.status_code == 202
     batch_id = res.json()["batch_id"]
-    assert res.json()["filenames"] == ["attendees.csv"]
 
     # TestClient は BackgroundTasks をレスポンス後に同期実行する
-    assert fake_process_batch == [
-        {"files": ["attendees.csv"], "hint": "展示会Xの参加者リスト", "event": ""}
-    ]
+    assert len(fake_process_batch) == 1
+    executed = fake_process_batch[0]
+    assert executed["files"] == ["attendees.csv"]
+    assert executed["plan"]["default_event"]["name"] == "展示会X"
+    assert executed["plan"]["files"][0]["targets"][0]["column_map"] == {
+        "name": "name",
+        "email": "email",
+    }
 
     status = client.get(
         f"/api/integration/batches/{batch_id}", headers={"X-Space-Id": seeded_space}
@@ -63,27 +93,70 @@ def test_upload_creates_batch_and_processes(make_client, seeded_space, db, fake_
     body = status.json()
     assert body["status"] == "done"
     assert body["created_entities"] == {"persons": 2, "events": 1}
+    assert body["pending_count"] == 1
+    assert body["report_markdown"].startswith("# 取り込み結果")
 
-    # ジョブドキュメントはスペース配下に作成される
+    # ジョブドキュメントはスペース配下に作成され、実行されたプランを保持する
     job = db.document(f"spaces/{seeded_space}/integration_jobs/{batch_id}").get()
     assert job.exists
+    assert job.to_dict()["plan"]["default_event"]["name"] == "展示会X"
 
 
-def test_upload_merges_created_entities_across_files(make_client, seeded_space, fake_process_batch):
+def test_plan_omitted_runs_understand_once(make_client, seeded_space, monkeypatch):
+    """plan 省略時（API 直叩き）は実行内で Understand が1回だけ走る。"""
+    import agents.data_integration_agent as agent
+    from agents.data_integration_agent import BatchResult
+    from ontology import BatchPlan, FilePlan
+
+    understand_calls: list[list[str]] = []
+    executed_plans: list[dict] = []
+
+    async def _fake_understand(files, hint, existing_event_names, space=None):
+        understand_calls.append([f for f, _ in files])
+        return BatchPlan(files=[FilePlan(filename="a.csv")])
+
+    async def _fake_process(files, batch_id, db, plan, space=None):
+        executed_plans.append(plan.model_dump())
+        return BatchResult()
+
+    monkeypatch.setattr(agent, "understand_batch", _fake_understand)
+    monkeypatch.setattr(agent, "process_batch", _fake_process)
+
     client = make_client(uid="uid_member")
     res = client.post(
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
-        files=[
-            ("files", ("a.csv", b"x\n1\n", "text/csv")),
-            ("files", ("b.csv", b"y\n2\n", "text/csv")),
-        ],
+        files=[("files", ("a.csv", b"x\n1\n", "text/csv"))],
     )
-    batch_id = res.json()["batch_id"]
-    body = client.get(
-        f"/api/integration/batches/{batch_id}", headers={"X-Space-Id": seeded_space}
-    ).json()
-    assert body["created_entities"] == {"persons": 4, "events": 2}
+    assert res.status_code == 202
+    assert understand_calls == [["a.csv"]]
+    assert executed_plans[0]["files"][0]["filename"] == "a.csv"
+
+
+def test_invalid_plan_json_returns_400(make_client, seeded_space, fake_process_batch):
+    client = make_client(uid="uid_member")
+    res = client.post(
+        "/api/integration/batches",
+        headers={"X-Space-Id": seeded_space},
+        files=[("files", ("a.csv", b"x\n1\n", "text/csv"))],
+        data={"plan": "{broken json"},
+    )
+    assert res.status_code == 400
+    assert fake_process_batch == []
+
+
+def test_pdf_upload_returns_400(make_client, seeded_space, fake_process_batch):
+    """PDF は明示拒否する（文字化けを AI に渡さない。ADR-015 決定7）。"""
+    client = make_client(uid="uid_member")
+    for endpoint in ("/api/integration/plan", "/api/integration/batches"):
+        res = client.post(
+            endpoint,
+            headers={"X-Space-Id": seeded_space},
+            files=[("files", ("report.pdf", b"%PDF-1.4 ...", "application/pdf"))],
+        )
+        assert res.status_code == 400
+        assert "未対応のファイル形式" in res.json()["detail"]
+    assert fake_process_batch == []
 
 
 def test_empty_upload_returns_400(make_client, seeded_space, fake_process_batch):
@@ -109,6 +182,7 @@ def test_pipeline_failure_marks_batch_error(make_client, seeded_space, monkeypat
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("a.csv", b"x\n1\n", "text/csv"))],
+        data={"plan": json.dumps(_APPROVED_PLAN)},
     )
     batch_id = res.json()["batch_id"]
     body = client.get(
@@ -116,6 +190,27 @@ def test_pipeline_failure_marks_batch_error(make_client, seeded_space, monkeypat
     ).json()
     assert body["status"] == "error"
     assert "pipeline exploded" in body["error"]
+
+
+def test_stale_processing_batch_is_swept_to_error(make_client, seeded_space, db):
+    """ハートビートが停止した processing ジョブは取得時に error へ倒される。"""
+    batch_id = "batch_stale"
+    stale_at = (datetime.now(UTC) - timedelta(seconds=3600)).isoformat()
+    db.document(f"spaces/{seeded_space}/integration_jobs/{batch_id}").set(
+        {
+            "batch_id": batch_id,
+            "status": "processing",
+            "stage": "interpret",
+            "heartbeat_at": stale_at,
+            "filenames": ["a.csv"],
+        }
+    )
+    client = make_client(uid="uid_member")
+    body = client.get(
+        f"/api/integration/batches/{batch_id}", headers={"X-Space-Id": seeded_space}
+    ).json()
+    assert body["status"] == "error"
+    assert "実行途絶" in body["error"]
 
 
 def test_unknown_batch_returns_404(make_client, seeded_space):
