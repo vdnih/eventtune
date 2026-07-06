@@ -44,16 +44,31 @@ interface CodeBlock {
   outcome?: string;
 }
 
-// 取り込みプラン（POST /api/integration/plan のレスポンス）
+// 取り込みプラン（POST /api/integration/plan のレスポンス = BatchPlan。
+// ユーザーが確認・修正したものをそのまま POST /batches の plan に渡す = 承認と実行の契約）
+interface TargetPlan {
+  entity_type: string;
+  column_map: Record<string, string>;
+  column_modes: Record<string, string>; // {元列: "direct" | "ai_parse"}
+  link_columns: Record<string, string>; // {リンク種別: 元列}
+}
+
 interface FilePlan {
   filename: string;
   business_context: string;
-  entity_type: string;
-  source_file_role: string;
-  link_hints: Record<string, string>;
-  link_existing: Record<string, boolean>;
-  column_map: Record<string, string>;
+  targets: TargetPlan[];
   unmapped_notes: string;
+}
+
+interface DefaultEventPlan {
+  name: string;
+  is_existing: boolean;
+  evidence: string;
+}
+
+interface BatchPlan {
+  default_event: DefaultEventPlan | null;
+  files: FilePlan[];
 }
 
 // チャット timeline のメッセージ型
@@ -73,7 +88,12 @@ type ChatMessage =
       deliverables?: DeliverableData[];
       runId?: string;
       loading?: boolean;
-      pendingConfirm?: { files: File[]; hint: string };
+      pendingConfirm?: {
+        files: File[];
+        hint: string;
+        plan: BatchPlan | null; // null = プラン生成失敗（実行側で Understand を1回だけ実行）
+        proposedEvent: DefaultEventPlan | null; // AI 提案の原本（「イベントなし」解除時の復元用）
+      };
     };
 
 const INITIAL_MESSAGE: ChatMessage = {
@@ -160,14 +180,11 @@ const ENTITY_LABEL: Record<string, string> = {
   events: "イベント",
   products: "製品",
   contents: "コンテンツ",
+  event_attendances: "イベント参加（接客）",
+  product_interests: "製品関心",
   cost_items: "費用",
-};
-
-const ROLE_LABEL: Record<string, string> = {
-  participant_list: "参加者リスト",
-  event_master: "イベントマスタ",
-  cost_list: "費用一覧",
-  content_list: "コンテンツ一覧",
+  event_kpi: "イベントKPI",
+  survey_summary: "アンケート集計",
 };
 
 const LINK_KIND_LABEL: Record<string, string> = {
@@ -176,28 +193,31 @@ const LINK_KIND_LABEL: Record<string, string> = {
   product: "製品",
 };
 
-function buildPlanText(plans: FilePlan[]): string {
+function buildPlanText(plan: BatchPlan): string {
   const lines: string[] = [];
-  for (const fp of plans) {
+  for (const fp of plan.files) {
     lines.push(`**${fp.filename}**`);
     if (fp.business_context) lines.push(fp.business_context);
-    const typeLabel = ENTITY_LABEL[fp.entity_type] ?? fp.entity_type;
-    const roleLabel = ROLE_LABEL[fp.source_file_role] ?? fp.source_file_role;
-    if (typeLabel) lines.push(`種別: ${typeLabel}${roleLabel ? `（${roleLabel}）` : ""}`);
-    for (const [kind, name] of Object.entries(fp.link_hints)) {
-      const ex = fp.link_existing[kind] ? "既存" : "新規";
-      lines.push(`${LINK_KIND_LABEL[kind] ?? kind}: ${name}（${ex}）`);
-    }
-    if (Object.keys(fp.column_map).length > 0) {
-      const entries = Object.entries(fp.column_map);
-      const cols = entries.slice(0, 5).map(([k, v]) => `${k}→${v}`).join("、");
-      const more = entries.length > 5 ? `、他${entries.length - 5}列` : "";
-      lines.push(`カラム: ${cols}${more}`);
+    for (const t of fp.targets) {
+      lines.push(`種別: ${ENTITY_LABEL[t.entity_type] ?? t.entity_type}`);
+      const entries = Object.entries(t.column_map);
+      if (entries.length > 0) {
+        const cols = entries.slice(0, 5).map(([k, v]) => `${k}→${v}`).join("、");
+        const more = entries.length > 5 ? `、他${entries.length - 5}列` : "";
+        lines.push(`カラム: ${cols}${more}`);
+      }
+      for (const [kind, col] of Object.entries(t.link_columns)) {
+        lines.push(`${LINK_KIND_LABEL[kind] ?? kind}リンク: 「${col}」列で行ごとに解決`);
+      }
+      const aiCols = Object.entries(t.column_modes)
+        .filter(([, mode]) => mode === "ai_parse")
+        .map(([col]) => col);
+      if (aiCols.length > 0) lines.push(`AI解釈列: ${aiCols.join("、")}`);
     }
     if (fp.unmapped_notes) lines.push(`⚠️ ${fp.unmapped_notes}`);
     lines.push("");
   }
-  lines.push("このデータを取り込みますか？");
+  lines.push("この内容（と下の既定イベント）で取り込みますか？");
   return lines.join("\n");
 }
 
@@ -253,23 +273,36 @@ export default function DashboardPage() {
       if (hint.trim()) formData.append("hint", hint.trim());
 
       const res = await authFetch("/api/integration/plan", { method: "POST", body: formData });
-      if (!res.ok) throw new Error(`エラー ${res.status}`);
-      const data = await res.json();
-      const plan: FilePlan[] = data.files ?? [];
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail ?? `エラー ${res.status}`);
+      }
+      const plan: BatchPlan = await res.json();
       const text = buildPlanText(plan);
 
       setMessages((prev) =>
         prev.map((m) =>
           m.id === asstMsgId
-            ? { ...m, content: text, loading: false, pendingConfirm: { files, hint } }
+            ? {
+                ...m,
+                content: text,
+                loading: false,
+                pendingConfirm: { files, hint, plan, proposedEvent: plan.default_event },
+              }
             : m
         )
       );
-    } catch {
+    } catch (e) {
+      // プラン生成失敗: 実行側で Understand を1回だけ実行する経路（plan なし）へ委ねる
       setMessages((prev) =>
         prev.map((m) =>
           m.id === asstMsgId
-            ? { ...m, content: "ファイルを解析しました。このデータを取り込みますか？", loading: false, pendingConfirm: { files, hint } }
+            ? {
+                ...m,
+                content: `プランの提示に失敗しました（${(e as Error).message}）。このまま取り込みを実行しますか？`,
+                loading: false,
+                pendingConfirm: { files, hint, plan: null, proposedEvent: null },
+              }
             : m
         )
       );
@@ -278,7 +311,26 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleConfirmIngestion(msgId: string, files: File[], hint: string) {
+  /** 確認ブロックの既定イベント編集（名前変更 / 「イベントなし」トグル）。 */
+  function updateDefaultEvent(msgId: string, next: DefaultEventPlan | null) {
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== msgId || m.role !== "assistant" || !m.pendingConfirm?.plan) return m;
+        return {
+          ...m,
+          pendingConfirm: {
+            ...m.pendingConfirm,
+            plan: { ...m.pendingConfirm.plan, default_event: next },
+          },
+        };
+      })
+    );
+  }
+
+  async function handleConfirmIngestion(
+    msgId: string,
+    pending: { files: File[]; hint: string; plan: BatchPlan | null }
+  ) {
     setMessages((prev) =>
       prev.map((m) =>
         m.id === msgId ? { ...m, pendingConfirm: undefined, loading: true } : m
@@ -288,8 +340,10 @@ export default function DashboardPage() {
 
     try {
       const formData = new FormData();
-      files.forEach((f) => formData.append("files", f));
-      if (hint.trim()) formData.append("hint", hint.trim());
+      pending.files.forEach((f) => formData.append("files", f));
+      if (pending.hint.trim()) formData.append("hint", pending.hint.trim());
+      // 承認済みプラン（既定イベントの修正を含む）をそのまま実行に渡す（ADR-015 決定4）
+      if (pending.plan) formData.append("plan", JSON.stringify(pending.plan));
 
       const res = await authFetch("/api/integration/batches", { method: "POST", body: formData });
       if (!res.ok) {
@@ -329,10 +383,16 @@ export default function DashboardPage() {
           const ce = data.created_entities ?? {};
           const parts = Object.entries(ce)
             .filter(([, v]) => (v as number) > 0)
-            .map(([k, v]) => `${k}: ${v}件`);
+            .map(([k, v]) => `${ENTITY_LABEL[k] ?? k}: ${v}件`);
+          const fallback = parts.length
+            ? `取り込み結果: ${parts.join(" / ")}`
+            : "取り込み完了（新規エンティティなし）";
+          const pendingCount = (data.pending_count as number) ?? 0;
           const resultText = [
-            data.partial ? "⚠️ 一部のファイルで取り込みに失敗しました。" : "",
-            parts.length ? `取り込み結果: ${parts.join(" / ")}` : "取り込み完了（新規エンティティなし）",
+            (data.report_markdown as string) || fallback,
+            pendingCount > 0
+              ? `⚠️ 保留 ${pendingCount} 件（イベント未確定の行）は「データ」タブの「取り込み行（着地）」から確認できます。`
+              : "",
             "データの確認は「データ」タブから行えます。",
           ]
             .filter(Boolean)
@@ -674,19 +734,76 @@ export default function DashboardPage() {
                     <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-gray-400 animate-pulse rounded-sm align-middle" />
                   )}
                   {msg.pendingConfirm && (
-                    <div className="flex gap-2 mt-3 pt-2 border-t border-gray-100">
-                      <button
-                        onClick={() => handleConfirmIngestion(msg.id, msg.pendingConfirm!.files, msg.pendingConfirm!.hint)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition"
-                      >
-                        <Check className="w-3.5 h-3.5" /> 取り込む
-                      </button>
-                      <button
-                        onClick={() => handleCancelIngestion(msg.id)}
-                        className="px-3 py-1.5 text-xs rounded-lg border border-gray-300 text-gray-600 hover:bg-white transition"
-                      >
-                        キャンセル
-                      </button>
+                    <div className="mt-3 pt-2 border-t border-gray-100 space-y-2">
+                      {msg.pendingConfirm.plan && (
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2 text-xs">
+                            <span className="text-gray-500 shrink-0">既定イベント:</span>
+                            <input
+                              type="text"
+                              value={msg.pendingConfirm.plan.default_event?.name ?? ""}
+                              disabled={msg.pendingConfirm.plan.default_event === null}
+                              placeholder="（なし）"
+                              onChange={(e) => {
+                                const cur = msg.pendingConfirm!.plan!.default_event;
+                                updateDefaultEvent(msg.id, {
+                                  name: e.target.value,
+                                  is_existing:
+                                    cur?.name === e.target.value ? (cur?.is_existing ?? false) : false,
+                                  evidence: cur?.evidence ?? "",
+                                });
+                              }}
+                              className="flex-1 min-w-0 rounded-lg border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400 disabled:bg-gray-100 disabled:text-gray-400"
+                            />
+                            {msg.pendingConfirm.plan.default_event && (
+                              <span
+                                className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded-full ${
+                                  msg.pendingConfirm.plan.default_event.is_existing
+                                    ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                    : "bg-amber-50 text-amber-700 border border-amber-200"
+                                }`}
+                              >
+                                {msg.pendingConfirm.plan.default_event.is_existing ? "既存" : "新規"}
+                              </span>
+                            )}
+                            <label className="shrink-0 flex items-center gap-1 text-[11px] text-gray-500">
+                              <input
+                                type="checkbox"
+                                checked={msg.pendingConfirm.plan.default_event === null}
+                                onChange={(e) =>
+                                  updateDefaultEvent(
+                                    msg.id,
+                                    e.target.checked ? null : (msg.pendingConfirm!.proposedEvent ?? { name: "", is_existing: false, evidence: "" })
+                                  )
+                                }
+                              />
+                              イベントなし
+                            </label>
+                          </div>
+                          {msg.pendingConfirm.plan.default_event?.evidence && (
+                            <div className="text-[11px] text-gray-400">
+                              提案根拠: {msg.pendingConfirm.plan.default_event.evidence}
+                            </div>
+                          )}
+                          <div className="text-[11px] text-gray-400">
+                            行にイベント列がある場合はそちらが優先されます。どちらも無い行は保留になります。
+                          </div>
+                        </div>
+                      )}
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleConfirmIngestion(msg.id, msg.pendingConfirm!)}
+                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition"
+                        >
+                          <Check className="w-3.5 h-3.5" /> 取り込む
+                        </button>
+                        <button
+                          onClick={() => handleCancelIngestion(msg.id)}
+                          className="px-3 py-1.5 text-xs rounded-lg border border-gray-300 text-gray-600 hover:bg-white transition"
+                        >
+                          キャンセル
+                        </button>
+                      </div>
                     </div>
                   )}
                   {msg.deliverables && msg.deliverables.length > 0 && (
@@ -749,7 +866,7 @@ export default function DashboardPage() {
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".csv,.xlsx,.xls,.txt,.pdf"
+            accept=".csv,.xlsx,.xls,.txt"
             className="hidden"
             onChange={(e) => {
               const files = Array.from(e.target.files ?? []);
