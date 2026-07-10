@@ -58,6 +58,7 @@ interface FilePlan {
   business_context: string;
   targets: TargetPlan[];
   unmapped_notes: string;
+  extraction_caveat: string;
 }
 
 interface DefaultEventPlan {
@@ -215,6 +216,7 @@ function buildPlanText(plan: BatchPlan): string {
       if (aiCols.length > 0) lines.push(`AI解釈列: ${aiCols.join("、")}`);
     }
     if (fp.unmapped_notes) lines.push(`⚠️ ${fp.unmapped_notes}`);
+    if (fp.extraction_caveat) lines.push(`⚠️ ${fp.extraction_caveat}`);
     lines.push("");
   }
   lines.push("この内容（と下の既定イベント）で取り込みますか？");
@@ -866,7 +868,7 @@ export default function DashboardPage() {
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".csv,.xlsx,.xls,.txt,.docx"
+            accept=".csv,.xlsx,.xls,.txt,.docx,.pdf,.pptx"
             className="hidden"
             onChange={(e) => {
               const files = Array.from(e.target.files ?? []);

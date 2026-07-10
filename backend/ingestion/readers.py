@@ -1,9 +1,11 @@
 """
 readers — ファイル → 観測ブロック（Read ステージの読み込み部。純粋・Firestore 非依存）
 
-対応形式は CSV / Excel / テキスト / Word (.docx) のみ。旧形式の .doc や PDF 等の
-未対応形式は UnsupportedFileError を送出し、ルーターが 400 に変換する
-（読めない文字化けを AI に渡さない。ADR-015 決定7）。
+対応形式は CSV / Excel / テキスト / Word (.docx) / PDF / PowerPoint (.pptx)。
+PDF・PPTX はテキスト抽出のみ（表のレイアウト・図解・画像内の文字は取り込まれない場合が
+ある。multimodal 読み取りは需要が実際に発生した時点の拡張トリガーのまま、ADR-015）。
+抽出品質の注意は `extraction_caveat()` が返し、確認画面（Confirm）に表示する。
+旧形式の .doc 等の未対応形式は UnsupportedFileError を送出し、ルーターが 400 に変換する。
 """
 
 import io
@@ -11,14 +13,29 @@ from dataclasses import dataclass
 
 import docx
 import pandas as pd
+import pptx
+from pypdf import PdfReader
 
 SUPPORTED_TABULAR = (".csv", ".xlsx", ".xls")
 SUPPORTED_TEXT = (".txt",)
 SUPPORTED_DOCX = (".docx",)
+SUPPORTED_PDF = (".pdf",)
+SUPPORTED_PPTX = (".pptx",)
+
+_EXTRACTION_CAVEATS = {
+    SUPPORTED_PDF: (
+        "PDF はテキスト抽出のみのため、表のレイアウトや画像内の文字は取り込まれない"
+        "場合があります。抽出結果をご確認ください。"
+    ),
+    SUPPORTED_PPTX: (
+        "PowerPoint はテキスト抽出のみのため、図解・グラフ・画像内の文字は取り込まれない"
+        "場合があります。抽出結果をご確認ください。"
+    ),
+}
 
 
 class UnsupportedFileError(ValueError):
-    """未対応のファイル形式（PDF 等）。ルーターが 400 に変換する。"""
+    """未対応のファイル形式（.doc 等）。ルーターが 400 に変換する。"""
 
 
 def is_tabular(filename: str) -> bool:
@@ -29,15 +46,35 @@ def is_docx(filename: str) -> bool:
     return filename.lower().endswith(SUPPORTED_DOCX)
 
 
+def is_pdf(filename: str) -> bool:
+    return filename.lower().endswith(SUPPORTED_PDF)
+
+
+def is_pptx(filename: str) -> bool:
+    return filename.lower().endswith(SUPPORTED_PPTX)
+
+
 def is_supported(filename: str) -> bool:
-    return filename.lower().endswith(SUPPORTED_TABULAR + SUPPORTED_TEXT + SUPPORTED_DOCX)
+    return filename.lower().endswith(
+        SUPPORTED_TABULAR + SUPPORTED_TEXT + SUPPORTED_DOCX + SUPPORTED_PDF + SUPPORTED_PPTX
+    )
 
 
 def ensure_supported(filename: str) -> None:
     if not is_supported(filename):
         raise UnsupportedFileError(
-            f"未対応のファイル形式です: {filename}（対応形式: CSV / Excel / テキスト / Word）"
+            f"未対応のファイル形式です: {filename}"
+            "（対応形式: CSV / Excel / テキスト / Word / PDF / PowerPoint）"
         )
+
+
+def extraction_caveat(filename: str) -> str:
+    """フォーマット起因の定型注意（PDF/PPTX のみ非空）。P1 の決定論的判定で、AI は関与しない。"""
+    lower = filename.lower()
+    for exts, message in _EXTRACTION_CAVEATS.items():
+        if lower.endswith(exts):
+            return message
+    return ""
 
 
 def read_tabular(filename: str, content: bytes) -> tuple[list[str], list[dict]]:
@@ -72,10 +109,41 @@ def read_docx(content: bytes) -> str:
     return "\n".join(parts)
 
 
+def read_pdf(content: bytes) -> str:
+    """PDF からページ単位のテキストを抽出する（テキスト抽出のみ。表・レイアウトは崩れる前提）。"""
+    reader = PdfReader(io.BytesIO(content))
+    parts = [page.extract_text() or "" for page in reader.pages]
+    return "\n".join(p for p in parts if p.strip())
+
+
+def read_pptx(content: bytes) -> str:
+    """PowerPoint (.pptx) からテキストを抽出する（テキストボックス + 表）。
+
+    docx の `read_docx` と同じ「段落＋表を "セルA | セルB" 形式で連結」の方針を踏襲する。
+    スライド順に走査するが、スライド区切りのマーカーは付けない（実装の単純さを優先）。
+    """
+    presentation = pptx.Presentation(io.BytesIO(content))
+    parts: list[str] = []
+    for slide in presentation.slides:
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip():
+                parts.append(shape.text_frame.text.strip())
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
+
 def read_document_text(filename: str, content: bytes) -> str:
-    """非表形式ファイルから本文テキストを抽出する（.txt はデコード、.docx は段落+表を連結）。"""
+    """非表形式ファイルから本文テキストを抽出する（.txt はデコード、.docx/.pdf/.pptx は専用抽出）。"""
     if is_docx(filename):
         return read_docx(content)
+    if is_pdf(filename):
+        return read_pdf(content)
+    if is_pptx(filename):
+        return read_pptx(content)
     return read_text(content)
 
 

@@ -26,8 +26,8 @@ from typing import Any
 
 import pandas as pd
 import vertexai
-from google import genai
 from google.adk.agents import Agent
+from google.adk.models import Gemini
 from google.adk.runners import Runner
 from google.adk.sessions import VertexAiSessionService
 from google.adk.tools import ToolContext
@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from vertexai import types as vai_types
 
 from config import get_settings
+from genai_client import RETRY_OPTIONS, new_client
 from metering import metered, record_compute, record_llm, record_llm_response
 from ontology import (
     Deliverable,
@@ -703,7 +704,7 @@ def build_agent(db: Any, space: SpaceContext) -> Agent:
     """
     return Agent(
         name="marketing_agent",
-        model=get_settings().model_agent,
+        model=Gemini(model=get_settings().model_agent, retry_options=RETRY_OPTIONS),
         description="EventTune のマーケティングエージェント。メール生成・振り返り分析・戦略立案を汎用的に担う。",
         instruction=_SYSTEM_PROMPT,
         tools=make_tools(db, space),
@@ -940,7 +941,7 @@ def _generate_one_pattern(
 - ブランド資産の維持: トーン＆マナー・用語・言い回しはセグメント横断で一貫させる。
 """
     _model = get_settings().model_content
-    client = genai.Client()
+    client = new_client()
     response = client.models.generate_content(
         model=_model,
         contents=f"セグメント「{bucket}」向けのメールパターンを作成してください。",

@@ -48,7 +48,8 @@
 
 ### DataIntegrationAgent (`agents/data_integration_agent.py` + `ingestion/`)
 
-カオスなファイル（CSV/Excel/テキスト/Word。PDF は明示拒否）をオントロジーへ分解・リンク解決して
+カオスなファイル（CSV/Excel/テキスト/Word/PDF/PowerPoint。PDF・PowerPoint はテキスト抽出のみで
+欠落リスクは Confirm 画面に注釈表示）をオントロジーへ分解・リンク解決して
 書き込む。概念の正典は [INGESTION_MAPPING.md](INGESTION_MAPPING.md) / ADR-015。
 
 | 項目 | 内容 |

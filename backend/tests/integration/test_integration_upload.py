@@ -145,18 +145,108 @@ def test_invalid_plan_json_returns_400(make_client, seeded_space, fake_process_b
     assert fake_process_batch == []
 
 
-def test_pdf_upload_returns_400(make_client, seeded_space, fake_process_batch):
-    """PDF は明示拒否する（文字化けを AI に渡さない。ADR-015 決定7）。"""
+def test_legacy_doc_upload_returns_400(make_client, seeded_space, fake_process_batch):
+    """旧形式 .doc は明示拒否する（文字化けを AI に渡さない）。"""
     client = make_client(uid="uid_member")
     for endpoint in ("/api/integration/plan", "/api/integration/batches"):
         res = client.post(
             endpoint,
             headers={"X-Space-Id": seeded_space},
-            files=[("files", ("report.pdf", b"%PDF-1.4 ...", "application/pdf"))],
+            files=[("files", ("report.doc", b"legacy doc bytes", "application/msword"))],
         )
         assert res.status_code == 400
         assert "未対応のファイル形式" in res.json()["detail"]
     assert fake_process_batch == []
+
+
+def test_pdf_upload_accepted(make_client, seeded_space, fake_process_batch, monkeypatch):
+    """PDF はテキスト抽出限定で受理される（ADR-015 決定7 改訂）。"""
+    import agents.data_integration_agent as agent
+    from ontology import BatchPlan, FilePlan
+
+    pdf_bytes = b"%PDF-1.4 ..."
+
+    async def _fake_understand(files, hint, existing_event_names, space=None):
+        return BatchPlan(files=[FilePlan(filename="report.pdf")])
+
+    monkeypatch.setattr(agent, "understand_batch", _fake_understand)
+
+    client = make_client(uid="uid_member")
+
+    plan_res = client.post(
+        "/api/integration/plan",
+        headers={"X-Space-Id": seeded_space},
+        files=[("files", ("report.pdf", pdf_bytes, "application/pdf"))],
+    )
+    assert plan_res.status_code == 200
+    assert plan_res.json()["files"][0]["extraction_caveat"] != ""
+
+    batch_res = client.post(
+        "/api/integration/batches",
+        headers={"X-Space-Id": seeded_space},
+        files=[("files", ("report.pdf", pdf_bytes, "application/pdf"))],
+    )
+    assert batch_res.status_code == 202
+    assert fake_process_batch[0]["files"] == ["report.pdf"]
+
+
+def test_pptx_upload_accepted(make_client, seeded_space, fake_process_batch, monkeypatch):
+    """PowerPoint (.pptx) はテキスト抽出限定で受理される。"""
+    import io
+
+    from pptx import Presentation
+
+    import agents.data_integration_agent as agent
+    from ontology import BatchPlan, FilePlan
+
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(0, 0, 100, 100)
+    box.text_frame.text = "概要"
+    buf = io.BytesIO()
+    presentation.save(buf)
+    pptx_bytes = buf.getvalue()
+
+    async def _fake_understand(files, hint, existing_event_names, space=None):
+        return BatchPlan(files=[FilePlan(filename="slides.pptx")])
+
+    monkeypatch.setattr(agent, "understand_batch", _fake_understand)
+
+    client = make_client(uid="uid_member")
+
+    plan_res = client.post(
+        "/api/integration/plan",
+        headers={"X-Space-Id": seeded_space},
+        files=[
+            (
+                "files",
+                (
+                    "slides.pptx",
+                    pptx_bytes,
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ),
+            )
+        ],
+    )
+    assert plan_res.status_code == 200
+    assert plan_res.json()["files"][0]["extraction_caveat"] != ""
+
+    batch_res = client.post(
+        "/api/integration/batches",
+        headers={"X-Space-Id": seeded_space},
+        files=[
+            (
+                "files",
+                (
+                    "slides.pptx",
+                    pptx_bytes,
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ),
+            )
+        ],
+    )
+    assert batch_res.status_code == 202
+    assert fake_process_batch[0]["files"] == ["slides.pptx"]
 
 
 def test_docx_upload_accepted(make_client, seeded_space, fake_process_batch, monkeypatch):
