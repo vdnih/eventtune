@@ -369,6 +369,9 @@ class FilePlan(BaseModel):
     business_context: str = ""  # 業務的な理解（例: "2025秋展示会の接客記録"）
     targets: list[TargetPlan] = []
     unmapped_notes: str = ""  # 対応づけられなかった列・不明点（確認画面に出す）
+    extraction_caveat: str = (
+        ""  # フォーマット起因の定型注意（PDF/PPTX）。P1 が上書きする。AI は設定しない
+    )
 
 
 class DefaultEventPlan(BaseModel):

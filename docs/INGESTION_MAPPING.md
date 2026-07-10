@@ -329,11 +329,14 @@ prompt_context の一段落、observation モデルの宣言、非自明な norm
   実行基盤の移行（Cloud Tasks 等）は ADR-002 のトリガー発火まで行わない。
 - **再実行と冪等性**: ファクトの重複は（person, event, action）/（person, product）キーで抑止する
   （現行踏襲）。同じバッチの再実行は、承認済み BatchPlan と source_records から同じ結果に収束する。
-- **ファイル種別の正直な取り扱い**: 対応形式は CSV / Excel / テキスト / Word (.docx)。旧形式の
-  .doc と PDF は UI の accept リストから除外し、API でも 4xx で明示拒否する（読めない文字化けを
-  AI に渡さない）。docx は文書（テキスト）扱いの Read リーダーを追加しただけで、Interpret 以降の
-  ロジックは変更していない。PDF の multimodal 読み取りは需要が実際に発生した時点で Read ステージの
-  リーダーとして追加する（ADR-015 拡張トリガー。docx とは別軸）。
+- **ファイル種別の正直な取り扱い**: 対応形式は CSV / Excel / テキスト / Word (.docx) / PDF /
+  PowerPoint (.pptx)。旧形式の .doc のみ UI の accept リストから除外し、API でも 4xx で明示拒否する
+  （読めない文字化けを AI に渡さない）。docx / PDF / PowerPoint はいずれも文書（テキスト）扱いの
+  Read リーダーを追加しただけで、Interpret 以降のロジックは変更していない。PDF・PowerPoint は
+  テキスト抽出のみのため、表のレイアウト・図解・画像内の文字が欠落し得る。この注意は AI ではなく
+  拡張子から一意に決まる P1 の決定論的な定型文（`FilePlan.extraction_caveat`）として Confirm 画面に
+  必ず表示し、黙って欠落させない（ADR-015）。表・レイアウト込みの multimodal 読み取りへの本格対応は
+  需要が実際に発生した時点で Read ステージのリーダーを差し替える形で行う（ADR-015 拡張トリガー）。
 
 ---
 
@@ -370,7 +373,7 @@ prompt_context の一段落、observation モデルの宣言、非自明な norm
 | プロンプト内オントロジー定義の3箇所手書き | レジストリからの単一レンダラー（§6） |
 | `DocumentPlan`（1ファイル=1種別・link_hints） | `BatchPlan` / `FilePlan.targets`（複数種別・§4） |
 | `ColumnMappingResult`（死蔵モデル） | 削除（BatchPlan に置換済み） |
-| PDF の UTF-8 強制デコード | accept 除外＋API 4xx 拒否（§9） |
+| PDF の UTF-8 強制デコード | 専用リーダー（pypdf）＋ `extraction_caveat` で欠落リスクを可視化（§9） |
 | 観測の非永続（一過性の行ブロック） | `source_records` へ永続（§8。ADR-011 保留事項の再決定） |
 
 ---

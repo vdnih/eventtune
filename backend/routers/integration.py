@@ -20,7 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 
 from dependencies import get_space_context
 from ingestion.normalize import _normalize_name
-from ingestion.readers import is_supported
+from ingestion.readers import extraction_caveat, is_supported
 from metering import metered
 from ontology import BatchPlan
 from space import SpaceContext
@@ -38,14 +38,17 @@ def _now_iso() -> str:
 
 
 async def _load_files(files: list[UploadFile]) -> list[tuple[str, bytes]]:
-    """アップロードを検証して読み込む。空 / 未対応形式（PDF 等）は 400。"""
+    """アップロードを検証して読み込む。空 / 未対応形式（旧 .doc 等）は 400。"""
     loaded: list[tuple[str, bytes]] = []
     for f in files:
         filename = f.filename or "upload"
         if not is_supported(filename):
             raise HTTPException(
                 status_code=400,
-                detail=f"未対応のファイル形式です: {filename}（対応形式: CSV / Excel / テキスト / Word）",
+                detail=(
+                    f"未対応のファイル形式です: {filename}"
+                    "（対応形式: CSV / Excel / テキスト / Word / PDF / PowerPoint）"
+                ),
             )
         content = await f.read()
         if content:
@@ -96,6 +99,9 @@ async def plan_ingestion(
     if plan.default_event is not None:
         existing_norm = {_normalize_name(n) for n in existing}
         plan.default_event.is_existing = _normalize_name(plan.default_event.name) in existing_norm
+
+    for fp in plan.files:
+        fp.extraction_caveat = extraction_caveat(fp.filename)
 
     return plan.model_dump()
 

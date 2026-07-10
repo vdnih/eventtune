@@ -16,7 +16,8 @@ AIが読み解いてふさわしい構成と言葉を選ぶ。個別カスタマ
 ## コア体験
 
 1. **スペース**（テナント）を作成 — データ・課金はスペース単位で構造的に分離
-2. CSV / Excel やイベント概要・KPI・アンケートのテキスト・Word 文書を**複数まとめてアップロード**
+2. CSV / Excel やイベント概要・KPI・アンケートのテキスト・Word / PDF / PowerPoint 文書を
+   **複数まとめてアップロード**
 3. **DataIntegrationAgent** が列名・表記ゆれを吸収し、来歴（source_job_id）付きで OSI
    オントロジー（マスタ `Person` / `Account` / `Product` / `Content` / `Event` ＋ ファクト
    `EventAttendance` / `ProductInterest` / `CostItem`。各マスタは appeal_summary / appeal_vector を持つ）へ統合
