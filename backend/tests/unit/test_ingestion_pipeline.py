@@ -10,11 +10,22 @@
 """
 
 import asyncio
+import io
+
+import docx as docx_lib
 
 import agents.data_integration_agent as agent
 from agents.data_integration_agent import process_batch
 from ontology import BatchPlan, DefaultEventPlan, FilePlan, TargetPlan
 from tests.unit.fakes import FakeDB
+
+
+def _make_docx(text: str) -> bytes:
+    document = docx_lib.Document()
+    document.add_paragraph(text)
+    buf = io.BytesIO()
+    document.save(buf)
+    return buf.getvalue()
 
 
 def _fake_appeal(monkeypatch):
@@ -107,6 +118,32 @@ def test_pipeline_converges_links_and_dedups(monkeypatch):
     sources = db.docs("source_records")
     assert len(sources) == 3  # CSV 2行 + 文書 1件
     assert all(s["status"] == "bound" for s in sources)
+    assert result.pending_count == 0
+
+
+def test_docx_document_integrates_like_txt(monkeypatch):
+    """実際の (モックしていない) Read ステージが .docx を解析し、.txt 同様に収束する。"""
+    _fake_appeal(monkeypatch)
+
+    async def _fake_doc_extractor(text, target_kinds, business_context, space=None):
+        assert "概要" in text  # 実際の docx 抽出テキストが Interpret に渡っている
+        return {"events": [{"name": "2025秋展示会"}]}
+
+    monkeypatch.setattr(agent, "run_document_extractor", _fake_doc_extractor)
+
+    plan = BatchPlan(
+        files=[FilePlan(filename="overview.docx", targets=[TargetPlan(entity_type="events")])]
+    )
+    db = FakeDB()
+    result = _run(db, [("overview.docx", _make_docx("概要"))], plan)
+
+    events = db.docs("events")
+    assert len(events) == 1
+    assert events[0]["name"] == "2025秋展示会"
+
+    sources = db.docs("source_records")
+    assert len(sources) == 1
+    assert sources[0]["status"] == "bound"
     assert result.pending_count == 0
 
 

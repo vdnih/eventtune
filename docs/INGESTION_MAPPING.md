@@ -329,9 +329,11 @@ prompt_context の一段落、observation モデルの宣言、非自明な norm
   実行基盤の移行（Cloud Tasks 等）は ADR-002 のトリガー発火まで行わない。
 - **再実行と冪等性**: ファクトの重複は（person, event, action）/（person, product）キーで抑止する
   （現行踏襲）。同じバッチの再実行は、承認済み BatchPlan と source_records から同じ結果に収束する。
-- **ファイル種別の正直な取り扱い**: 対応形式は CSV / Excel / テキスト。PDF は UI の accept リストから
-  除外し、API でも 4xx で明示拒否する（読めない文字化けを AI に渡さない）。multimodal 読み取りは
-  需要が実際に発生した時点で Read ステージのリーダーとして追加する（ADR-015 拡張トリガー）。
+- **ファイル種別の正直な取り扱い**: 対応形式は CSV / Excel / テキスト / Word (.docx)。旧形式の
+  .doc と PDF は UI の accept リストから除外し、API でも 4xx で明示拒否する（読めない文字化けを
+  AI に渡さない）。docx は文書（テキスト）扱いの Read リーダーを追加しただけで、Interpret 以降の
+  ロジックは変更していない。PDF の multimodal 読み取りは需要が実際に発生した時点で Read ステージの
+  リーダーとして追加する（ADR-015 拡張トリガー。docx とは別軸）。
 
 ---
 

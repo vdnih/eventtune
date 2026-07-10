@@ -45,7 +45,7 @@ async def _load_files(files: list[UploadFile]) -> list[tuple[str, bytes]]:
         if not is_supported(filename):
             raise HTTPException(
                 status_code=400,
-                detail=f"未対応のファイル形式です: {filename}（対応形式: CSV / Excel / テキスト）",
+                detail=f"未対応のファイル形式です: {filename}（対応形式: CSV / Excel / テキスト / Word）",
             )
         content = await f.read()
         if content:

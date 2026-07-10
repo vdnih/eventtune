@@ -88,7 +88,11 @@ def _files_block(files: list[tuple[str, bytes]]) -> str:
             except Exception as e:
                 parts.append(f"--- {filename} ---\n読み込みエラー: {e}")
         else:
-            parts.append(f"--- {filename} ---\n{readers.read_text(content)[:800]}")
+            try:
+                text = readers.read_document_text(filename, content)
+                parts.append(f"--- {filename} ---\n{text[:800]}")
+            except Exception as e:
+                parts.append(f"--- {filename} ---\n読み込みエラー: {e}")
     return "\n\n".join(parts)
 
 

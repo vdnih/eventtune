@@ -866,7 +866,7 @@ export default function DashboardPage() {
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".csv,.xlsx,.xls,.txt"
+            accept=".csv,.xlsx,.xls,.txt,.docx"
             className="hidden"
             onChange={(e) => {
               const files = Array.from(e.target.files ?? []);

@@ -159,6 +159,62 @@ def test_pdf_upload_returns_400(make_client, seeded_space, fake_process_batch):
     assert fake_process_batch == []
 
 
+def test_docx_upload_accepted(make_client, seeded_space, fake_process_batch, monkeypatch):
+    """Word (.docx) は文書として受理される（PDF とは異なり明示拒否しない）。"""
+    import io
+
+    import docx as docx_lib
+
+    import agents.data_integration_agent as agent
+    from ontology import BatchPlan, FilePlan
+
+    document = docx_lib.Document()
+    document.add_paragraph("概要テキスト")
+    buf = io.BytesIO()
+    document.save(buf)
+    docx_bytes = buf.getvalue()
+
+    async def _fake_understand(files, hint, existing_event_names, space=None):
+        return BatchPlan(files=[FilePlan(filename="overview.docx")])
+
+    monkeypatch.setattr(agent, "understand_batch", _fake_understand)
+
+    client = make_client(uid="uid_member")
+
+    plan_res = client.post(
+        "/api/integration/plan",
+        headers={"X-Space-Id": seeded_space},
+        files=[
+            (
+                "files",
+                (
+                    "overview.docx",
+                    docx_bytes,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+            )
+        ],
+    )
+    assert plan_res.status_code == 200
+
+    batch_res = client.post(
+        "/api/integration/batches",
+        headers={"X-Space-Id": seeded_space},
+        files=[
+            (
+                "files",
+                (
+                    "overview.docx",
+                    docx_bytes,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+            )
+        ],
+    )
+    assert batch_res.status_code == 202
+    assert fake_process_batch[0]["files"] == ["overview.docx"]
+
+
 def test_empty_upload_returns_400(make_client, seeded_space, fake_process_batch):
     client = make_client(uid="uid_member")
     res = client.post(
