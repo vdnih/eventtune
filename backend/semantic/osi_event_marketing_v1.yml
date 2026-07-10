@@ -380,6 +380,9 @@ relationships:
   - {name: attendance_to_person, left_dataset: event_attendances, right_dataset: persons, sql: "{{ left_dataset.person_id }} = {{ right_dataset.person_id }}"}
   - {name: attendance_to_event,  left_dataset: event_attendances, right_dataset: events,  sql: "{{ left_dataset.event_id }} = {{ right_dataset.event_id }}"}
 
+  # イベント費用明細
+  - {name: cost_to_event, left_dataset: cost_items, right_dataset: events, sql: "{{ left_dataset.event_id }} = {{ right_dataset.event_id }}"}
+
   # 製品興味ログ
   - {name: interest_to_person,  left_dataset: product_interests, right_dataset: persons,  sql: "{{ left_dataset.person_id }} = {{ right_dataset.person_id }}"}
   - {name: interest_to_product, left_dataset: product_interests, right_dataset: products, sql: "{{ left_dataset.product_id }} = {{ right_dataset.product_id }}"}

@@ -789,14 +789,18 @@ async def _bind_facts(
             payload = dict(row.data)
             _fill_required_fields(spec, payload)
             try:
+                # バインダーが注入する identity/link/provenance フィールドは、観測由来の
+                # payload より必ず優先させる（payload を先に展開して上書きされる側にする）。
+                # 例: _fill_required_fields は必須 str の event_id を "" で埋めるため、
+                # payload を後置きすると解決済み ev_id を空文字が潰してしまう。
                 fact = spec.model(
                     **{
+                        **payload,
                         spec.id_field: fact_id,
                         "space_id": space_id,
                         "event_id": ev_id,
                         "source_job_id": batch_id,
                         "created_at": now,
-                        **payload,
                     }
                 )
             except Exception:

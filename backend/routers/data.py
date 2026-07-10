@@ -72,8 +72,10 @@ VIEWS: dict[str, tuple[str, str, Callable[[SpaceContext], Iterator[dict]]]] = {
 
 # ── ファクト/参照の表示名エンリッチ ───────────────────────────────────────────
 #
-# osi_event_marketing_v1.yml の `relationships`（FK 宣言）を正典とし、フロントが
-# ID しか読めない問題を解消する。ファクト行にマスタの表示名を付与して返す。
+# osi_event_marketing_v1.yml の `relationships`（FK 宣言）に対応する FK を（手動で）
+# 反映し、フロントが ID しか読めない問題を解消する。ファクト行にマスタの表示名を
+# 付与して返す。※YAML は概念モデルで Python からはロードしない。runtime の正典は
+# specs.py の REGISTRY / 本 _ENRICH 側であり、両者を YAML と手動で揃える。
 # Firestore は物理 JOIN しないため、対象マスタを1回だけ stream して {id: name} 辞書を
 # 作り、O(1) 辞書引きで付与する（N+1 なし）。
 #

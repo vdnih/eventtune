@@ -250,6 +250,47 @@ def test_row_link_column_overrides_default_event(monkeypatch):
     assert bound_events.count(events["既定イベントC"]) == 1  # 列が空の行のみ既定へ
 
 
+def test_cost_items_retain_resolved_event_id(monkeypatch):
+    """費用ファクトは解決済み event_id を保持する（必須フィールド既定の空文字で潰さない）。
+
+    回帰: _fill_required_fields が必須 str の event_id を "" で埋め、fact 構築時に
+    payload を後置きしていたため、解決済み ev_id を空文字が上書きしていた。結果
+    cost_items.event_id が常に "" となり、events との JOIN・表示名解決が壊れていた。
+    """
+    _fake_appeal(monkeypatch)
+    csv = "費目,内容,金額\n会場費・出展費,ブース出展料,2200000\n".encode()
+    plan = BatchPlan(
+        default_event=DefaultEventPlan(name="スマート工場EXPO 2025秋", evidence="概要より"),
+        files=[
+            FilePlan(
+                filename="costs.csv",
+                targets=[
+                    TargetPlan(
+                        entity_type="cost_items",
+                        column_map={
+                            "費目": "category",
+                            "内容": "description",
+                            "金額": "amount_jpy",
+                        },
+                    )
+                ],
+            )
+        ],
+    )
+    db = FakeDB()
+    result = _run(db, [("costs.csv", csv)], plan)
+
+    events = db.docs("events")
+    assert len(events) == 1
+    event_id = events[0]["event_id"]
+
+    costs = db.docs("cost_items")
+    assert len(costs) == 1
+    assert costs[0]["event_id"] == event_id
+    assert costs[0]["event_id"]  # 空文字でない（回帰ガード）
+    assert result.pending_count == 0
+
+
 def test_document_patches_fold_into_event(monkeypatch):
     """文書由来の KPI/アンケートが当該イベントの doc へ畳み込まれる。"""
     _fake_appeal(monkeypatch)
