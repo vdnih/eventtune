@@ -112,9 +112,9 @@ _SYSTEM_PROMPT = """\
 
 【オントロジーの定義】
 マスタ（持続する実体。それぞれ appeal_summary / appeal_vector を持つ）:
-- Person: ハウスリストの人物（旧 Contact）。ContactStage と EngagementLevel を持つ
+- Person: ハウスリストの人物（旧 Contact）。ContactStage を持つ
   - ContactStage: LEAD / MQL / SQL / CUSTOMER / EXCLUDED
-  - EngagementLevel (stage=LEAD のとき有効): アポ獲得済み / アポなし・感度高 / 通常リード
+  - 温度感・興味度の観測事実は event_attendances.challenge_note（テキスト）と appeal_summary が担う
 - Account: 企業マスター。Person に account_id で紐づく
 - Product: 製品マスター
 - Content: 推薦可能なコンテンツ（資料・事例・セミナー等）
@@ -176,7 +176,7 @@ ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / ap
    - イベントの**実参加者数** = event_attendances を event_id で件数集計
      （例: event_attendances[event_attendances.event_id == X].shape[0]）。events の KPI 列ではなくここから出す。
    - 参加者の属性分布 = event_attendances → persons（→ accounts）を person_id/account_id で merge し、
-     contact_stage / engagement_level / 業種・企業規模で集計。
+     contact_stage / 業種・企業規模で集計。
    - 関心製品の分布 = product_interests を product_id・イベント別に集計。
    - 予算・目標名刺数・定性メモ = events の total_budget / target_contact_count / description。
 3. **欠損は「止まる理由」ではなく「注記」**: ある数値列（KPI 等）が NaN でも分析を放棄しない。

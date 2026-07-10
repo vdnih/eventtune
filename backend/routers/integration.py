@@ -2,75 +2,72 @@
 Data Integration Router — /api/integration
 
 ファイルアップロード・取り込みプラン提案・バッチ処理のエンドポイントを提供する。
-docs/INGESTION_MAPPING.md に従い、イベント割り当てではなく「ファイル→オントロジー分解」を行う。
+docs/INGESTION_MAPPING.md / ADR-015 に従い、「承認済み BatchPlan がそのまま実行される」
+契約を提供する（プレビューと実行が別々に AI を呼ぶ構成の廃止）。
 
-  POST /api/integration/plan           → AI がファイル内容を読み分解プラン（種別＋リンク案）を返す
-  POST /api/integration/batches        → hint 付きで実際の取り込みを開始
-  GET  /api/integration/batches        → バッチ一覧
-  GET  /api/integration/batches/{id}   → バッチ状態
-  GET  /api/integration/batches/{id}/report   → 加工レポート
-  GET  /api/integration/batches/{id}/contacts → 取り込み済み Person
+  POST /api/integration/plan         → AI が BatchPlan（変換仕様 + 既定イベント提案）を返す
+  POST /api/integration/batches      → 承認済み BatchPlan 付きで取り込みを開始
+  GET  /api/integration/batches      → （提供しない。閲覧は /api/data に一本化）
+  GET  /api/integration/batches/{id} → バッチ状態 + 報告 Markdown（stale sweep 付き）
 """
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
 
-from agents.ontology_mapper import _normalize_name
 from dependencies import get_space_context
+from ingestion.normalize import _normalize_name
+from ingestion.readers import is_supported
 from metering import metered
-from ontology import DocumentPlan
+from ontology import BatchPlan
 from space import SpaceContext
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/integration", tags=["integration"])
 
+# ハートビートがこの秒数以上更新されない processing ジョブは実行途絶とみなす
+STALE_AFTER_SECONDS = 600
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-# ── 取り込みプラン提案 ──────────────────────────────────────────────────────────
+async def _load_files(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    """アップロードを検証して読み込む。空 / 未対応形式（PDF 等）は 400。"""
+    loaded: list[tuple[str, bytes]] = []
+    for f in files:
+        filename = f.filename or "upload"
+        if not is_supported(filename):
+            raise HTTPException(
+                status_code=400,
+                detail=f"未対応のファイル形式です: {filename}（対応形式: CSV / Excel / テキスト / Word）",
+            )
+        content = await f.read()
+        if content:
+            loaded.append((filename, content))
+    if not loaded:
+        raise HTTPException(status_code=400, detail="有効なファイルがありません")
+    return loaded
 
 
-class _FilePlan(BaseModel):
-    filename: str
-    business_context: str = ""
-    entity_type: str = ""
-    source_file_role: str = ""
-    link_hints: dict[str, str] = {}  # {kind: マスタ名}
-    link_existing: dict[str, bool] = {}  # {kind: 既存マスタに一致するか}
-    column_map: dict[str, str] = {}
-    unmapped_notes: str = ""
-
-
-class _PlanResponse(BaseModel):
-    files: list[_FilePlan]
-
-
-def _load_master_names(space: SpaceContext) -> dict[str, list[str]]:
-    """既存マスタ名（events/accounts/products）を取得し、リンク照合のヒントにする。"""
-    out: dict[str, list[str]] = {"events": [], "accounts": [], "products": []}
-    for col, field in (
-        ("events", "name"),
-        ("accounts", "account_name"),
-        ("products", "product_name"),
-    ):
-        try:
-            for doc in space.col(col).get():
-                name = (doc.to_dict() or {}).get(field, "")
-                if name:
-                    out[col].append(name)
-        except Exception:
-            pass
+def _existing_event_names(space: SpaceContext) -> list[str]:
+    out: list[str] = []
+    try:
+        for doc in space.col("events").get():
+            name = (doc.to_dict() or {}).get("name", "")
+            if name:
+                out.append(name)
+    except Exception:
+        pass
     return out
 
 
-_KIND_TO_COL = {"event": "events", "account": "accounts", "product": "products"}
+# ── 取り込みプラン提案（Understand → Confirm の材料）──────────────────────────────
 
 
 @router.post("/plan")
@@ -79,44 +76,31 @@ async def plan_ingestion(
     hint: str | None = Form(None),
     space: SpaceContext = Depends(get_space_context),
 ):
-    """ファイルを受け取り、understand_batch で分解プランを生成して返す（保存しない）。"""
-    from agents.data_integration_agent import understand_batch
+    """ファイルを受け取り、BatchPlan（変換仕様）を生成して返す（保存しない）。
 
-    loaded: list[tuple[str, bytes]] = []
-    for f in files:
-        content = await f.read()
-        loaded.append((f.filename or "upload", content))
+    ユーザーはこのプランを確認・修正し、そのまま POST /batches の `plan` に渡す。
+    default_event.is_existing は既存イベント照合で P1 が確定する（AI は設定しない）。
+    """
+    from agents.data_integration_agent import UnderstandError, understand_batch
 
-    with metered(space):
-        document_plans = await understand_batch(loaded, (hint or "").strip() or None, space=space)
-
-    masters = _load_master_names(space)
-
-    result_files: list[_FilePlan] = []
-    for filename, _ in loaded:
-        plan: DocumentPlan = document_plans.get(filename, DocumentPlan())
-        link_existing: dict[str, bool] = {}
-        for kind, name in plan.link_hints.items():
-            col = _KIND_TO_COL.get(kind, kind + "s")
-            norm_name = _normalize_name(name)
-            link_existing[kind] = norm_name in {_normalize_name(n) for n in masters.get(col, [])}
-        result_files.append(
-            _FilePlan(
-                filename=filename,
-                business_context=plan.business_context,
-                entity_type=plan.entity_type,
-                source_file_role=plan.source_file_role,
-                link_hints=plan.link_hints,
-                link_existing=link_existing,
-                column_map=plan.column_map,
-                unmapped_notes=plan.unmapped_notes,
+    loaded = await _load_files(files)
+    existing = _existing_event_names(space)
+    try:
+        with metered(space):
+            plan = await understand_batch(
+                loaded, (hint or "").strip() or None, existing, space=space
             )
-        )
+    except UnderstandError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
-    return {"files": [f.model_dump() for f in result_files]}
+    if plan.default_event is not None:
+        existing_norm = {_normalize_name(n) for n in existing}
+        plan.default_event.is_existing = _normalize_name(plan.default_event.name) in existing_norm
+
+    return plan.model_dump()
 
 
-# ── バッチ処理 ─────────────────────────────────────────────────────────────────
+# ── バッチ処理（承認済み BatchPlan の実行）─────────────────────────────────────────
 
 
 async def _run_integration(
@@ -124,52 +108,45 @@ async def _run_integration(
     batch_id: str,
     files: list[tuple[str, bytes]],
     hint: str | None,
-    event: str | None = None,
+    plan: BatchPlan | None,
 ) -> None:
-    from agents.data_integration_agent import process_batch
+    from agents.data_integration_agent import process_batch, understand_batch
 
     scoped = space.scoped_db()
     try:
         scoped.collection("integration_jobs").document(batch_id).update({"status": "processing"})
         with metered(space):
-            results = await process_batch(
-                files, batch_id, scoped, hint=hint, space=space, event=event
-            )
-
-        merged: dict[str, int] = {}
-        for r in results:
-            for k, v in r.created_entities.items():
-                merged[k] = merged.get(k, 0) + v
-
-        any_ok = any(r.status == "done" for r in results)
-        any_err = any(r.status == "error" for r in results)
-        batch_status = "done" if any_ok else "error"
-        child_job_ids = [r.job_id for r in results if r.job_id]
+            if plan is None:
+                # plan 省略時（API 直叩き）: 実行内で1回だけ Understand を実行して採用する。
+                # UI 経由は常に承認済みプランを送る（承認と実行の一致）。
+                plan = await understand_batch(
+                    files, hint, _existing_event_names(space), space=space
+                )
+                scoped.collection("integration_jobs").document(batch_id).update(
+                    {"plan": plan.model_dump()}
+                )
+            result = await process_batch(files, batch_id, scoped, plan, space=space)
 
         scoped.collection("integration_jobs").document(batch_id).update(
             {
-                "status": batch_status,
-                "files": [r.to_dict() for r in results],
-                "created_entities": merged,
-                "child_job_ids": child_job_ids,
-                "partial": any_ok and any_err,
+                "status": "done",
+                "created_entities": result.created_entities,
+                "pending_count": result.pending_count,
+                "skipped_count": result.skipped_count,
+                "report_markdown": result.report_markdown,
             }
         )
         logger.info(
-            "integration done: batch_id=%s status=%s created=%s",
+            "integration done: batch_id=%s created=%s pending=%d",
             batch_id,
-            batch_status,
-            merged,
+            result.created_entities,
+            result.pending_count,
         )
-
     except Exception as e:
         logger.exception("integration failed: batch_id=%s error=%s", batch_id, e)
         try:
             scoped.collection("integration_jobs").document(batch_id).update(
-                {
-                    "status": "error",
-                    "error": str(e)[:500],
-                }
+                {"status": "error", "error": str(e)[:500]}
             )
         except Exception:
             pass
@@ -179,46 +156,57 @@ async def _run_integration(
 async def start_integration(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
+    plan: str | None = Form(None),
     hint: str | None = Form(None),
-    event: str | None = Form(None),
     space: SpaceContext = Depends(get_space_context),
 ):
-    """複数ファイルをアップロードしデータ統合バッチを開始する。
+    """複数ファイルと承認済み BatchPlan でデータ統合バッチを開始する。
 
-    hint はユーザーの自然言語ヒント（曖昧なリンク解決・スコープ指定の補正）。全ファイル共通。
-    event は明示的な既定イベント名（行にイベントリンクが無いとき使う。hint より強いシグナル）。
-    取り込みエージェントがファイル内容を読み、オントロジーへ分解・リンク解決する。
+    plan は POST /plan が返した JSON（ユーザーが既定イベント等を修正したもの）。
+    承認済みプランがそのまま実行され、実行側で理解をやり直さない（ADR-015 決定4）。
+    plan 省略時は実行内で Understand を1回だけ実行する（API 直叩き向け）。
     """
-    loaded: list[tuple[str, bytes]] = []
-    for f in files:
-        content = await f.read()
-        if not content:
-            continue
-        loaded.append((f.filename or "upload", content))
+    loaded = await _load_files(files)
 
-    if not loaded:
-        raise HTTPException(status_code=400, detail="有効なファイルがありません")
+    batch_plan: BatchPlan | None = None
+    if plan:
+        try:
+            batch_plan = BatchPlan.model_validate(json.loads(plan))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"plan の形式が不正です: {e}") from e
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     filenames = [name for name, _ in loaded]
 
     space.col("integration_jobs").document(batch_id).set(
         {
+            "job_id": batch_id,
             "batch_id": batch_id,
             "filenames": filenames,
-            "files": [{"filename": name, "status": "queued"} for name in filenames],
             "hint": (hint or "").strip(),
-            "event": (event or "").strip(),
+            "plan": batch_plan.model_dump() if batch_plan else None,
             "status": "queued",
+            "stage": "",
+            "heartbeat_at": _now_iso(),
             "created_at": _now_iso(),
         }
     )
 
     background_tasks.add_task(
-        _run_integration, space, batch_id, loaded, (hint or "").strip(), (event or "").strip()
+        _run_integration, space, batch_id, loaded, (hint or "").strip(), batch_plan
     )
 
     return {"batch_id": batch_id, "filenames": filenames}
+
+
+def _is_stale(heartbeat_at: str) -> bool:
+    if not heartbeat_at:
+        return False
+    try:
+        beat = datetime.fromisoformat(heartbeat_at)
+    except ValueError:
+        return False
+    return (datetime.now(UTC) - beat).total_seconds() > STALE_AFTER_SECONDS
 
 
 @router.get("/batches/{batch_id}")
@@ -226,18 +214,33 @@ async def get_batch_status(
     batch_id: str,
     space: SpaceContext = Depends(get_space_context),
 ):
-    """バッチの処理状況と生成されたエンティティ数を返す。"""
-    doc = space.col("integration_jobs").document(batch_id).get()
+    """バッチの処理状況・生成エンティティ数・報告 Markdown を返す。
+
+    processing のままハートビートが停止しているジョブは error に倒す（stale sweep）。
+    """
+    doc_ref = space.col("integration_jobs").document(batch_id)
+    doc = doc_ref.get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Batch not found")
     data = doc.to_dict()
+
+    if data.get("status") == "processing" and _is_stale(data.get("heartbeat_at", "")):
+        try:
+            doc_ref.update({"status": "error", "error": "実行途絶（ハートビート停止）"})
+        except Exception:
+            logger.exception("stale sweep update failed: batch_id=%s", batch_id)
+        data["status"] = "error"
+        data["error"] = "実行途絶（ハートビート停止）"
+
     return {
         "batch_id": batch_id,
         "status": data.get("status"),
+        "stage": data.get("stage", ""),
         "filenames": data.get("filenames", []),
-        "files": data.get("files", []),
         "hint": data.get("hint", ""),
         "created_entities": data.get("created_entities", {}),
-        "partial": data.get("partial", False),
+        "pending_count": data.get("pending_count", 0),
+        "skipped_count": data.get("skipped_count", 0),
+        "report_markdown": data.get("report_markdown", ""),
         "error": data.get("error"),
     }

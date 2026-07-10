@@ -56,6 +56,8 @@ INGESTION_COLLECTIONS = [
     "events",
     "contents",
     "event_attendances",
+    "cost_items",
+    "source_records",
     "segments",
     "integration_jobs",
 ]

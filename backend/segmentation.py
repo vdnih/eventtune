@@ -5,7 +5,7 @@ Segmentation — 個別カスタマイズの第1段階（Person → バケット
 バケットへ割り当てる。割り当ては Auditable AI に従い、必ず reason を残す。
 
 責務境界:
-- 構造化フィールド（ProductInterest / engagement_level / stage）だけで自明に決まる
+- 構造化フィールド（ProductInterest / stage）だけで自明に決まる
   軸は決定論 Python で割り当てる（LLM 不使用）。
 - 意味判断が要る場合は、まず appeal_vector（人物の関心・文脈の埋め込み）と各バケットの
   代表ベクトルのコサイン近接（semantic_search.find_similar / 決定論 Python）で一次候補を
@@ -189,7 +189,6 @@ def _classify_batch(
         {
             "person_id": p.get("person_id", ""),
             "job_title": p.get("job_title", ""),
-            "engagement_level": p.get("engagement_level"),
             "appeal_summary": p.get("appeal_summary", ""),
             "vector_top_bucket": ranks.get(p.get("person_id", ""), ("", 0.0))[0],
         }

@@ -16,7 +16,7 @@ AIが読み解いてふさわしい構成と言葉を選ぶ。個別カスタマ
 ## コア体験
 
 1. **スペース**（テナント）を作成 — データ・課金はスペース単位で構造的に分離
-2. CSV / Excel やイベント概要・KPI・アンケートのテキストを**複数まとめてアップロード**
+2. CSV / Excel やイベント概要・KPI・アンケートのテキスト・Word 文書を**複数まとめてアップロード**
 3. **DataIntegrationAgent** が列名・表記ゆれを吸収し、来歴（source_job_id）付きで OSI
    オントロジー（マスタ `Person` / `Account` / `Product` / `Content` / `Event` ＋ ファクト
    `EventAttendance` / `ProductInterest` / `CostItem`。各マスタは appeal_summary / appeal_vector を持つ）へ統合
@@ -43,8 +43,9 @@ AIが読み解いてふさわしい構成と言葉を選ぶ。個別カスタマ
 │  ontology.py が全型定義の単一真実源（星座型・appeal_vector）│
 ├──────────────────────────────────────────────────────────┤
 │  Layer 1: Data Integration (DataIntegrationAgent)         │
-│  パスA 表形式: run_schema_mapper / パスB 非構造化: run_document_extractor │
-│   → OntologyMapper（決定論的Python変換）                   │
+│  Read→Understand→Confirm→Interpret→Conform→Bind→Derive→Report │
+│  AI が変換仕様(BatchPlan)を1回生成 → 人間が承認 → 基盤コードが │
+│  機械適用（IngestionSpec レジストリ駆動。ADR-015）           │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -84,9 +85,13 @@ eventtune/
 │   ├── space.py                       # SpaceContext（テナント束縛アクセス）
 │   ├── segmentation.py                # セグメント分類（決定論＋軽量AI）
 │   ├── metering.py / plans.py         # 使用量計測・クレジット換算
+│   ├── ingestion/                     # 取り込み基盤（ADR-015）
+│   │   ├── specs.py                   # IngestionSpec レジストリ（種別追加=1エントリ）
+│   │   ├── engine.py                  # 解釈エンジン（変換仕様の機械適用。純粋）
+│   │   ├── prompts.py                 # レジストリからのプロンプト描画
+│   │   └── readers.py / normalize.py  # ファイル読み込み / 正規化・normalizer
 │   ├── agents/
-│   │   ├── data_integration_agent.py  # Layer1: CSV/Excel・テキスト → オントロジー
-│   │   ├── ontology_mapper.py         # ステージ2: 決定論的変換（AI不使用）
+│   │   ├── data_integration_agent.py  # Layer1: 8ステージパイプライン（BatchPlan 実行）
 │   │   └── marketing_agent.py         # Layer3: MarketingAgent（Agent + Tools）
 │   ├── semantic_search.py            # 埋め込み・appeal_summary・cosine/find_similar
 │   ├── routers/
