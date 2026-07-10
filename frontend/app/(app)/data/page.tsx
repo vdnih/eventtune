@@ -1,12 +1,17 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { ChevronRight, GitBranch, Loader2 } from "lucide-react";
 import { useSpace } from "@/lib/space-context";
 import { authFetch } from "@/lib/api";
 import { DataTable } from "@/components/ui/DataTable";
+import { DataToolbar } from "@/components/ui/DataToolbar";
+import { ColumnManager } from "@/components/ui/ColumnManager";
+import { TableSummary } from "@/components/ui/TableSummary";
 import { Drawer } from "@/components/ui/Drawer";
-import { formatDetail, isComplex, pickEntityId } from "@/components/ui/format";
+import { formatDetail, isComplex, isMetadataColumn, pickEntityId } from "@/components/ui/format";
+import { summarize } from "@/components/ui/aggregate";
+import { useTableView } from "./useTableView";
 
 interface Collection {
   key: string;
@@ -34,9 +39,19 @@ export default function ExplorerPage() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const selectedRow = selectedIndex !== null ? rows[selectedIndex] : null;
 
+  const [columnsOpen, setColumnsOpen] = useState(false);
+  const [summaryOpen, setSummaryOpen] = useState(false);
+
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [lineage, setLineage] = useState<LineageNode[]>([]);
   const [loadingLineage, setLoadingLineage] = useState(false);
+
+  const view = useTableView(rows, spaceId, activeKey);
+
+  const stats = useMemo(
+    () => summarize(view.displayRows.map((d) => d.row), view.visibleColumns),
+    [view.displayRows, view.visibleColumns],
+  );
 
   const fetchJson = useCallback(async (path: string) => {
     const res = await authFetch(path);
@@ -64,6 +79,7 @@ export default function ExplorerPage() {
     setLoadingRows(true);
     setRows([]);
     setSelectedIndex(null);
+    setColumnsOpen(false);
     fetchJson(`/api/data/${activeKey}`)
       .then((data) => setRows(data.rows ?? []))
       .catch(console.error)
@@ -90,6 +106,13 @@ export default function ExplorerPage() {
       setLoadingLineage(false);
     }
   }, [selectedRow, fetchJson]);
+
+  const activeLabel = collections.find((c) => c.key === activeKey)?.label ?? activeKey ?? "—";
+
+  // 詳細ペイン: 主要フィールドとメタデータ（ID・ベクトル等）に分割。
+  const detailEntries = selectedRow ? Object.entries(selectedRow) : [];
+  const primaryEntries = detailEntries.filter(([k]) => !isMetadataColumn(k));
+  const metaEntries = detailEntries.filter(([k]) => isMetadataColumn(k));
 
   return (
     <div className="h-full flex overflow-hidden">
@@ -128,23 +151,53 @@ export default function ExplorerPage() {
         )}
       </aside>
 
-      {/* Center: DataTable */}
-      <div className="flex-1 min-w-0 overflow-hidden flex flex-col">
-        <div className="shrink-0 px-4 h-11 flex items-center border-b border-gray-200 bg-white">
-          <span className="text-sm font-medium text-gray-700">
-            {collections.find((c) => c.key === activeKey)?.label ?? activeKey ?? "—"}
-          </span>
-          {!loadingRows && rows.length > 0 && (
-            <span className="ml-2 text-xs text-gray-400">{rows.length} 件</span>
-          )}
-        </div>
+      {/* Center: toolbar + summary + DataTable */}
+      <div className="flex-1 min-w-0 overflow-hidden flex flex-col relative">
+        <DataToolbar
+          search={view.search}
+          onSearch={view.setSearch}
+          rowCount={view.displayRows.length}
+          totalCount={rows.length}
+          filterActive={view.filterActive}
+          onClearFilters={view.clearFilters}
+          columnsOpen={columnsOpen}
+          onToggleColumns={() => setColumnsOpen((v) => !v)}
+          summaryOpen={summaryOpen}
+          onToggleSummary={() => setSummaryOpen((v) => !v)}
+        />
+
+        {columnsOpen && (
+          <ColumnManager
+            order={view.order}
+            hidden={view.hidden}
+            metadataColumns={view.metadataColumns}
+            onToggle={view.toggleColumn}
+            onMove={view.moveColumn}
+            onReset={view.resetColumns}
+            onClose={() => setColumnsOpen(false)}
+          />
+        )}
+
+        {summaryOpen && activeKey && !loadingRows && rows.length > 0 && (
+          <TableSummary viewKey={activeKey} stats={stats} />
+        )}
+
         <div className="flex-1 min-h-0 overflow-hidden">
           {loadingRows ? (
             <div className="flex justify-center items-center h-full">
               <Loader2 className="w-6 h-6 animate-spin text-gray-300" />
             </div>
           ) : (
-            <DataTable rows={rows} selectedIndex={selectedIndex} onSelectRow={handleSelectRow} />
+            <DataTable
+              displayRows={view.displayRows}
+              columns={view.visibleColumns}
+              selectedIndex={selectedIndex}
+              onSelectRow={handleSelectRow}
+              sort={view.sort}
+              onSort={view.toggleSort}
+              filters={view.filters}
+              onFilter={view.setFilter}
+            />
           )}
         </div>
       </div>
@@ -153,7 +206,9 @@ export default function ExplorerPage() {
       {selectedRow && (
         <aside className="w-72 shrink-0 border-l border-gray-200 bg-white overflow-y-auto">
           <div className="px-4 pt-4 pb-2 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide">詳細</span>
+            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wide">
+              {activeLabel} 詳細
+            </span>
             <button
               onClick={handleTraceLineage}
               className="flex items-center gap-1 text-xs text-brand-600 hover:text-brand-700"
@@ -163,19 +218,23 @@ export default function ExplorerPage() {
             </button>
           </div>
           <dl className="divide-y divide-gray-100">
-            {Object.entries(selectedRow).map(([k, v]) => (
-              <div key={k} className="px-4 py-2">
-                <dt className="text-xs font-medium text-gray-400 mb-0.5">{k}</dt>
-                <dd className={`text-sm text-gray-800 break-all ${isComplex(v) ? "font-mono text-xs" : ""}`}>
-                  {isComplex(v) ? (
-                    <pre className="whitespace-pre-wrap">{formatDetail(v)}</pre>
-                  ) : (
-                    formatDetail(v)
-                  )}
-                </dd>
-              </div>
+            {primaryEntries.map(([k, v]) => (
+              <DetailField key={k} k={k} v={v} />
             ))}
           </dl>
+
+          {metaEntries.length > 0 && (
+            <details className="mt-2 border-t border-gray-100">
+              <summary className="px-4 py-2 text-xs font-semibold text-gray-400 uppercase tracking-wide cursor-pointer select-none hover:text-gray-600">
+                メタデータ
+              </summary>
+              <dl className="divide-y divide-gray-100">
+                {metaEntries.map(([k, v]) => (
+                  <DetailField key={k} k={k} v={v} />
+                ))}
+              </dl>
+            </details>
+          )}
         </aside>
       )}
 
@@ -214,6 +273,22 @@ export default function ExplorerPage() {
           </ul>
         )}
       </Drawer>
+    </div>
+  );
+}
+
+function DetailField({ k, v }: { k: string; v: unknown }) {
+  const complex = isComplex(v, k);
+  return (
+    <div className="px-4 py-2">
+      <dt className="text-xs font-medium text-gray-400 mb-0.5">{k}</dt>
+      <dd className={`text-sm text-gray-800 break-all ${complex ? "font-mono text-xs" : ""}`}>
+        {complex ? (
+          <pre className="whitespace-pre-wrap">{formatDetail(v, k)}</pre>
+        ) : (
+          formatDetail(v, k)
+        )}
+      </dd>
     </div>
   );
 }
