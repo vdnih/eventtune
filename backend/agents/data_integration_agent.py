@@ -914,9 +914,41 @@ async def _derive_person_appeal(db: Any, space: SpaceContext | None, person_ids:
 
 # ── Report: P1 集計 + AI 整形 Markdown ─────────────────────────────────────────────
 
+_ENTITY_LABEL_JA: dict[str, str] = {
+    "persons": "人物",
+    "accounts": "企業",
+    "events": "イベント",
+    "products": "製品",
+    "contents": "コンテンツ",
+    "event_attendances": "イベント参加（接客）",
+    "product_interests": "製品関心",
+    "cost_items": "費用",
+    "event_kpi": "イベントKPI",
+    "survey_summary": "アンケート集計",
+}
+
+
+def _fallback_report(aggregate: dict) -> str:
+    """AI整形が失敗したときの日本語サマリ（事実は失わないが、生JSONは見せない）。"""
+    created = aggregate.get("created") or {}
+    parts = [f"{_ENTITY_LABEL_JA.get(k, k)} {v}件" for k, v in created.items() if v]
+    total = sum(created.values())
+    lines = ["## 取り込み結果", ""]
+    summary = f"登録件数: {total}件"
+    if parts:
+        summary += f"（{'、'.join(parts)}）"
+    lines.append(summary)
+    pending = aggregate.get("pending_count", 0)
+    if pending:
+        lines.append(f"保留: {pending}件（イベントが確定できなかった行）")
+    skipped = aggregate.get("skipped_count", 0)
+    if skipped:
+        lines.append(f"スキップ: {skipped}件（読み取れなかった内容）")
+    return "\n\n".join(lines)
+
 
 async def _render_report(aggregate: dict, space: SpaceContext | None) -> str:
-    """集計を AI で Markdown に整形する。失敗時は素の集計 JSON を返す（事実は失わない）。"""
+    """集計を AI で Markdown に整形する。失敗時は日本語サマリを返す（事実は失わない）。"""
     try:
         _model = get_settings().model_ingestion
         response = await _get_client().aio.models.generate_content(
@@ -929,7 +961,7 @@ async def _render_report(aggregate: dict, space: SpaceContext | None) -> str:
             return text
     except Exception:
         logger.exception("_render_report failed")
-    return "```json\n" + json.dumps(aggregate, ensure_ascii=False, indent=2) + "\n```"
+    return _fallback_report(aggregate)
 
 
 # ── バッチ処理（依存順の多段オーケストレーション）─────────────────────────────────

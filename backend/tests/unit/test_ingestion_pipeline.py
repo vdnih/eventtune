@@ -208,7 +208,9 @@ def test_no_event_goes_pending_not_silent(monkeypatch):
     # バッチ doc にも保留が集計される
     batch = db.store["integration_jobs/batch_test"]
     assert batch["pending_count"] == 1
-    assert "pending" in batch["report_markdown"]  # AI 不通時は集計 JSON がそのまま載る
+    # AI 不通時は日本語サマリにフォールバックする（事実は失わない）
+    assert "保留" in batch["report_markdown"]
+    assert "```json" not in batch["report_markdown"]
 
 
 def test_row_link_column_overrides_default_event(monkeypatch):
@@ -336,3 +338,22 @@ def test_heartbeat_progresses_to_report(monkeypatch):
     assert batch["stage"] == "report"
     assert batch["heartbeat_at"]
     assert batch["plan"]["default_event"]["name"] == "イベントX"  # 実行されたプランが記録される
+
+
+def test_fallback_report_is_human_readable_not_json():
+    """AI整形が失敗したときのフォールバックは、生JSONではなく日本語サマリになる。"""
+    aggregate = {
+        "created": {"events": 1, "persons": 0},
+        "pending_count": 0,
+        "pending": [],
+        "skipped_count": 1,
+        "skipped": [{"entity_type": "memo.txt", "reason": "文書抽出に失敗"}],
+        "new_masters": [],
+        "fuzzy_matches": [],
+        "default_event": None,
+    }
+    text = agent._fallback_report(aggregate)
+    assert "{" not in text
+    assert "```json" not in text
+    assert "イベント 1件" in text
+    assert "スキップ: 1件" in text
