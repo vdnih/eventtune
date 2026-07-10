@@ -21,12 +21,12 @@ import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
-from google import genai
 from google.cloud.firestore import FieldFilter
 from google.genai import types
 from pydantic import BaseModel
 
 from config import get_settings
+from genai_client import new_client
 from metering import record_llm_response
 from ontology import Segment, SegmentAssignment, SegmentSnapshot
 from semantic_search import embed_text_sync, find_similar
@@ -217,7 +217,7 @@ reason は判定根拠を20〜40字で簡潔に。
 {slim}
 """
     _model = get_settings().model_agent
-    client = genai.Client()
+    client = new_client()
     response = client.models.generate_content(
         model=_model,
         contents=prompt,

@@ -23,6 +23,7 @@ from google import genai
 from google.genai import types
 
 from config import get_settings
+from genai_client import new_client
 from metering import record_llm_response
 from space import SpaceContext
 
@@ -38,7 +39,7 @@ _client: genai.Client | None = None
 def _get_client() -> genai.Client:
     global _client
     if _client is None:
-        _client = genai.Client()
+        _client = new_client()
     return _client
 
 

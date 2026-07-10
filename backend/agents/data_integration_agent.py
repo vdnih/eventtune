@@ -29,6 +29,7 @@ from pydantic import BaseModel, create_model
 
 import semantic_search
 from config import get_settings
+from genai_client import new_client
 from ingestion import engine, prompts, readers
 from ingestion.engine import InterpretedRow, _enum_default, enum_fields_of
 from ingestion.normalize import _normalize_name
@@ -57,7 +58,7 @@ _client: genai.Client | None = None
 def _get_client() -> genai.Client:
     global _client
     if _client is None:
-        _client = genai.Client()
+        _client = new_client()
     return _client
 
 
