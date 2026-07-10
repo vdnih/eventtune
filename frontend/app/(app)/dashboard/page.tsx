@@ -671,7 +671,7 @@ export default function DashboardPage() {
   // ── レンダリング ─────────────────────────────────────────────────────────
 
   return (
-    <div className="h-[calc(100vh-3.5rem)] flex overflow-hidden bg-white">
+    <div className="h-full flex overflow-hidden bg-white">
       <ThreadSidebar
         threads={threads}
         activeThreadId={activeThreadId}
