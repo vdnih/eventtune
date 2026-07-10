@@ -33,7 +33,7 @@ export default function SpacesPage() {
                   key={s.space_id}
                   onClick={() => {
                     switchSpace(s.space_id);
-                    router.push("/dashboard");
+                    router.push("/agent");
                   }}
                   className={`w-full flex items-center justify-between px-4 py-3 border rounded-lg text-left hover:bg-gray-50 ${
                     active ? "border-brand-500 bg-brand-50/40" : "border-gray-200"

@@ -18,7 +18,7 @@ export default function LoginPage() {
     setError("");
     try {
       await signInWithPopup(auth, googleProvider);
-      router.push("/dashboard");
+      router.push("/agent");
     } catch {
       setError("ログインに失敗しました。もう一度お試しください。");
     } finally {
@@ -33,7 +33,7 @@ export default function LoginPage() {
     setError("");
     try {
       await signInAnonymously(auth);
-      router.push("/dashboard");
+      router.push("/agent");
     } catch {
       setError("ログインに失敗しました。もう一度お試しください。");
     } finally {

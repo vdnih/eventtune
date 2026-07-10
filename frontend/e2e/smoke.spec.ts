@@ -20,7 +20,7 @@ async function signInAsTestUser(page: Page) {
 }
 
 test("未認証アクセスはログイン画面へリダイレクトされる", async ({ page }) => {
-  await page.goto("/dashboard");
+  await page.goto("/agent");
   await expect(page).toHaveURL(/\/login/);
   await expect(page.getByRole("button", { name: "Googleでログイン" })).toBeVisible();
 });
@@ -38,13 +38,13 @@ test("ログイン → 同意 → スペース作成 → データ閲覧", async
   await page.getByPlaceholder("例: マーケティング部").fill("E2E スモークスペース");
   await page.getByRole("button", { name: "スペースを作成" }).click();
 
-  // 作成後はダッシュボード（チャット）へ。スペース名がヘッダに反映される
-  await expect(page).toHaveURL(/\/dashboard/, { timeout: 15_000 });
+  // 作成後はエージェント（チャット）画面へ。スペース名がヘッダに反映される
+  await expect(page).toHaveURL(/\/agent/, { timeout: 15_000 });
   await expect(page.getByText("E2E スモークスペース").first()).toBeVisible();
   await expect(page.getByText("AIエージェントです", { exact: false })).toBeVisible();
 
-  // データエクスプローラが開き、ビュー一覧（バックエンドの /api/data/collections）が出る
-  await page.goto("/explorer");
+  // データ画面が開き、ビュー一覧（バックエンドの /api/data/collections）が出る
+  await page.goto("/data");
   await expect(page.getByText("ハウスリスト")).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText("イベント", { exact: true }).first()).toBeVisible();
 });

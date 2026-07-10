@@ -179,8 +179,8 @@ marketing-mail-generator/
 ├── frontend/
 │   ├── app/(app)/
 │   │   ├── layout.tsx                  # 認証ガード + ヘッダ（エージェント / データ ナビ）
-│   │   ├── dashboard/page.tsx          # 全画面チャット UI（アップロードはチャット入力欄）
-│   │   ├── explorer/page.tsx           # 3ペイン汎用データブラウザ（/api/data/* 駆動）
+│   │   ├── agent/page.tsx              # 全画面チャット UI（アップロードはチャット入力欄）
+│   │   ├── data/page.tsx               # 3ペイン汎用データブラウザ（/api/data/* 駆動）
 │   │   ├── spaces/new/page.tsx
 │   │   └── settings/{space,members,usage}/page.tsx
 │   ├── components/
@@ -208,13 +208,13 @@ marketing-mail-generator/
 
 ## 主要フロントエンドコンポーネント
 
-### `dashboard/page.tsx`
+### `agent/page.tsx`
 全画面チャット。アップロードボタンはチャット入力エリアに統合し、`POST /api/integration/plan`
 で取り込みプランを提案 → `UploadConfirmModal` で確認 → `POST /api/integration/batches`。
 個別カスタマイズは SSE（`/api/marketing/chat`）でエージェントが進め、`run_assembly` 検出後に
 `/api/marketing/runs/{id}` をポーリングして成果物を `DeliverableCard` で表示する。
 
-### `explorer/page.tsx`
+### `data/page.tsx`
 3ペインの汎用データブラウザ。左=コレクションナビ（`/api/data/collections`）、中央=`DataTable`
 （`/api/data/{key}`）、右=詳細＋「由来を追う」（`/api/data/lineage/by-entity/{id}`）。
 `DataTable` / `Drawer` / `format` はモデル非依存で、オントロジー変更に追従不要。
