@@ -8,7 +8,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
-import { MessageSquarePlus, MoreHorizontal, Pencil, Trash2, Upload } from "lucide-react";
+import { MessageSquarePlus, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import type { ThreadSummary } from "@/lib/threads";
 
 interface ThreadSidebarProps {
@@ -138,9 +138,6 @@ function ThreadRow({
         )}
         title={thread.title}
       >
-        {thread.kind === "ingestion" && (
-          <Upload className="w-3.5 h-3.5 shrink-0 text-gray-400" />
-        )}
         <span className="truncate">{thread.title}</span>
       </button>
       <button

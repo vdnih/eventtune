@@ -12,10 +12,10 @@ export interface ThreadSummary {
   title: string;
   updated_at: string;
   message_count?: number;
-  kind?: "chat" | "ingestion"; // 未指定は "chat" 扱い（既存スレッドとの互換用）
 }
 
-// Firestore に保存された再表示用メッセージ（スナップショット）
+// Firestore に保存された再表示用メッセージ（スナップショット）。
+// chat・ingestion 両方のターンが同じスレッドの中に seq 順で並ぶ（content_type で見分ける）。
 export interface StoredMessage {
   seq: number;
   role: "user" | "assistant";
@@ -23,8 +23,10 @@ export interface StoredMessage {
   tool_calls?: { tool_name: string; args: Record<string, unknown> }[];
   code_blocks?: { code: string; output?: string; outcome?: string }[];
   run_id?: string | null;
-  // kind: "ingestion" のスレッドのみで使うフィールド
+  files?: string[]; // ingestion のユーザー添付メッセージのみで使う
+  // ingestion 関連メッセージのみで使うフィールド
   content_type?: "ingestion_plan" | "ingestion_result" | "ingestion_error";
+  batch_id?: string;
   plan?: BatchPlan | null;
   filenames?: string[];
   report_markdown?: string;

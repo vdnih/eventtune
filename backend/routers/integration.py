@@ -122,6 +122,7 @@ async def plan_ingestion(
 async def _run_integration(
     space: SpaceContext,
     batch_id: str,
+    thread_id: str,
     files: list[tuple[str, bytes]],
     hint: str | None,
     plan: BatchPlan | None,
@@ -161,10 +162,11 @@ async def _run_integration(
         try:
             thread_store.append_message(
                 space,
-                batch_id,
+                thread_id,
                 {
                     "role": "assistant",
                     "content_type": "ingestion_result",
+                    "batch_id": batch_id,
                     "report_markdown": result.report_markdown,
                     "created_entities": result.created_entities,
                     "pending_count": result.pending_count,
@@ -184,15 +186,24 @@ async def _run_integration(
         try:
             thread_store.append_message(
                 space,
-                batch_id,
+                thread_id,
                 {
                     "role": "assistant",
                     "content_type": "ingestion_error",
+                    "batch_id": batch_id,
                     "error": str(e)[:500],
                 },
             )
         except Exception:
             logger.exception("thread persist (ingestion_error) failed: batch_id=%s", batch_id)
+
+
+def _ingestion_user_message(filenames: list[str], hint: str) -> str:
+    if hint:
+        return hint
+    if len(filenames) == 1:
+        return f"「{filenames[0]}」を添付しました"
+    return f"{len(filenames)}件のファイルを添付しました"
 
 
 @router.post("/batches", status_code=202)
@@ -201,6 +212,7 @@ async def start_integration(
     files: list[UploadFile] = File(...),
     plan: str | None = Form(None),
     hint: str | None = Form(None),
+    thread_id: str = Form(...),
     space: SpaceContext = Depends(get_space_context),
 ):
     """複数ファイルと承認済み BatchPlan でデータ統合バッチを開始する。
@@ -208,6 +220,10 @@ async def start_integration(
     plan は POST /plan が返した JSON（ユーザーが既定イベント等を修正したもの）。
     承認済みプランがそのまま実行され、実行側で理解をやり直さない（ADR-015 決定4）。
     plan 省略時は実行内で Understand を1回だけ実行する（API 直叩き向け）。
+
+    thread_id はフロントが会話開始時に採番した表示スレッド ID。marketing チャットと
+    同じスレッドに書き込むことで、取り込み結果を以後の会話（分析依頼）の文脈として
+    使えるようにする（thread_store.pop_unconsumed_ingestion_context 参照）。
     """
     loaded = await _load_files(files)
 
@@ -218,46 +234,63 @@ async def start_integration(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"plan の形式が不正です: {e}") from e
 
-    batch_id = f"batch_{uuid.uuid4().hex[:12]}"
     filenames = [name for name, _ in loaded]
+    hint_stripped = (hint or "").strip()
+
+    # thread_id はクライアント採番の UUID で信用境界にならないため、所有者チェックを
+    # 必ず通す（marketing.py の /chat と同じ規約）。integration_jobs 作成前に行う。
+    if not thread_store.touch_thread(space, thread_id, _ingestion_title(filenames)):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    batch_id = f"batch_{uuid.uuid4().hex[:12]}"
 
     space.col("integration_jobs").document(batch_id).set(
         {
             "job_id": batch_id,
             "batch_id": batch_id,
+            "thread_id": thread_id,
             "filenames": filenames,
-            "hint": (hint or "").strip(),
+            "hint": hint_stripped,
             "plan": batch_plan.model_dump() if batch_plan else None,
             "status": "queued",
             "stage": "",
+            "consumed_by_chat": False,
             "heartbeat_at": _now_iso(),
             "created_at": _now_iso(),
         }
     )
 
-    # 取り込みも会話スレッドと同じ左メニューに出せるよう、thread として upsert する
-    # （左ペイン一覧はスレッド一覧を再利用。永続化の失敗は取り込み自体を止めない）。
+    # 永続化の失敗は取り込み自体を止めない（ベストエフォート）。
     try:
-        thread_store.touch_thread(space, batch_id, _ingestion_title(filenames), kind="ingestion")
         thread_store.append_message(
             space,
-            batch_id,
+            thread_id,
+            {
+                "role": "user",
+                "content": _ingestion_user_message(filenames, hint_stripped),
+                "files": filenames,
+            },
+        )
+        thread_store.append_message(
+            space,
+            thread_id,
             {
                 "role": "assistant",
                 "content_type": "ingestion_plan",
+                "batch_id": batch_id,
                 "plan": batch_plan.model_dump() if batch_plan else None,
                 "filenames": filenames,
-                "hint": (hint or "").strip(),
+                "hint": hint_stripped,
             },
         )
     except Exception:
         logger.exception("thread persist (ingestion_plan) failed: batch_id=%s", batch_id)
 
     background_tasks.add_task(
-        _run_integration, space, batch_id, loaded, (hint or "").strip(), batch_plan
+        _run_integration, space, batch_id, thread_id, loaded, hint_stripped, batch_plan
     )
 
-    return {"batch_id": batch_id, "filenames": filenames}
+    return {"batch_id": batch_id, "thread_id": thread_id, "filenames": filenames}
 
 
 def _is_stale(heartbeat_at: str) -> bool:
