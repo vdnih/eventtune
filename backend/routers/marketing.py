@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/marketing", tags=["marketing"])
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: str | None = None
+    thread_id: str
     event_id: str | None = None
 
 
@@ -38,28 +38,40 @@ async def chat(
     """
     MarketingAgent とのチャット。Server-Sent Events でストリーミングする。
     各イベントは JSON 文字列として `data: {...}\n\n` 形式で送信される。
+
+    thread_id は表示スレッド（フロントが会話開始時に採番するクライアント UUID）。
+    Agent Engine セッション（agent_session_id）とは別物なので、StreamingResponse を
+    返す前に同期的に「スレッドの所有者チェック → セッション確定 → 対応づけの永続化」を
+    済ませておく（ストリーム内の best-effort な永続化ブロックに埋もれさせない）。
     """
     import thread_store
     from agents.marketing_agent import chat_stream, ensure_session
 
+    # thread_id はクライアント採番の UUID で信用境界にならないため、所有者チェックを
+    # 必ず通す。他人のスレッドなら 404（存在しない場合と区別しない）。
+    if not thread_store.touch_thread(space, body.thread_id, body.message):
+        raise HTTPException(status_code=404, detail="Thread not found")
+
     # Agent Engine の session_id はサーバ採番。既存IDは resume、未指定なら新規採番する。
-    # ここで確定させ、X-Session-Id ヘッダ・thread_store・chat_stream で同一IDを使う。
+    existing_agent_session_id = thread_store.get_agent_session_id(space, body.thread_id)
     try:
-        session_id = await ensure_session(body.session_id, space)
+        agent_session_id = await ensure_session(existing_agent_session_id, space)
     except Exception as e:
         logger.exception("ensure_session failed")
         raise HTTPException(status_code=502, detail="セッションの初期化に失敗しました") from e
 
+    if agent_session_id != existing_agent_session_id:
+        thread_store.set_agent_session_id(space, body.thread_id, agent_session_id)
+
     async def event_generator():
-        # スレッドを upsert し、user メッセージを再表示用スナップショットとして保存する。
+        # user メッセージを再表示用スナップショットとして保存する。
         # 永続化の失敗はチャット自体を止めない（ベストエフォート）。
         try:
-            thread_store.touch_thread(space, session_id, body.message)
             thread_store.append_message(
-                space, session_id, {"role": "user", "content": body.message}
+                space, body.thread_id, {"role": "user", "content": body.message}
             )
         except Exception:
-            logger.exception("thread persist (user) failed: session_id=%s", session_id)
+            logger.exception("thread persist (user) failed: thread_id=%s", body.thread_id)
 
         # assistant メッセージのスナップショットをサーバ側でも組み立てる（フロントの解釈に合わせる）。
         acc_text = ""
@@ -69,7 +81,8 @@ async def chat(
         try:
             async for event in chat_stream(
                 message=body.message,
-                session_id=session_id,
+                session_id=agent_session_id,
+                thread_id=body.thread_id,
                 space=space,
                 event_id=body.event_id,
             ):
@@ -104,7 +117,7 @@ async def chat(
             try:
                 thread_store.append_message(
                     space,
-                    session_id,
+                    body.thread_id,
                     {
                         "role": "assistant",
                         "content": acc_text,
@@ -114,7 +127,7 @@ async def chat(
                     },
                 )
             except Exception:
-                logger.exception("thread persist (assistant) failed: session_id=%s", session_id)
+                logger.exception("thread persist (assistant) failed: thread_id=%s", body.thread_id)
 
     return StreamingResponse(
         event_generator(),
@@ -122,7 +135,7 @@ async def chat(
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "X-Session-Id": session_id,
+            "X-Agent-Session-Id": agent_session_id,
         },
     )
 

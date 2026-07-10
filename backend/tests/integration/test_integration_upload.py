@@ -71,10 +71,16 @@ def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, f
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("attendees.csv", b"name,email\nA,a@example.com\n", "text/csv"))],
-        data={"plan": json.dumps(_APPROVED_PLAN), "hint": "展示会Xの参加者リスト"},
+        data={
+            "plan": json.dumps(_APPROVED_PLAN),
+            "hint": "展示会Xの参加者リスト",
+            "thread_id": "thread_1",
+        },
     )
     assert res.status_code == 202
-    batch_id = res.json()["batch_id"]
+    body_json = res.json()
+    batch_id = body_json["batch_id"]
+    assert body_json["thread_id"] == "thread_1"
 
     # TestClient は BackgroundTasks をレスポンス後に同期実行する
     assert len(fake_process_batch) == 1
@@ -102,16 +108,19 @@ def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, f
     assert job.to_dict()["plan"]["default_event"]["name"] == "展示会X"
 
     # 取り込みも会話スレッドと同じ左メニューから見えるよう thread として永続化される
-    thread = db.document(f"spaces/{seeded_space}/threads/{batch_id}").get()
+    # （thread_id はフロント採番。batch_id とは別物）
+    thread = db.document(f"spaces/{seeded_space}/threads/thread_1").get()
     assert thread.exists
     thread_data = thread.to_dict()
-    assert thread_data["kind"] == "ingestion"
     assert thread_data["uid"] == "uid_member"
     messages = {
-        m.to_dict()["content_type"]: m.to_dict()
-        for m in db.collection(f"spaces/{seeded_space}/threads/{batch_id}/messages").stream()
+        m.to_dict().get("content_type"): m.to_dict()
+        for m in db.collection(f"spaces/{seeded_space}/threads/thread_1/messages").stream()
     }
+    assert messages[None]["role"] == "user"
+    assert messages["ingestion_plan"]["batch_id"] == batch_id
     assert messages["ingestion_plan"]["plan"]["default_event"]["name"] == "展示会X"
+    assert messages["ingestion_result"]["batch_id"] == batch_id
     assert messages["ingestion_result"]["created_entities"] == {"persons": 2, "events": 1}
 
 
@@ -140,6 +149,7 @@ def test_plan_omitted_runs_understand_once(make_client, seeded_space, monkeypatc
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("a.csv", b"x\n1\n", "text/csv"))],
+        data={"thread_id": "thread_2"},
     )
     assert res.status_code == 202
     assert understand_calls == [["a.csv"]]
@@ -152,7 +162,7 @@ def test_invalid_plan_json_returns_400(make_client, seeded_space, fake_process_b
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("a.csv", b"x\n1\n", "text/csv"))],
-        data={"plan": "{broken json"},
+        data={"plan": "{broken json", "thread_id": "thread_invalid_plan"},
     )
     assert res.status_code == 400
     assert fake_process_batch == []
@@ -166,6 +176,7 @@ def test_legacy_doc_upload_returns_400(make_client, seeded_space, fake_process_b
             endpoint,
             headers={"X-Space-Id": seeded_space},
             files=[("files", ("report.doc", b"legacy doc bytes", "application/msword"))],
+            data={"thread_id": "thread_legacy_doc"},
         )
         assert res.status_code == 400
         assert "未対応のファイル形式" in res.json()["detail"]
@@ -198,6 +209,7 @@ def test_pdf_upload_accepted(make_client, seeded_space, fake_process_batch, monk
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("report.pdf", pdf_bytes, "application/pdf"))],
+        data={"thread_id": "thread_pdf"},
     )
     assert batch_res.status_code == 202
     assert fake_process_batch[0]["files"] == ["report.pdf"]
@@ -257,6 +269,7 @@ def test_pptx_upload_accepted(make_client, seeded_space, fake_process_batch, mon
                 ),
             )
         ],
+        data={"thread_id": "thread_pptx"},
     )
     assert batch_res.status_code == 202
     assert fake_process_batch[0]["files"] == ["slides.pptx"]
@@ -313,6 +326,7 @@ def test_docx_upload_accepted(make_client, seeded_space, fake_process_batch, mon
                 ),
             )
         ],
+        data={"thread_id": "thread_docx"},
     )
     assert batch_res.status_code == 202
     assert fake_process_batch[0]["files"] == ["overview.docx"]
@@ -324,6 +338,7 @@ def test_empty_upload_returns_400(make_client, seeded_space, fake_process_batch)
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("empty.csv", b"", "text/csv"))],
+        data={"thread_id": "thread_empty"},
     )
     assert res.status_code == 400
 
@@ -341,7 +356,7 @@ def test_pipeline_failure_marks_batch_error(make_client, seeded_space, db, monke
         "/api/integration/batches",
         headers={"X-Space-Id": seeded_space},
         files=[("files", ("a.csv", b"x\n1\n", "text/csv"))],
-        data={"plan": json.dumps(_APPROVED_PLAN)},
+        data={"plan": json.dumps(_APPROVED_PLAN), "thread_id": "thread_failure"},
     )
     batch_id = res.json()["batch_id"]
     body = client.get(
@@ -352,8 +367,8 @@ def test_pipeline_failure_marks_batch_error(make_client, seeded_space, db, monke
 
     # スレッド側にも失敗が記録され、開いたときに分かる
     messages = {
-        m.to_dict()["content_type"]: m.to_dict()
-        for m in db.collection(f"spaces/{seeded_space}/threads/{batch_id}/messages").stream()
+        m.to_dict().get("content_type"): m.to_dict()
+        for m in db.collection(f"spaces/{seeded_space}/threads/thread_failure/messages").stream()
     }
     assert "pipeline exploded" in messages["ingestion_error"]["error"]
 

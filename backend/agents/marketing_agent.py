@@ -35,6 +35,7 @@ from google.genai import types
 from pydantic import BaseModel
 from vertexai import types as vai_types
 
+import thread_store
 from config import get_settings
 from genai_client import RETRY_OPTIONS, new_client
 from metering import metered, record_compute, record_llm, record_llm_response
@@ -744,8 +745,10 @@ def _parse_tool_response(resp: Any) -> dict:
 
 
 async def ensure_session(session_id: str | None, space: SpaceContext) -> str:
-    """Agent Engine セッションを用意し、確定した session_id（= thread_id）を返す。
+    """Agent Engine セッションを用意し、確定した session_id を返す。
 
+    ここでの session_id は表示スレッド（thread_id）とは別物の Agent Engine 側の ID
+    （呼び出し元が thread_store.get_agent_session_id/set_agent_session_id で対応づける）。
     Agent Engine の session_id はサーバ採番のため独自IDは渡せない。
     - 既存IDあり → resume（get_session で存在確認、無ければ新規採番）
     - ID未指定   → 新規セッションを採番
@@ -768,11 +771,16 @@ async def ensure_session(session_id: str | None, space: SpaceContext) -> str:
 async def chat_stream(
     message: str,
     session_id: str,
+    thread_id: str,
     space: SpaceContext,
     event_id: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     MarketingAgent とのチャットを SSE 用のイベント辞書としてストリーミングする。
+
+    session_id は Agent Engine セッション（ensure_session が確定させたもの）、
+    thread_id は表示スレッド（Firestore の再表示用スナップショットのキー）。両者は別物。
+    thread_id は同スレッド内の未消費 ingestion 結果を文脈として拾うために使う。
 
     Yields:
         { type: "tool_call" | "tool_result" | "code" | "code_result" | "text" | "done" | "error", ... }
@@ -790,8 +798,13 @@ async def chat_stream(
         session_service=_session_service,
     )
 
-    # 選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
-    message_text = message
+    # 同スレッドの未消費 ingestion 結果・選択中イベントがあれば、メッセージ先頭に文脈ブロックを前置する。
+    context_blocks: list[str] = []
+
+    ingestion_context = thread_store.pop_unconsumed_ingestion_context(space, thread_id)
+    if ingestion_context:
+        context_blocks.append(ingestion_context)
+
     if event_id:
         event_name = event_id
         try:
@@ -800,11 +813,14 @@ async def chat_stream(
                 event_name = doc.to_dict().get("name", event_id)
         except Exception:
             logger.warning("failed to load event context: event_id=%s", event_id)
-        message_text = (
+        context_blocks.append(
             f"[コンテキスト] ユーザーは現在「{event_name}」(event_id={event_id})を選択中です。"
-            "データを分析する場合は get_space_data() を呼んでから run_python_code で絞り込んでください。\n\n"
-            f"ユーザーの質問: {message}"
+            "データを分析する場合は get_space_data() を呼んでから run_python_code で絞り込んでください。"
         )
+
+    message_text = (
+        "\n\n".join([*context_blocks, f"ユーザーの質問: {message}"]) if context_blocks else message
+    )
 
     user_content = types.Content(
         role="user",

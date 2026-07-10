@@ -79,7 +79,12 @@ type ChatMessage =
         pending_count: number;
         skipped_count: number;
       } | null;
+      // 取り込みバッチの識別子（履歴再構築時に plan/result/error を紐付け、
+      // 進行中バッチのポーリングを再開するために使う）
+      batchId?: string;
     };
+
+type AssistantChatMessage = Extract<ChatMessage, { role: "assistant" }>;
 
 const INITIAL_MESSAGE: ChatMessage = {
   id: "init",
@@ -179,7 +184,9 @@ export default function DashboardPage() {
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const sessionId = useRef<string>("");
+  // 表示スレッドID。Agent Engine のセッションIDとは別物で、会話開始時にフロントが採番する
+  // （文脈に応じて marketing/ingestion どちらが呼ばれても同じスレッドに書き込むための入れ物）。
+  const threadId = useRef<string>(crypto.randomUUID());
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const { threads, reload: reloadThreads, rename: renameThread, remove: removeThread } = useThreads();
   const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
@@ -296,6 +303,7 @@ export default function DashboardPage() {
       if (pending.hint.trim()) formData.append("hint", pending.hint.trim());
       // 承認済みプラン（既定イベントの修正を含む）をそのまま実行に渡す（ADR-015 決定4）
       if (pending.plan) formData.append("plan", JSON.stringify(pending.plan));
+      formData.append("thread_id", threadId.current);
 
       const res = await authFetch("/api/integration/batches", { method: "POST", body: formData });
       if (!res.ok) {
@@ -303,6 +311,8 @@ export default function DashboardPage() {
         throw new Error(body.detail ?? `エラー ${res.status}`);
       }
       const { batch_id } = await res.json();
+      setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, batchId: batch_id } : m)));
+      setActiveThreadId(threadId.current);
       // バックエンドがこの時点で取り込みスレッドを作成済み。左メニューに即時反映する。
       reloadThreads();
       pollBatch(batch_id, msgId);
@@ -397,7 +407,7 @@ export default function DashboardPage() {
       const res = await fetch(`${API_BASE}/api/marketing/chat`, {
         method: "POST",
         headers: await authHeaders({ "Content-Type": "application/json", Accept: "text/event-stream" }),
-        body: JSON.stringify({ message: text, session_id: sessionId.current || null }),
+        body: JSON.stringify({ message: text, thread_id: threadId.current }),
       });
 
       if (!res.ok) {
@@ -405,11 +415,7 @@ export default function DashboardPage() {
         throw new Error(body.detail ?? `エラー ${res.status}`);
       }
 
-      const newSessionId = res.headers.get("X-Session-Id");
-      if (newSessionId) {
-        sessionId.current = newSessionId;
-        setActiveThreadId(newSessionId);
-      }
+      setActiveThreadId(threadId.current);
 
       const reader = res.body?.getReader();
       if (!reader) throw new Error("ストリームを読み込めません");
@@ -525,6 +531,8 @@ export default function DashboardPage() {
   }
 
   async function handleSend() {
+    if (sending || isIngesting) return;
+
     if (pendingFiles.length > 0) {
       const files = [...pendingFiles];
       const hint = input.trim();
@@ -535,7 +543,7 @@ export default function DashboardPage() {
     }
 
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text) return;
     setInput("");
     await handleChatFlow(text);
   }
@@ -544,64 +552,83 @@ export default function DashboardPage() {
 
   function handleNewChat() {
     if (sending) return;
-    sessionId.current = "";
+    threadId.current = crypto.randomUUID();
     setActiveThreadId(null);
     setMessages([INITIAL_MESSAGE]);
   }
 
-  async function handleSelectThread(threadId: string) {
-    if (sending || threadId === activeThreadId) return;
-    const stored = await getThreadMessages(threadId);
-    const thread = threads.find((t) => t.thread_id === threadId);
-    sessionId.current = threadId;
-    setActiveThreadId(threadId);
+  async function handleSelectThread(selectedThreadId: string) {
+    if (sending || selectedThreadId === activeThreadId) return;
+    const stored = await getThreadMessages(selectedThreadId);
+    threadId.current = selectedThreadId;
+    setActiveThreadId(selectedThreadId);
 
-    if (thread?.kind === "ingestion") {
-      // 取り込みスレッドは会話メッセージではなく plan/result のスナップショットなので、
-      // 通常のチャットUIとは別経路で単一の合成メッセージに組み立てる。
-      const planMsg = stored.find((m) => m.content_type === "ingestion_plan");
-      const resultMsg = stored.find((m) => m.content_type === "ingestion_result");
-      const errorMsg = stored.find((m) => m.content_type === "ingestion_error");
-      const msgId = crypto.randomUUID();
-      const stillRunning = !resultMsg && !errorMsg;
-      setMessages([
-        {
-          id: msgId,
+    // chat・ingestion のターンが seq 順に混在しているので、通しで走査して統一的に
+    // 組み立てる。ingestion_plan で新規バブルを開始し、対応する batch_id を持つ
+    // ingestion_result/ingestion_error でそのバブルを完成させる（旧データは
+    // batch_id フィールドを持たないため thread_id にフォールバックする）。
+    const restored: ChatMessage[] = [];
+    const batchBubbles = new Map<string, AssistantChatMessage>();
+
+    for (const m of stored) {
+      if (m.content_type === "ingestion_plan") {
+        const batchId = m.batch_id ?? selectedThreadId;
+        const bubble: AssistantChatMessage = {
+          id: crypto.randomUUID(),
           role: "assistant",
-          content: errorMsg ? `取り込みエラー: ${errorMsg.error ?? "不明なエラー"}` : "",
-          ingestionPlan: planMsg?.plan ?? null,
-          ingestionResult: resultMsg
-            ? {
-                report_markdown: resultMsg.report_markdown ?? "",
-                created_entities: resultMsg.created_entities ?? {},
-                pending_count: resultMsg.pending_count ?? 0,
-                skipped_count: resultMsg.skipped_count ?? 0,
-              }
-            : null,
-          ingestionProgress: stillRunning ? { stage: "" } : null,
-          loading: stillRunning,
-        },
-      ]);
-      if (stillRunning) {
-        // 実行中に離脱して戻ってきたケース: batch_id === thread_id なのでそのまま再開できる
-        setIsIngesting(true);
-        pollBatch(threadId, msgId);
+          content: "",
+          ingestionPlan: m.plan ?? null,
+          ingestionProgress: { stage: "" },
+          loading: true,
+          batchId,
+        };
+        batchBubbles.set(batchId, bubble);
+        restored.push(bubble);
+      } else if (m.content_type === "ingestion_result" || m.content_type === "ingestion_error") {
+        const batchId = m.batch_id ?? selectedThreadId;
+        const bubble = batchBubbles.get(batchId);
+        if (!bubble) continue;
+        if (m.content_type === "ingestion_result") {
+          bubble.ingestionResult = {
+            report_markdown: m.report_markdown ?? "",
+            created_entities: m.created_entities ?? {},
+            pending_count: m.pending_count ?? 0,
+            skipped_count: m.skipped_count ?? 0,
+          };
+        } else {
+          bubble.content = `取り込みエラー: ${m.error ?? "不明なエラー"}`;
+        }
+        bubble.ingestionProgress = null;
+        bubble.loading = false;
+      } else if (m.role === "user") {
+        restored.push({
+          id: crypto.randomUUID(),
+          role: "user",
+          content: m.content,
+          files: m.files?.map((name) => ({ name })),
+        });
+      } else {
+        restored.push({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: m.content,
+          toolCalls: m.tool_calls,
+          codeBlocks: m.code_blocks,
+          runId: m.run_id ?? undefined,
+          loading: false,
+        });
       }
-      return;
     }
 
-    const restored: ChatMessage[] = stored.map((m) => ({
-      id: crypto.randomUUID(),
-      role: m.role,
-      content: m.content,
-      toolCalls: m.tool_calls,
-      codeBlocks: m.code_blocks,
-      runId: m.run_id ?? undefined,
-      loading: false,
-    }));
     setMessages(restored.length > 0 ? restored : [INITIAL_MESSAGE]);
     restored.forEach((m) => {
-      if (m.role === "assistant" && m.runId) loadRunDeliverables(m.id, m.runId);
+      if (m.role !== "assistant") return;
+      if (m.runId) loadRunDeliverables(m.id, m.runId);
+      if (m.loading && m.batchId) {
+        // 実行中に離脱して戻ってきたケース。batch_id でポーリングを再開する。
+        setIsIngesting(true);
+        pollBatch(m.batchId, m.id);
+      }
     });
   }
 
@@ -660,7 +687,7 @@ export default function DashboardPage() {
   const prevSpaceId = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (activeSpace && prevSpaceId.current && prevSpaceId.current !== activeSpace.space_id) {
-      sessionId.current = "";
+      threadId.current = crypto.randomUUID();
       setActiveThreadId(null);
       setMessages([INITIAL_MESSAGE]);
       setPendingFiles([]);
@@ -915,12 +942,12 @@ export default function DashboardPage() {
                   ? "ヒントを入力（任意）"
                   : "指示を入力してください（例: 顧客ごとのフォローアップ案を作って）"
               }
-              disabled={sending}
+              disabled={sending || isIngesting}
               className="flex-1 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400 disabled:bg-gray-50 disabled:text-gray-400"
             />
             <button
               type="submit"
-              disabled={(!input.trim() && pendingFiles.length === 0) || sending}
+              disabled={(!input.trim() && pendingFiles.length === 0) || sending || isIngesting}
               className="flex items-center justify-center w-10 h-10 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
             >
               {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
