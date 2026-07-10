@@ -34,7 +34,7 @@ export default function NewSpacePage() {
       setActiveSpaceId(created.space_id);
       await reloadSpaces();
       switchSpace(created.space_id);
-      router.replace("/dashboard");
+      router.replace("/agent");
     } catch (err) {
       setError(err instanceof Error ? err.message : "作成に失敗しました");
       setSubmitting(false);

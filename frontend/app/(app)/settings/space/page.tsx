@@ -65,7 +65,7 @@ export default function SpaceSettingsPage() {
     if (res.ok) {
       setActiveSpaceId(null);
       const list = await reloadSpaces();
-      router.replace(list.length > 0 ? "/dashboard" : "/spaces/new");
+      router.replace(list.length > 0 ? "/agent" : "/spaces/new");
     }
   }
 

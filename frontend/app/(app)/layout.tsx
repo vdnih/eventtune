@@ -114,13 +114,13 @@ function AppShell({ userEmail, children }: { userEmail: string; children: React.
       <header className="shrink-0 bg-white border-b border-gray-200">
         <div className="px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <Link href="/dashboard" className="text-lg font-bold text-brand-600">
+            <Link href="/agent" className="text-lg font-bold text-brand-600">
               EventTune
             </Link>
             <SpaceSwitcher />
             <nav className="flex items-center gap-1 text-sm">
-              <NavLink href="/dashboard" label="エージェント" />
-              <NavLink href="/explorer" label="データ" />
+              <NavLink href="/agent" label="エージェント" />
+              <NavLink href="/data" label="データ" />
             </nav>
           </div>
           <UserMenu userEmail={userEmail} />
