@@ -71,7 +71,9 @@ def test_read_blocks_corrupt_docx_yields_read_error():
 
 
 def test_read_blocks_xlsx_returns_row_blocks():
-    content = _make_xlsx([{"会社名": "株式会社A", "お名前": "山田様"}, {"会社名": "株式会社B", "お名前": "鈴木様"}])
+    content = _make_xlsx(
+        [{"会社名": "株式会社A", "お名前": "山田様"}, {"会社名": "株式会社B", "お名前": "鈴木様"}]
+    )
     blocks = readers.read_blocks("list.xlsx", content)
     assert len(blocks) == 2
     assert blocks[0].read_error == ""
