@@ -8,6 +8,8 @@ import { getThreadMessages } from "@/lib/threads";
 import { ThreadSidebar } from "@/components/features/agent/ThreadSidebar";
 import { DeliverableCard } from "@/components/features/agent/DeliverableCard";
 import { MessageMarkdown } from "@/components/features/agent/MessageMarkdown";
+import { IngestionPlanCard } from "@/components/features/agent/IngestionPlanCard";
+import type { BatchPlan, DefaultEventPlan } from "@/lib/ingestion";
 import { Check, FileText, Loader2, Send, Upload, Wrench, X } from "lucide-react";
 
 // ── 型定義 ──────────────────────────────────────────────────────────────────
@@ -44,34 +46,6 @@ interface CodeBlock {
   outcome?: string;
 }
 
-// 取り込みプラン（POST /api/integration/plan のレスポンス = BatchPlan。
-// ユーザーが確認・修正したものをそのまま POST /batches の plan に渡す = 承認と実行の契約）
-interface TargetPlan {
-  entity_type: string;
-  column_map: Record<string, string>;
-  column_modes: Record<string, string>; // {元列: "direct" | "ai_parse"}
-  link_columns: Record<string, string>; // {リンク種別: 元列}
-}
-
-interface FilePlan {
-  filename: string;
-  business_context: string;
-  targets: TargetPlan[];
-  unmapped_notes: string;
-  extraction_caveat: string;
-}
-
-interface DefaultEventPlan {
-  name: string;
-  is_existing: boolean;
-  evidence: string;
-}
-
-interface BatchPlan {
-  default_event: DefaultEventPlan | null;
-  files: FilePlan[];
-}
-
 // チャット timeline のメッセージ型
 type ChatMessage =
   | {
@@ -95,6 +69,16 @@ type ChatMessage =
         plan: BatchPlan | null; // null = プラン生成失敗（実行側で Understand を1回だけ実行）
         proposedEvent: DefaultEventPlan | null; // AI 提案の原本（「イベントなし」解除時の復元用）
       };
+      // 取り込みメッセージ専用。一度セットした ingestionPlan は完了後も消さない
+      // （結果表示に上書きされてプランが消える問題への対策）。
+      ingestionPlan?: BatchPlan | null;
+      ingestionProgress?: { stage: string } | null;
+      ingestionResult?: {
+        report_markdown: string;
+        created_entities: Record<string, number>;
+        pending_count: number;
+        skipped_count: number;
+      } | null;
     };
 
 const INITIAL_MESSAGE: ChatMessage = {
@@ -173,54 +157,19 @@ function CodeExecutionPanel({ blocks }: { blocks: CodeBlock[] }) {
   );
 }
 
-// ── 取り込みプランのラベルマップ・テキスト生成 ──────────────────────────────────
+// ── 取り込み進捗ステージのラベル ────────────────────────────────────────────────
 
-const ENTITY_LABEL: Record<string, string> = {
-  persons: "人物",
-  accounts: "企業",
-  events: "イベント",
-  products: "製品",
-  contents: "コンテンツ",
-  event_attendances: "イベント参加（接客）",
-  product_interests: "製品関心",
-  cost_items: "費用",
-  event_kpi: "イベントKPI",
-  survey_summary: "アンケート集計",
+const STAGE_LABEL: Record<string, string> = {
+  read: "データを読み込み中",
+  interpret: "内容を解釈中",
+  conform: "重複や表記ゆれを確認中",
+  bind: "データをひも付け中",
+  derive: "分析用の情報を生成中",
+  report: "レポートを作成中",
 };
 
-const LINK_KIND_LABEL: Record<string, string> = {
-  event: "イベント",
-  account: "企業",
-  product: "製品",
-};
-
-function buildPlanText(plan: BatchPlan): string {
-  const lines: string[] = [];
-  for (const fp of plan.files) {
-    lines.push(`**${fp.filename}**`);
-    if (fp.business_context) lines.push(fp.business_context);
-    for (const t of fp.targets) {
-      lines.push(`種別: ${ENTITY_LABEL[t.entity_type] ?? t.entity_type}`);
-      const entries = Object.entries(t.column_map);
-      if (entries.length > 0) {
-        const cols = entries.slice(0, 5).map(([k, v]) => `${k}→${v}`).join("、");
-        const more = entries.length > 5 ? `、他${entries.length - 5}列` : "";
-        lines.push(`カラム: ${cols}${more}`);
-      }
-      for (const [kind, col] of Object.entries(t.link_columns)) {
-        lines.push(`${LINK_KIND_LABEL[kind] ?? kind}リンク: 「${col}」列で行ごとに解決`);
-      }
-      const aiCols = Object.entries(t.column_modes)
-        .filter(([, mode]) => mode === "ai_parse")
-        .map(([col]) => col);
-      if (aiCols.length > 0) lines.push(`AI解釈列: ${aiCols.join("、")}`);
-    }
-    if (fp.unmapped_notes) lines.push(`⚠️ ${fp.unmapped_notes}`);
-    if (fp.extraction_caveat) lines.push(`⚠️ ${fp.extraction_caveat}`);
-    lines.push("");
-  }
-  lines.push("この内容（と下の既定イベント）で取り込みますか？");
-  return lines.join("\n");
+function stageLabel(stage: string): string {
+  return STAGE_LABEL[stage] ?? "取り込みを準備中";
 }
 
 // ── メインコンポーネント ──────────────────────────────────────────────────────
@@ -280,16 +229,16 @@ export default function DashboardPage() {
         throw new Error(body.detail ?? `エラー ${res.status}`);
       }
       const plan: BatchPlan = await res.json();
-      const text = buildPlanText(plan);
 
       setMessages((prev) =>
         prev.map((m) =>
           m.id === asstMsgId
             ? {
                 ...m,
-                content: text,
+                content: "この内容（と下の既定イベント）で取り込みますか？",
                 loading: false,
                 pendingConfirm: { files, hint, plan, proposedEvent: plan.default_event },
+                ingestionPlan: plan,
               }
             : m
         )
@@ -318,12 +267,11 @@ export default function DashboardPage() {
     setMessages((prev) =>
       prev.map((m) => {
         if (m.id !== msgId || m.role !== "assistant" || !m.pendingConfirm?.plan) return m;
+        const plan = { ...m.pendingConfirm.plan, default_event: next };
         return {
           ...m,
-          pendingConfirm: {
-            ...m.pendingConfirm,
-            plan: { ...m.pendingConfirm.plan, default_event: next },
-          },
+          pendingConfirm: { ...m.pendingConfirm, plan },
+          ingestionPlan: plan,
         };
       })
     );
@@ -335,7 +283,9 @@ export default function DashboardPage() {
   ) {
     setMessages((prev) =>
       prev.map((m) =>
-        m.id === msgId ? { ...m, pendingConfirm: undefined, loading: true } : m
+        m.id === msgId
+          ? { ...m, content: "", pendingConfirm: undefined, loading: true, ingestionProgress: { stage: "" } }
+          : m
       )
     );
     setIsIngesting(true);
@@ -353,12 +303,14 @@ export default function DashboardPage() {
         throw new Error(body.detail ?? `エラー ${res.status}`);
       }
       const { batch_id } = await res.json();
+      // バックエンドがこの時点で取り込みスレッドを作成済み。左メニューに即時反映する。
+      reloadThreads();
       pollBatch(batch_id, msgId);
     } catch (e) {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === msgId
-            ? { ...m, content: `取り込みエラー: ${(e as Error).message}`, loading: false }
+            ? { ...m, content: `取り込みエラー: ${(e as Error).message}`, loading: false, ingestionProgress: null }
             : m
         )
       );
@@ -382,25 +334,22 @@ export default function DashboardPage() {
         if (data.status === "done") {
           clearInterval(timer);
           setIsIngesting(false);
-          const ce = data.created_entities ?? {};
-          const parts = Object.entries(ce)
-            .filter(([, v]) => (v as number) > 0)
-            .map(([k, v]) => `${ENTITY_LABEL[k] ?? k}: ${v}件`);
-          const fallback = parts.length
-            ? `取り込み結果: ${parts.join(" / ")}`
-            : "取り込み完了（新規エンティティなし）";
-          const pendingCount = (data.pending_count as number) ?? 0;
-          const resultText = [
-            (data.report_markdown as string) || fallback,
-            pendingCount > 0
-              ? `⚠️ 保留 ${pendingCount} 件（イベント未確定の行）は「データ」タブの「取り込み行（着地）」から確認できます。`
-              : "",
-            "データの確認は「データ」タブから行えます。",
-          ]
-            .filter(Boolean)
-            .join("\n\n");
           setMessages((prev) =>
-            prev.map((m) => (m.id === msgId ? { ...m, content: resultText, loading: false } : m))
+            prev.map((m) =>
+              m.id === msgId
+                ? {
+                    ...m,
+                    loading: false,
+                    ingestionProgress: null,
+                    ingestionResult: {
+                      report_markdown: (data.report_markdown as string) || "取り込みが完了しました。",
+                      created_entities: data.created_entities ?? {},
+                      pending_count: (data.pending_count as number) ?? 0,
+                      skipped_count: (data.skipped_count as number) ?? 0,
+                    },
+                  }
+                : m
+            )
           );
         } else if (data.status === "error") {
           clearInterval(timer);
@@ -408,8 +357,19 @@ export default function DashboardPage() {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === msgId
-                ? { ...m, content: `取り込みエラー: ${data.error ?? "不明なエラー"}`, loading: false }
+                ? {
+                    ...m,
+                    content: `取り込みエラー: ${data.error ?? "不明なエラー"}`,
+                    loading: false,
+                    ingestionProgress: null,
+                  }
                 : m
+            )
+          );
+        } else {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === msgId ? { ...m, ingestionProgress: { stage: data.stage ?? "" } } : m
             )
           );
         }
@@ -592,6 +552,44 @@ export default function DashboardPage() {
   async function handleSelectThread(threadId: string) {
     if (sending || threadId === activeThreadId) return;
     const stored = await getThreadMessages(threadId);
+    const thread = threads.find((t) => t.thread_id === threadId);
+    sessionId.current = threadId;
+    setActiveThreadId(threadId);
+
+    if (thread?.kind === "ingestion") {
+      // 取り込みスレッドは会話メッセージではなく plan/result のスナップショットなので、
+      // 通常のチャットUIとは別経路で単一の合成メッセージに組み立てる。
+      const planMsg = stored.find((m) => m.content_type === "ingestion_plan");
+      const resultMsg = stored.find((m) => m.content_type === "ingestion_result");
+      const errorMsg = stored.find((m) => m.content_type === "ingestion_error");
+      const msgId = crypto.randomUUID();
+      const stillRunning = !resultMsg && !errorMsg;
+      setMessages([
+        {
+          id: msgId,
+          role: "assistant",
+          content: errorMsg ? `取り込みエラー: ${errorMsg.error ?? "不明なエラー"}` : "",
+          ingestionPlan: planMsg?.plan ?? null,
+          ingestionResult: resultMsg
+            ? {
+                report_markdown: resultMsg.report_markdown ?? "",
+                created_entities: resultMsg.created_entities ?? {},
+                pending_count: resultMsg.pending_count ?? 0,
+                skipped_count: resultMsg.skipped_count ?? 0,
+              }
+            : null,
+          ingestionProgress: stillRunning ? { stage: "" } : null,
+          loading: stillRunning,
+        },
+      ]);
+      if (stillRunning) {
+        // 実行中に離脱して戻ってきたケース: batch_id === thread_id なのでそのまま再開できる
+        setIsIngesting(true);
+        pollBatch(threadId, msgId);
+      }
+      return;
+    }
+
     const restored: ChatMessage[] = stored.map((m) => ({
       id: crypto.randomUUID(),
       role: m.role,
@@ -601,8 +599,6 @@ export default function DashboardPage() {
       runId: m.run_id ?? undefined,
       loading: false,
     }));
-    sessionId.current = threadId;
-    setActiveThreadId(threadId);
     setMessages(restored.length > 0 ? restored : [INITIAL_MESSAGE]);
     restored.forEach((m) => {
       if (m.role === "assistant" && m.runId) loadRunDeliverables(m.id, m.runId);
@@ -726,7 +722,14 @@ export default function DashboardPage() {
                   {msg.codeBlocks && msg.codeBlocks.length > 0 && (
                     <CodeExecutionPanel blocks={msg.codeBlocks} />
                   )}
-                  {msg.loading && !msg.content && <Loader2 className="w-4 h-4 animate-spin text-gray-400" />}
+                  {msg.loading && !msg.content && !msg.ingestionProgress && (
+                    <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
+                  )}
+                  {msg.ingestionPlan && (
+                    <div className="mt-1">
+                      <IngestionPlanCard plan={msg.ingestionPlan} />
+                    </div>
+                  )}
                   {msg.content && (
                     <div className="mt-1">
                       <MessageMarkdown content={msg.content} />
@@ -806,6 +809,23 @@ export default function DashboardPage() {
                           キャンセル
                         </button>
                       </div>
+                    </div>
+                  )}
+                  {msg.ingestionProgress && (
+                    <div className="mt-3 flex items-center gap-2 text-xs text-gray-500">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-500" />
+                      {stageLabel(msg.ingestionProgress.stage)}...
+                    </div>
+                  )}
+                  {msg.ingestionResult && (
+                    <div className="mt-3 pt-2 border-t border-gray-100 space-y-2">
+                      <MessageMarkdown content={msg.ingestionResult.report_markdown} />
+                      {msg.ingestionResult.pending_count > 0 && (
+                        <p className="text-[11px] text-amber-700">
+                          ⚠️ 保留 {msg.ingestionResult.pending_count} 件（イベント未確定の行）は「データ」タブの「取り込み行（着地）」から確認できます。
+                        </p>
+                      )}
+                      <p className="text-[11px] text-gray-400">データの確認は「データ」タブから行えます。</p>
                     </div>
                   )}
                   {msg.deliverables && msg.deliverables.length > 0 && (

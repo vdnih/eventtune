@@ -8,7 +8,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
-import { MessageSquarePlus, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { MessageSquarePlus, MoreHorizontal, Pencil, Trash2, Upload } from "lucide-react";
 import type { ThreadSummary } from "@/lib/threads";
 
 interface ThreadSidebarProps {
@@ -133,12 +133,15 @@ function ThreadRow({
       <button
         onClick={onSelect}
         className={cn(
-          "flex-1 min-w-0 text-left px-3 py-2 text-sm truncate",
+          "flex-1 min-w-0 flex items-center gap-1.5 text-left px-3 py-2 text-sm truncate",
           active ? "text-brand-700 font-medium" : "text-gray-700",
         )}
         title={thread.title}
       >
-        {thread.title}
+        {thread.kind === "ingestion" && (
+          <Upload className="w-3.5 h-3.5 shrink-0 text-gray-400" />
+        )}
+        <span className="truncate">{thread.title}</span>
       </button>
       <button
         onClick={() => setMenuOpen((v) => !v)}

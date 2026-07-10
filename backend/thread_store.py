@@ -44,8 +44,14 @@ def _title_from_message(message: str) -> str:
 # ── 永続化（チャット時に呼ばれる）─────────────────────────────────────────────
 
 
-def touch_thread(space: SpaceContext, thread_id: str, first_message: str) -> None:
-    """スレッドを upsert する。新規なら uid/title/created_at をセット、毎回 updated_at を更新。"""
+def touch_thread(
+    space: SpaceContext, thread_id: str, first_message: str, kind: str = "chat"
+) -> None:
+    """スレッドを upsert する。新規なら uid/title/created_at/kind をセット、毎回 updated_at を更新。
+
+    kind はスレッドの種類（"chat" | "ingestion"）。既存の呼び出し（chat）は無指定のままで
+    互換性を保つ。
+    """
     ref = space.col("threads").document(thread_id)
     snap = ref.get()
     now = _now_iso()
@@ -57,6 +63,7 @@ def touch_thread(space: SpaceContext, thread_id: str, first_message: str) -> Non
                 "thread_id": thread_id,
                 "session_id": thread_id,
                 "uid": space.uid,
+                "kind": kind,
                 "title": _title_from_message(first_message),
                 "title_custom": False,
                 "created_at": now,

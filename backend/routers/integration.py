@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 
+import thread_store
 from dependencies import get_space_context
 from ingestion.normalize import _normalize_name
 from ingestion.readers import extraction_caveat, is_supported
@@ -35,6 +36,15 @@ STALE_AFTER_SECONDS = 600
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _ingestion_title(filenames: list[str]) -> str:
+    if not filenames:
+        return "データ取り込み"
+    title = f"取り込み: {filenames[0]}"
+    if len(filenames) > 1:
+        title += f" 他{len(filenames) - 1}件"
+    return title
 
 
 async def _load_files(files: list[UploadFile]) -> list[tuple[str, bytes]]:
@@ -148,6 +158,21 @@ async def _run_integration(
             result.created_entities,
             result.pending_count,
         )
+        try:
+            thread_store.append_message(
+                space,
+                batch_id,
+                {
+                    "role": "assistant",
+                    "content_type": "ingestion_result",
+                    "report_markdown": result.report_markdown,
+                    "created_entities": result.created_entities,
+                    "pending_count": result.pending_count,
+                    "skipped_count": result.skipped_count,
+                },
+            )
+        except Exception:
+            logger.exception("thread persist (ingestion_result) failed: batch_id=%s", batch_id)
     except Exception as e:
         logger.exception("integration failed: batch_id=%s error=%s", batch_id, e)
         try:
@@ -156,6 +181,18 @@ async def _run_integration(
             )
         except Exception:
             pass
+        try:
+            thread_store.append_message(
+                space,
+                batch_id,
+                {
+                    "role": "assistant",
+                    "content_type": "ingestion_error",
+                    "error": str(e)[:500],
+                },
+            )
+        except Exception:
+            logger.exception("thread persist (ingestion_error) failed: batch_id=%s", batch_id)
 
 
 @router.post("/batches", status_code=202)
@@ -197,6 +234,24 @@ async def start_integration(
             "created_at": _now_iso(),
         }
     )
+
+    # 取り込みも会話スレッドと同じ左メニューに出せるよう、thread として upsert する
+    # （左ペイン一覧はスレッド一覧を再利用。永続化の失敗は取り込み自体を止めない）。
+    try:
+        thread_store.touch_thread(space, batch_id, _ingestion_title(filenames), kind="ingestion")
+        thread_store.append_message(
+            space,
+            batch_id,
+            {
+                "role": "assistant",
+                "content_type": "ingestion_plan",
+                "plan": batch_plan.model_dump() if batch_plan else None,
+                "filenames": filenames,
+                "hint": (hint or "").strip(),
+            },
+        )
+    except Exception:
+        logger.exception("thread persist (ingestion_plan) failed: batch_id=%s", batch_id)
 
     background_tasks.add_task(
         _run_integration, space, batch_id, loaded, (hint or "").strip(), batch_plan

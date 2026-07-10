@@ -5,12 +5,14 @@
  * すべて authFetch 経由でバックエンド（/api/marketing/threads...）を呼ぶ。
  */
 import { authFetch } from "@/lib/api";
+import type { BatchPlan } from "@/lib/ingestion";
 
 export interface ThreadSummary {
   thread_id: string;
   title: string;
   updated_at: string;
   message_count?: number;
+  kind?: "chat" | "ingestion"; // 未指定は "chat" 扱い（既存スレッドとの互換用）
 }
 
 // Firestore に保存された再表示用メッセージ（スナップショット）
@@ -21,6 +23,15 @@ export interface StoredMessage {
   tool_calls?: { tool_name: string; args: Record<string, unknown> }[];
   code_blocks?: { code: string; output?: string; outcome?: string }[];
   run_id?: string | null;
+  // kind: "ingestion" のスレッドのみで使うフィールド
+  content_type?: "ingestion_plan" | "ingestion_result" | "ingestion_error";
+  plan?: BatchPlan | null;
+  filenames?: string[];
+  report_markdown?: string;
+  created_entities?: Record<string, number>;
+  pending_count?: number;
+  skipped_count?: number;
+  error?: string;
 }
 
 export async function listThreads(): Promise<ThreadSummary[]> {

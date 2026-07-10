@@ -101,6 +101,19 @@ def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, f
     assert job.exists
     assert job.to_dict()["plan"]["default_event"]["name"] == "展示会X"
 
+    # 取り込みも会話スレッドと同じ左メニューから見えるよう thread として永続化される
+    thread = db.document(f"spaces/{seeded_space}/threads/{batch_id}").get()
+    assert thread.exists
+    thread_data = thread.to_dict()
+    assert thread_data["kind"] == "ingestion"
+    assert thread_data["uid"] == "uid_member"
+    messages = {
+        m.to_dict()["content_type"]: m.to_dict()
+        for m in db.collection(f"spaces/{seeded_space}/threads/{batch_id}/messages").stream()
+    }
+    assert messages["ingestion_plan"]["plan"]["default_event"]["name"] == "展示会X"
+    assert messages["ingestion_result"]["created_entities"] == {"persons": 2, "events": 1}
+
 
 def test_plan_omitted_runs_understand_once(make_client, seeded_space, monkeypatch):
     """plan 省略時（API 直叩き）は実行内で Understand が1回だけ走る。"""
@@ -315,7 +328,7 @@ def test_empty_upload_returns_400(make_client, seeded_space, fake_process_batch)
     assert res.status_code == 400
 
 
-def test_pipeline_failure_marks_batch_error(make_client, seeded_space, monkeypatch):
+def test_pipeline_failure_marks_batch_error(make_client, seeded_space, db, monkeypatch):
     """process_batch が例外を投げてもジョブは error 状態で着地する（握りつぶさない）。"""
     import agents.data_integration_agent as agent
 
@@ -336,6 +349,13 @@ def test_pipeline_failure_marks_batch_error(make_client, seeded_space, monkeypat
     ).json()
     assert body["status"] == "error"
     assert "pipeline exploded" in body["error"]
+
+    # スレッド側にも失敗が記録され、開いたときに分かる
+    messages = {
+        m.to_dict()["content_type"]: m.to_dict()
+        for m in db.collection(f"spaces/{seeded_space}/threads/{batch_id}/messages").stream()
+    }
+    assert "pipeline exploded" in messages["ingestion_error"]["error"]
 
 
 def test_stale_processing_batch_is_swept_to_error(make_client, seeded_space, db):
