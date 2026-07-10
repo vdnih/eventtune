@@ -132,7 +132,9 @@ def pop_unconsumed_ingestion_context(space: SpaceContext, thread_id: str) -> str
     """
     try:
         docs = list(
-            space.col("integration_jobs").where(filter=FieldFilter("thread_id", "==", thread_id)).get()
+            space.col("integration_jobs")
+            .where(filter=FieldFilter("thread_id", "==", thread_id))
+            .get()
         )
     except Exception:
         logger.exception("pop_unconsumed_ingestion_context: query failed thread_id=%s", thread_id)

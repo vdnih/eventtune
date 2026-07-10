@@ -127,9 +127,7 @@ async def chat(
                     },
                 )
             except Exception:
-                logger.exception(
-                    "thread persist (assistant) failed: thread_id=%s", body.thread_id
-                )
+                logger.exception("thread persist (assistant) failed: thread_id=%s", body.thread_id)
 
     return StreamingResponse(
         event_generator(),
