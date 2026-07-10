@@ -238,9 +238,7 @@ async def start_integration(
     # 取り込みも会話スレッドと同じ左メニューに出せるよう、thread として upsert する
     # （左ペイン一覧はスレッド一覧を再利用。永続化の失敗は取り込み自体を止めない）。
     try:
-        thread_store.touch_thread(
-            space, batch_id, _ingestion_title(filenames), kind="ingestion"
-        )
+        thread_store.touch_thread(space, batch_id, _ingestion_title(filenames), kind="ingestion")
         thread_store.append_message(
             space,
             batch_id,
