@@ -18,7 +18,11 @@ function summarizeColumns(fp: FilePlan): string {
       if (!cols.includes(k)) cols.push(k);
     }
   }
-  if (cols.length === 0) return "—";
+  if (cols.length === 0) {
+    // 文書ファイル（.txt等）は column_map を持たない仕様（本文全体をAIが解釈するため）。
+    // targets があるのに「—」と出すと未読取に見えるため、対象がある場合は明示する。
+    return fp.targets.length > 0 ? "本文全体から解釈（列指定なし）" : "—";
+  }
   const shown = cols.slice(0, MAX_COLUMNS_SHOWN).join("、");
   const more = cols.length > MAX_COLUMNS_SHOWN ? ` 他${cols.length - MAX_COLUMNS_SHOWN}項目` : "";
   return `${shown}${more}`;
