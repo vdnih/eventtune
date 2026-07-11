@@ -17,8 +17,10 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 
 import thread_store
+from agents.confirmation_intent import ConfirmationIntentValue, classify_confirmation_intent
 from dependencies import get_space_context
 from ingestion.normalize import _normalize_name
 from ingestion.readers import extraction_caveat, is_supported
@@ -154,6 +156,25 @@ async def plan_ingestion(
     return plan.model_dump()
 
 
+class ConfirmIntentRequest(BaseModel):
+    message: str
+    context_summary: str
+
+
+@router.post("/confirm-intent")
+async def confirm_intent(
+    payload: ConfirmIntentRequest,
+    space: SpaceContext = Depends(get_space_context),
+) -> dict[str, ConfirmationIntentValue]:
+    """保留中の確認（取り込みプラン等）へのテキスト返信を承認/取消/それ以外に分類する。
+
+    ボタンを押さずにテキストで「取り込む」「OK」等と送っても承認扱いにできるようにする
+    ためのもの。フロントは pendingConfirm がある間だけこのエンドポイントを呼ぶ。
+    """
+    intent = await classify_confirmation_intent(space, payload.message, payload.context_summary)
+    return {"intent": intent}
+
+
 # ── バッチ処理（承認済み BatchPlan の実行）─────────────────────────────────────────
 
 
@@ -251,6 +272,7 @@ async def start_integration(
     plan: str | None = Form(None),
     hint: str | None = Form(None),
     thread_id: str = Form(...),
+    confirm_text: str = Form("取り込む"),
     space: SpaceContext = Depends(get_space_context),
 ):
     """複数ファイルと承認済み BatchPlan でデータ統合バッチを開始する。
@@ -262,6 +284,10 @@ async def start_integration(
     thread_id はフロントが会話開始時に採番した表示スレッド ID。marketing チャットと
     同じスレッドに書き込むことで、取り込み結果を以後の会話（分析依頼）の文脈として
     使えるようにする（thread_store.pop_unconsumed_ingestion_context 参照）。
+
+    confirm_text はユーザーが承認の意思表示として実際に送った文言（ボタンなら固定文言
+    「取り込む」、テキスト入力なら入力そのもの）。ボタンとテキストを同じ意味として扱う
+    ため、チャット履歴上は必ずこの発言がプラン提示の直後に記録される。
     """
     loaded = await _load_files(files)
 
@@ -319,6 +345,16 @@ async def start_integration(
                 "plan": batch_plan.model_dump() if batch_plan else None,
                 "filenames": filenames,
                 "hint": hint_stripped,
+            },
+        )
+        thread_store.append_message(
+            space,
+            thread_id,
+            {
+                "role": "user",
+                "content": (confirm_text or "").strip() or "取り込む",
+                "content_type": "ingestion_confirm",
+                "batch_id": batch_id,
             },
         )
     except Exception:

@@ -28,7 +28,7 @@ export interface StoredMessage {
   pattern_format?: string | null;
   files?: string[]; // ingestion のユーザー添付メッセージのみで使う
   // ingestion 関連メッセージのみで使うフィールド
-  content_type?: "ingestion_plan" | "ingestion_result" | "ingestion_error";
+  content_type?: "ingestion_plan" | "ingestion_confirm" | "ingestion_result" | "ingestion_error";
   batch_id?: string;
   plan?: BatchPlan | null;
   filenames?: string[];
