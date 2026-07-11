@@ -115,15 +115,49 @@ def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, f
     assert thread_data["uid"] == "uid_member"
     # タイトルはファイル名でなく、承認済みプランの既定イベント名になる
     assert thread_data["title"] == "展示会X"
-    messages = {
-        m.to_dict().get("content_type"): m.to_dict()
-        for m in db.collection(f"spaces/{seeded_space}/threads/thread_1/messages").stream()
-    }
+    docs = list(db.collection(f"spaces/{seeded_space}/threads/thread_1/messages").stream())
+    messages = {d.to_dict().get("content_type"): d.to_dict() for d in docs}
     assert messages[None]["role"] == "user"
     assert messages["ingestion_plan"]["batch_id"] == batch_id
     assert messages["ingestion_plan"]["plan"]["default_event"]["name"] == "展示会X"
     assert messages["ingestion_result"]["batch_id"] == batch_id
     assert messages["ingestion_result"]["created_entities"] == {"persons": 2, "events": 1}
+
+    # 承認発話（ボタン起点なら既定文言「取り込む」）が、添付→プラン提示の直後に
+    # ユーザー発言として記録される（ボタンとテキスト入力を同じ意味として扱うための土台）。
+    assert messages["ingestion_confirm"]["role"] == "user"
+    assert messages["ingestion_confirm"]["content"] == "取り込む"
+    assert messages["ingestion_confirm"]["batch_id"] == batch_id
+    by_seq = sorted(docs, key=lambda d: d.to_dict()["seq"])
+    assert [d.to_dict().get("content_type") for d in by_seq] == [
+        None,
+        "ingestion_plan",
+        "ingestion_confirm",
+        "ingestion_result",
+    ]
+
+
+def test_upload_persists_custom_confirm_text(make_client, seeded_space, db, fake_process_batch):
+    """confirm_text はテキスト入力による承認（ボタン以外）の実際の発言をそのまま保持する。"""
+    client = make_client(uid="uid_member")
+    res = client.post(
+        "/api/integration/batches",
+        headers={"X-Space-Id": seeded_space},
+        files=[("files", ("attendees.csv", b"name,email\nA,a@example.com\n", "text/csv"))],
+        data={
+            "plan": json.dumps(_APPROVED_PLAN),
+            "thread_id": "thread_confirm_text",
+            "confirm_text": "OK、お願いします",
+        },
+    )
+    assert res.status_code == 202
+    messages = {
+        m.to_dict().get("content_type"): m.to_dict()
+        for m in db.collection(
+            f"spaces/{seeded_space}/threads/thread_confirm_text/messages"
+        ).stream()
+    }
+    assert messages["ingestion_confirm"]["content"] == "OK、お願いします"
 
 
 def test_thread_title_uses_dataset_kind_when_no_default_event(
@@ -436,3 +470,33 @@ def test_unknown_batch_returns_404(make_client, seeded_space):
     client = make_client(uid="uid_member")
     res = client.get("/api/integration/batches/batch_none", headers={"X-Space-Id": seeded_space})
     assert res.status_code == 404
+
+
+def test_confirm_intent_classifies_free_text(make_client, seeded_space, monkeypatch):
+    """テキスト入力（ボタンを押さない承認/取消）が意図判定エンドポイント経由で分類される。"""
+    import routers.integration as integration_router
+
+    calls: list[tuple[str, str]] = []
+
+    async def _fake_classify(space, message, context_summary):
+        calls.append((message, context_summary))
+        return "approve" if "OK" in message else "cancel"
+
+    monkeypatch.setattr(integration_router, "classify_confirmation_intent", _fake_classify)
+
+    client = make_client(uid="uid_member")
+    res = client.post(
+        "/api/integration/confirm-intent",
+        headers={"X-Space-Id": seeded_space},
+        json={"message": "OK", "context_summary": "「展示会X」の取り込みプラン"},
+    )
+    assert res.status_code == 200
+    assert res.json() == {"intent": "approve"}
+    assert calls == [("OK", "「展示会X」の取り込みプラン")]
+
+    res2 = client.post(
+        "/api/integration/confirm-intent",
+        headers={"X-Space-Id": seeded_space},
+        json={"message": "やめて", "context_summary": "「展示会X」の取り込みプラン"},
+    )
+    assert res2.json() == {"intent": "cancel"}

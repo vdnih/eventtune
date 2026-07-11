@@ -298,17 +298,23 @@ export default function DashboardPage() {
     );
   }
 
+  // ボタンクリックとテキスト入力（「取り込む」「OK」等）を同じ意味として扱うため、
+  // どちらの経路でも「承認発話を新しいユーザーバブルとして積む」→「進捗・結果は
+  // プランのバブルとは別の新しいバブルに出す」という同じ処理を通す。
   async function handleConfirmIngestion(
     msgId: string,
-    pending: { files: File[]; hint: string; plan: BatchPlan | null }
+    pending: { files: File[]; hint: string; plan: BatchPlan | null },
+    confirmText: string = "取り込む"
   ) {
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === msgId
-          ? { ...m, content: "", pendingConfirm: undefined, loading: true, ingestionProgress: { stage: "" } }
-          : m
-      )
-    );
+    setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, pendingConfirm: undefined } : m)));
+
+    const userMsgId = crypto.randomUUID();
+    const progressMsgId = crypto.randomUUID();
+    setMessages((prev) => [
+      ...prev,
+      { id: userMsgId, role: "user", content: confirmText },
+      { id: progressMsgId, role: "assistant", content: "", loading: true, ingestionProgress: { stage: "" } },
+    ]);
     setIsIngesting(true);
 
     try {
@@ -318,6 +324,7 @@ export default function DashboardPage() {
       // 承認済みプラン（既定イベントの修正を含む）をそのまま実行に渡す（ADR-015 決定4）
       if (pending.plan) formData.append("plan", JSON.stringify(pending.plan));
       formData.append("thread_id", threadId.current);
+      formData.append("confirm_text", confirmText);
 
       const res = await authFetch("/api/integration/batches", { method: "POST", body: formData });
       if (!res.ok) {
@@ -325,15 +332,15 @@ export default function DashboardPage() {
         throw new Error(body.detail ?? `エラー ${res.status}`);
       }
       const { batch_id } = await res.json();
-      setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, batchId: batch_id } : m)));
+      setMessages((prev) => prev.map((m) => (m.id === progressMsgId ? { ...m, batchId: batch_id } : m)));
       setActiveThreadId(threadId.current);
       // バックエンドがこの時点で取り込みスレッドを作成済み。左メニューに即時反映する。
       reloadThreads();
-      pollBatch(batch_id, msgId);
+      pollBatch(batch_id, progressMsgId);
     } catch (e) {
       setMessages((prev) =>
         prev.map((m) =>
-          m.id === msgId
+          m.id === progressMsgId
             ? { ...m, content: `取り込みエラー: ${(e as Error).message}`, loading: false, ingestionProgress: null }
             : m
         )
@@ -342,10 +349,65 @@ export default function DashboardPage() {
     }
   }
 
-  function handleCancelIngestion(msgId: string) {
-    setMessages((prev) =>
-      prev.map((m) => (m.id === msgId ? { ...m, pendingConfirm: undefined } : m))
-    );
+  // キャンセルはまだ何も作成していないため、バックエンド呼び出しは行わない
+  // （ADR-015: 未承認プランでAI呼び出しを浪費しない）。ローカルの会話履歴にのみ残す。
+  function handleCancelIngestion(msgId: string, cancelText: string = "キャンセル") {
+    setMessages((prev) => [
+      ...prev.map((m) => (m.id === msgId ? { ...m, pendingConfirm: undefined } : m)),
+      { id: crypto.randomUUID(), role: "user", content: cancelText },
+      {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: "取り込みをキャンセルしました。",
+        loading: false,
+      },
+    ]);
+  }
+
+  /** 保留中の取り込みプランを短く説明する文（意図判定モデルへの文脈として渡す）。 */
+  function summarizePendingIngestion(pending: { files: File[]; plan: BatchPlan | null }): string {
+    if (pending.plan?.default_event?.name) return `「${pending.plan.default_event.name}」の取り込みプラン`;
+    const names = pending.files.map((f) => f.name);
+    if (names.length === 1) return `「${names[0]}」の取り込みプラン`;
+    return `${names.length}件のファイルの取り込みプラン`;
+  }
+
+  // 保留中の取り込み確認があるときだけ、テキスト入力を承認/キャンセル/それ以外に判定する。
+  // ボタンを押さなくても「取り込む」「OK」等のテキストで承認できるようにするための入口。
+  async function routeChatInput(text: string) {
+    const pendingMsg = [...messages]
+      .reverse()
+      .find((m): m is AssistantChatMessage => m.role === "assistant" && !!m.pendingConfirm);
+
+    if (!pendingMsg?.pendingConfirm) {
+      await handleChatFlow(text);
+      return;
+    }
+
+    try {
+      const res = await authFetch("/api/integration/confirm-intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          context_summary: summarizePendingIngestion(pendingMsg.pendingConfirm),
+        }),
+      });
+      if (res.ok) {
+        const { intent } = await res.json();
+        if (intent === "approve") {
+          await handleConfirmIngestion(pendingMsg.id, pendingMsg.pendingConfirm, text);
+          return;
+        }
+        if (intent === "cancel") {
+          handleCancelIngestion(pendingMsg.id, text);
+          return;
+        }
+      }
+    } catch {
+      // 分類に失敗した場合は通常のチャットにフォールバックする（fail open）
+    }
+    await handleChatFlow(text);
   }
 
   function pollBatch(batchId: string, msgId: string) {
@@ -595,7 +657,7 @@ export default function DashboardPage() {
     const text = input.trim();
     if (!text) return;
     setInput("");
-    await handleChatFlow(text);
+    await routeChatInput(text);
   }
 
   // ── スレッド（会話）切替 ─────────────────────────────────────────────────
@@ -614,11 +676,13 @@ export default function DashboardPage() {
     setActiveThreadId(selectedThreadId);
 
     // chat・ingestion のターンが seq 順に混在しているので、通しで走査して統一的に
-    // 組み立てる。ingestion_plan で新規バブルを開始し、対応する batch_id を持つ
-    // ingestion_result/ingestion_error でそのバブルを完成させる（旧データは
-    // batch_id フィールドを持たないため thread_id にフォールバックする）。
+    // 組み立てる。プラン提示（ingestion_plan）と、承認後の進捗・結果は別バブルにする
+    // （承認発話 ingestion_confirm が来た時点で新しいバブルを開始する）。承認発話を
+    // 持たない旧データ（このリリース前に作られたスレッド）は、結果を従来通りプラン
+    // バブルへ合成してフォールバックする。
     const restored: ChatMessage[] = [];
-    const batchBubbles = new Map<string, AssistantChatMessage>();
+    const planBubbles = new Map<string, AssistantChatMessage>();
+    const resultBubbles = new Map<string, AssistantChatMessage>();
     const patternLoads: { id: string; segmentId: string; format: string }[] = [];
 
     for (const m of stored) {
@@ -633,11 +697,31 @@ export default function DashboardPage() {
           loading: true,
           batchId,
         };
-        batchBubbles.set(batchId, bubble);
+        planBubbles.set(batchId, bubble);
         restored.push(bubble);
+      } else if (m.content_type === "ingestion_confirm") {
+        const batchId = m.batch_id ?? selectedThreadId;
+        const planBubble = planBubbles.get(batchId);
+        if (planBubble) {
+          // 承認発話が来た時点でプランバブルは確定状態（ポーリング再開は新バブル側に移す）。
+          planBubble.ingestionProgress = null;
+          planBubble.loading = false;
+        }
+        restored.push({ id: crypto.randomUUID(), role: "user", content: m.content });
+        const resultBubble: AssistantChatMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: "",
+          ingestionProgress: { stage: "" },
+          loading: true,
+          batchId,
+        };
+        resultBubbles.set(batchId, resultBubble);
+        restored.push(resultBubble);
       } else if (m.content_type === "ingestion_result" || m.content_type === "ingestion_error") {
         const batchId = m.batch_id ?? selectedThreadId;
-        const bubble = batchBubbles.get(batchId);
+        // 承認発話由来の新バブルを優先し、無ければ旧データとしてプランバブルに合成する。
+        const bubble = resultBubbles.get(batchId) ?? planBubbles.get(batchId);
         if (!bubble) continue;
         if (m.content_type === "ingestion_result") {
           bubble.ingestionResult = {
