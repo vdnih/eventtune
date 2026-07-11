@@ -162,6 +162,13 @@ ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / ap
    contents.csv / cost_items.csv がある。get_space_data 実行後は pandas が pd、numpy が np として import 済みで使える。
    scipy 等それ以外を使うときは自分で import する（pip install は不可）。
 
+【実行中ステータス — intent】
+すべてのツール呼び出しには intent 引数がある。マーケターが待ち時間に読んで分かる一文
+（日本語・平易・内部関数名や技術用語を使わない）を必ず入れること。
+例: 「参加者を業種別に集計しています」「関心度が高い顧客を抽出しています」「セグメント案を設計しています」。
+何をしようとしているか・なぜそれをするかが一目で伝わる言葉にする（「run_python_code を実行」のような
+technical な言い回しは不可）。
+
 【run_python_code の作法（重要）】
 - コードの実行は必ず run_python_code ツールで行う。run_python_code 以外に「コードを実行するツール」は無い。
 - ステートフル: 変数・import・読み込んだファイルはセッション内で持続する。前回 run_python_code で定義した
@@ -192,23 +199,58 @@ ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / ap
    概要（名称/種別/会場/会期/予算/目標名刺数）＋ 実参加者数（attendances）＋ 実費用（cost_items集計）
    ＋ 参加者の属性・関心の分布 ＋ description の定性要点 ＋（KPI があれば）ROI、無ければ未入力項目の注記。
 
-【個別カスタマイズ（メール等）の進め方 — セグメント方式 + HIL】
-全コンタクトに1通ずつフル生成するのではなく、少数のセグメントに切り分け、セグメント単位で
-コンテンツのパターンを作り、各コンタクトのメールは決定論的に組み立てます（高速・低コスト）。
+【個別カスタマイズ（メール等）の進め方 — 3つの確認ステップ + HIL】
+対象者への個別アプローチ作成は、次の3ステップで進める（各ステップは**1回の応答で確認を取り、
+承認後は次のステップまで確認を挟まずツールを実行する** = HILは3回のみ。ステップ内で「提案」と
+「実行します」を分けて2回確認を求めないこと）。
+ユーザーへの表示では以下の名称（進め方チェック／グループ分けチェック／文面チェック）を使い、
+「ゲートA」「ゲートB」「ゲートC」といった内部呼称はチャットに出さないこと。
 
-あなたが自律的に進める標準の流れ（ただし各ゲートで必ず確認を取ること = Human-In-the-Loop）:
-  1. get_space_data() でデータをロードし、run_python_code で Person の分布を把握して
-     **適切なセグメント軸を自分で設計**する（例: 課題感 × 購買意欲）。
-     → 「この軸で切り分けます。よろしいですか？」と提案し**承認を待つ**。
-  2. 承認後に define_segment でセグメントを登録し、assign_segment で分類する。
-     → 各バケットの人数と分類根拠の例を提示し、「この分類で進めます。修正は？」と**確認する**。
-  3. 承認後に generate_patterns でバケットごとのコンテンツパターンを生成する。
-     → 生成パターンを提示し、「この文面で全件組み立てます。よいですか？」と**確認する**。
-  4. **明示的な承認を得てから** run_assembly を呼び、全件を組み立てる。完了後 run_id を伝える。
+■ 進め方チェック（方針・可否）— 最初に必ず通ること
+  1. get_space_data() でデータをロードし、run_python_code で対象候補の分布を把握する。
+  2. **アプローチ方法を検討する**: メール／架電／（重要顧客向けの）個別資料作成など、
+     組み合わせ得る選択肢の中から施策に合うものを考える。多くの場合メールが最有力だが、
+     決め打ちにせず「まずはメールで進める」ことを理由とともに提案する。
+  3. 選んだ方法に応じた**アプローチ可否**を run_python_code で確認する
+     （メールなら email が空/欠損の Person は到達不可）。到達可能総数と、到達不可の人数・理由を
+     run_python_code の集計結果に基づいて算出する。
+  4. 到達可能総数から**セグメント方式／個別方式**を決める（目安: 15名以下は個別方式、
+     それを超えたらセグメント方式）。
+  → 「アプローチ方法（例: メール中心）／到達可能◯名（到達不可△名: 理由）／
+     ◯方式で進めます」を一括提示し**承認を待つ**。
 
-重要: 提案や確認を飛ばして確定ツール（assign_segment / generate_patterns / run_assembly）を
-呼ばないこと。とくに run_assembly（全件確定）はユーザーの明示承認なしに実行してはならない。
-ユーザーが軌道修正（軸の変更・対象の絞り込み・文面トーンの変更など）を求めたら、該当ステップを
+■ グループ分けチェック（セグメント条件＋人数）— セグメント方式のときのみ通る
+  承認後、**define_segment と assign_segment を続けて実行**してから
+  （2ツールの間で確認を挟まない）、設計したセグメント軸・バケットと**各バケットの人数**を
+  一括提示し、「この軸・分類で進めます。修正は？」と**確認する**。
+  個別方式（15名以下目安）のときはこのステップを飛ばしてよい。セグメント化は本来、
+  対象者が多いときにカスタマイズ数と確認負荷を減らすための**例外的な手段**であり、
+  少人数なら切り分けず個々人に最適化する方が自然だと理解しておくこと。
+
+■ 文面チェック — 両方式共通の最終確認
+  - セグメント方式: 承認後に generate_patterns でバケットごとのパターンを生成する。
+    生成した本文はツールの戻り値に含まれない（件名のみが返る）。UI側が全バケット分の
+    文面をカードで自動的に一覧表示するため、チャット本文で本文を書き起こし直さないこと。
+    「◯バケット分の文面パターンを生成しました。下記でご確認ください」のように短く伝える。
+  - 個別方式: generate_individual_deliverables で対象者ごとに1通ずつフル生成する。
+    同様に本文はツールの戻り値に含まれず、UIが対象者全員分をカードで自動的に一覧表示する
+    ため、チャット本文で個々のドラフトを書き起こし直さないこと。
+    「◯名分の個別文面を生成しました。下記でご確認ください」のように短く伝える。
+  → 「この文面で確定します。よいですか？」と**確認する**。
+  **承認を得たら、追加の実行確認を挟まず**そのステップの確定処理まで完了させる:
+  - セグメント方式は run_assembly を続けて自動実行する（run_assembly 前に再度確認しない）。
+  - 個別方式は generate_individual_deliverables の生成結果をそのまま確定として扱う
+    （組み立ての実行確認は不要。generate_individual_deliverables 自体が確定処理）。
+  完了後は run_id とエクスポート導線（GET /api/marketing/runs/<run_id>/export）を伝える。
+
+output_format（"EMAIL" 既定 / "TALK_SCRIPT" / "PROPOSAL"）は、進め方チェックで決めた
+アプローチ方法に対応するものを generate_patterns / generate_individual_deliverables /
+run_assembly に一貫して渡すこと。
+
+重要: 進め方チェックでの方針確認より前に define_segment / assign_segment / generate_patterns /
+run_assembly / generate_individual_deliverables を呼ばないこと。文面チェックの承認前に
+run_assembly や generate_individual_deliverables を呼ばないこと。ユーザーが軌道修正
+（方法の変更・対象の絞り込み・軸の変更・文面トーンの変更など）を求めたら、該当ステップを
 やり直してから次へ進むこと。
 
 【ブランドの一貫性 — Static Core & Dynamic Context】
@@ -347,13 +389,16 @@ def _exec_in_sandbox(
 def make_tools(db: Any, space: SpaceContext) -> list:
     """スペース前置済み db を closure 束縛したツール群を返す。"""
 
-    def get_space_data(tool_context: ToolContext) -> str:
+    def get_space_data(tool_context: ToolContext, intent: str = "") -> str:
         """
         スペースの全データを Firestore からロードし、コード実行サンドボックスへ CSV として投入する。
         分析（run_python_code）の前に必ず1回呼ぶこと。
 
         各データセットは "{name}.csv"（persons.csv 等）としてサンドボックスの作業ディレクトリに置かれ、
         以降の run_python_code から pd.read_csv("persons.csv") で読める（ファイルはセッション内で持続）。
+
+        Args:
+            intent: マーケターに表示する一文（日本語・平易）。例:「データを読み込んでいます」
 
         Returns:
             { loaded, files, counts, schema }
@@ -414,7 +459,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             ensure_ascii=False,
         )
 
-    def run_python_code(code: str, tool_context: ToolContext) -> str:
+    def run_python_code(code: str, tool_context: ToolContext, intent: str = "") -> str:
         """
         Python コードをコード実行サンドボックスで実行し、標準出力を返す。データ分析はこのツールで行う。
 
@@ -425,6 +470,8 @@ def make_tools(db: Any, space: SpaceContext) -> list:
 
         Args:
             code: 実行する Python コード。
+            intent: マーケターに表示する一文（日本語・平易）。このコードで何を調べる/計算するかを
+                    毎回具体的に書くこと。例:「参加者を業種別に集計しています」
 
         Returns:
             { stdout, stderr } の JSON 文字列。
@@ -448,7 +495,9 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             )
         return json.dumps({"stdout": stdout, "stderr": stderr}, ensure_ascii=False)
 
-    def find_relevant_for_person(person_id: str, target: str = "contents", top_k: int = 5) -> str:
+    def find_relevant_for_person(
+        person_id: str, target: str = "contents", top_k: int = 5, intent: str = ""
+    ) -> str:
         """
         指定 Person の appeal_vector に意味的に近い候補を上位 top_k 返す（コサイン類似度・決定論）。
 
@@ -460,6 +509,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             person_id: 対象 Person の ID
             target: "contents" | "products" | "events" のいずれか（既定 contents）
             top_k: 返す件数（既定 5）
+            intent: マーケターに表示する一文（日本語・平易）。例:「関連するコンテンツを検索しています」
 
         Returns:
             { person_id, target, results: [{id, name, appeal_summary, score}] } の JSON 文字列
@@ -504,11 +554,12 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             ensure_ascii=False,
         )
 
-    def save_report(event_id: str, report_type: str, content: str) -> str:
+    def save_report(event_id: str, report_type: str, content: str, intent: str = "") -> str:
         """
         分析レポートや戦略提案を Firestore に保存する。
         report_type: "retrospective" / "strategy" / その他の自由な文字列
         content: JSON 文字列または自由テキスト
+        intent: マーケターに表示する一文（日本語・平易）。例:「レポートを保存しています」
         """
         report_id = f"report_{uuid.uuid4().hex[:12]}"
         db.collection(f"events/{event_id}/reports").document(report_id).set(
@@ -530,6 +581,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         axes_json: str,
         buckets: list[str],
         criteria: str,
+        intent: str = "",
     ) -> str:
         """
         施策向けのセグメント軸を設計し、オントロジーに登録する（HILゲート①の承認後に呼ぶ）。
@@ -542,6 +594,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             buckets: 運用単位のセグメント値（直積セル等）の **配列**。例 ["高課題×高意欲","高課題×低意欲"]。
                      JSON配列文字列（例 '["高課題×高意欲","高課題×低意欲"]'）で渡しても受理する。
             criteria: 各バケットへの割り当て基準（自然言語）
+            intent: マーケターに表示する一文（日本語・平易）。例:「セグメント案を設計しています」
 
         Returns:
             { segment_id, name, buckets }
@@ -572,13 +625,16 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             ensure_ascii=False,
         )
 
-    def assign_segment(segment_id: str, event_id: str = "") -> str:
+    def assign_segment(segment_id: str, event_id: str = "", intent: str = "") -> str:
         """
         登録済みセグメントに従って対象 Person を各バケットへ分類する（HILゲート①承認後）。
         event_id を指定するとそのイベントの参加者のみ、未指定なら全 Person が対象。
 
         構造化フィールドで自明な分は決定論、意味判断が要る分のみ軽量モデルで判別する。
         各割り当てには根拠（reason）が残る。
+
+        Args:
+            intent: マーケターに表示する一文（日本語・平易）。例:「対象者をバケットに分類しています」
 
         Returns:
             { snapshot_id, total, by_bucket, llm_persons }（人数分布と分類根拠の概況）
@@ -597,6 +653,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         context: str = "",
         content_ids: list[str] = [],  # noqa: B006 — ADKツールスキーマ維持のため（読み取り専用）
         output_format: str = "EMAIL",
+        intent: str = "",
     ) -> str:
         """
         バケットごとに1つずつコンテンツパターン（件名＋本文ブロック）を生成する（HILゲート②承認後）。
@@ -608,6 +665,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             output_format: 成果物の形式。"EMAIL"（既定）/ "TALK_SCRIPT" / "PROPOSAL"。
                            パターンは "{bucket}__{output_format}" をキーに保存し、同じ format を
                            指定した run_assembly が参照する。
+            intent: マーケターに表示する一文（日本語・平易）。例:「文面パターンを生成しています」
 
         Returns:
             { segment_id, format, patterns: [{bucket, pattern_id, subject}], count }
@@ -650,7 +708,9 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             ensure_ascii=False,
         )
 
-    def run_assembly(segment_id: str, snapshot_id: str = "", output_format: str = "EMAIL") -> str:
+    def run_assembly(
+        segment_id: str, snapshot_id: str = "", output_format: str = "EMAIL", intent: str = ""
+    ) -> str:
         """
         セグメントの分類とパターンから、各 Person の成果物を決定論的に組み立てる（HILゲート③の
         明示承認後にのみ呼ぶ）。LLMは使わずプレースホルダ置換で組み立てるため高速。
@@ -661,6 +721,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             snapshot_id: 使用するスナップショット（省略時は最新）
             output_format: 組み立てる形式。generate_patterns で生成した format と一致させること
                            （既定 "EMAIL"）。パターンは "{bucket}__{output_format}" で引く。
+            intent: マーケターに表示する一文（日本語・平易）。例:「成果物を組み立てています」
 
         Returns:
             { run_id, count, snapshot_id, format }
@@ -698,6 +759,48 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             ensure_ascii=False,
         )
 
+    def generate_individual_deliverables(
+        person_ids: list[str],
+        purpose: str,
+        context: str = "",
+        output_format: str = "EMAIL",
+        intent: str = "",
+    ) -> str:
+        """
+        少人数（目安15名以下、上限30名）向けに、セグメント化せず対象者ごとに1通ずつ
+        個別最適化した成果物をフル生成する（個別方式）。1人1回のLLM呼び出し。
+        define_segment/assign_segment/generate_patterns/run_assembly は不要で、これ単体で完結する。
+
+        対象が多い（目安15名超）場合はコストと確認負荷の観点でセグメント方式を使うこと。
+
+        Args:
+            person_ids: 対象 Person の ID 一覧
+            purpose: 施策の目的
+            context: 追加の背景・指示（相手の状況など）
+            output_format: 成果物の形式。"EMAIL"（既定）/ "TALK_SCRIPT" / "PROPOSAL"
+            intent: マーケターに表示する一文（日本語・平易）。例:「個別の文面を生成しています」
+
+        Returns:
+            { run_id, count, format }
+        """
+        if not person_ids:
+            return json.dumps({"error": "person_ids が空です"}, ensure_ascii=False)
+        if len(person_ids) > 30:
+            return json.dumps(
+                {
+                    "error": f"対象{len(person_ids)}名は個別方式には多すぎます（目安30名以下）。"
+                    "define_segment 等のセグメント方式を使ってください。"
+                },
+                ensure_ascii=False,
+            )
+
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        with metered(space):
+            count = _individual_run(db, space, person_ids, purpose, context, output_format, run_id)
+        return json.dumps(
+            {"run_id": run_id, "count": count, "format": output_format}, ensure_ascii=False
+        )
+
     return [
         get_space_data,
         run_python_code,
@@ -707,6 +810,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         assign_segment,
         generate_patterns,
         run_assembly,
+        generate_individual_deliverables,
     ]
 
 
@@ -738,6 +842,22 @@ _session_service = VertexAiSessionService(
     agent_engine_id=_settings.agent_engine_id,
 )
 _APP_NAME = _settings.agent_engine_id
+
+
+# ツールが intent を埋め忘れた場合のフォールバック表示ラベル（ツール名ベース・決定論）。
+# intent 自体はモデルが呼び出しごとに生成する一文（AI/Python 責務境界: 文言生成はAI、
+# フォールバックの配線は決定論Python）。
+_TOOL_INTENT_FALLBACK: dict[str, str] = {
+    "get_space_data": "データを読み込んでいます",
+    "run_python_code": "データを分析しています",
+    "find_relevant_for_person": "関連情報を検索しています",
+    "save_report": "レポートを保存しています",
+    "define_segment": "セグメントを設計しています",
+    "assign_segment": "対象者を分類しています",
+    "generate_patterns": "文面パターンを生成しています",
+    "run_assembly": "成果物を組み立てています",
+    "generate_individual_deliverables": "個別の文面を生成しています",
+}
 
 
 def _accumulate_usage(event: Any, totals: dict[str, int]) -> None:
@@ -800,6 +920,8 @@ async def chat_stream(
 
     Yields:
         { type: "tool_call" | "tool_result" | "code" | "code_result" | "text" | "done" | "error", ... }
+        - tool_call / code: 実行中ステータス表示用の intent（一文・日本語）を含む。
+                            モデル未設定時は _TOOL_INTENT_FALLBACK で補完する。
         - code:        AIが生成して実行した Python コード（{code}）
         - code_result: その実行結果（{outcome, output}）
     """
@@ -855,13 +977,18 @@ async def chat_stream(
             # ToolCall イベント。run_python_code は「AIが実行したコード」として可視化する。
             if event.get_function_calls():
                 for fc in event.get_function_calls():
+                    args = dict(fc.args) if fc.args else {}
+                    intent = args.pop("intent", "") or _TOOL_INTENT_FALLBACK.get(
+                        fc.name, "処理しています"
+                    )
                     if fc.name == "run_python_code":
-                        yield {"type": "code", "code": (fc.args or {}).get("code", "")}
+                        yield {"type": "code", "code": args.get("code", ""), "intent": intent}
                     else:
                         yield {
                             "type": "tool_call",
                             "tool_name": fc.name,
-                            "args": dict(fc.args) if fc.args else {},
+                            "args": args,
+                            "intent": intent,
                         }
             # ToolResponse イベント。run_python_code の結果はコード実行結果として可視化する。
             elif event.get_function_responses():
@@ -911,6 +1038,12 @@ async def chat_stream(
 # プレースホルダとして使える Person フィールド（account_name は fill 時に company_name として提供）
 _PLACEHOLDER_FIELDS = ("name", "company_name", "department", "job_title")
 
+_FORMAT_LABELS = {
+    "EMAIL": "メール",
+    "TALK_SCRIPT": "電話・商談トークスクリプト",
+    "PROPOSAL": "提案書",
+}
+
 
 class _PatternBlock(BaseModel):
     block_type: str
@@ -924,6 +1057,16 @@ class _PatternSchema(BaseModel):
     blocks: list[_PatternBlock]
 
 
+def _pattern_doc_id(bucket: str, output_format: str) -> str:
+    """Firestore ドキュメントIDとして安全な pattern_id を組み立てる。
+
+    bucket は自由記述のため '/' を含み得るが、Firestore はパス中の '/' を区切り文字として
+    再解釈しドキュメントパスの偶奇チェックを壊すため、パス区切りと衝突しない全角スラッシュに
+    置換する（bucket 表示名自体はこの関数の外では無加工のまま扱う）。
+    """
+    return f"{bucket.replace('/', '／')}__{output_format}"
+
+
 def _generate_one_pattern(
     space: SpaceContext,
     segment: Segment,
@@ -935,11 +1078,7 @@ def _generate_one_pattern(
 ) -> DeliverablePattern:
     """1バケットぶんのコンテンツパターンを生成して DeliverablePattern で返す。"""
     assets_text = json.dumps(assets, ensure_ascii=False, indent=2) if assets else "（なし）"
-    format_label = {
-        "EMAIL": "メール",
-        "TALK_SCRIPT": "電話・商談トークスクリプト",
-        "PROPOSAL": "提案書",
-    }.get(output_format, "メール")
+    format_label = _FORMAT_LABELS.get(output_format, "メール")
     system_prompt = f"""\
 あなたはプロのマーケターです。施策「{segment.name}」のために、あるセグメントへ届ける
 {format_label}の**ひな型（パターン）**を1つ作成してください。個々人に1通ずつではなく、この
@@ -976,7 +1115,7 @@ def _generate_one_pattern(
     client = new_client()
     response = client.models.generate_content(
         model=_model,
-        contents=f"セグメント「{bucket}」向けのメールパターンを作成してください。",
+        contents=f"セグメント「{bucket}」向けの{format_label}パターンを作成してください。",
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
             response_mime_type="application/json",
@@ -986,7 +1125,7 @@ def _generate_one_pattern(
     record_llm_response(space, _model, response)
     pattern = _PatternSchema.model_validate_json(response.text)
     return DeliverablePattern(
-        pattern_id=f"{bucket}__{output_format}",
+        pattern_id=_pattern_doc_id(bucket, output_format),
         segment_id=segment.segment_id,
         bucket=bucket,
         format=output_format,
@@ -1037,8 +1176,8 @@ def _assemble_run(
     for asn in assignments:
         person_id = asn.get("person_id", "")
         bucket = asn.get("bucket", "")
-        # パターンキーは "{bucket}__{format}" 規約（generate_patterns と一致）
-        pattern_key = f"{bucket}__{output_format}"
+        # パターンキーは "{bucket}__{format}" 規約（generate_patterns と一致、_pattern_doc_id 参照）
+        pattern_key = _pattern_doc_id(bucket, output_format)
         pattern = patterns.get(pattern_key)
         if not pattern:
             logger.warning("no pattern for key '%s' (person %s)", pattern_key, person_id)
@@ -1090,4 +1229,153 @@ def _assemble_run(
     logger.info(
         "assembly completed: run_id=%s segment=%s done=%d", run_id, segment.segment_id, done
     )
+    return done
+
+
+# ── Stage 個別方式: 少人数向けフル生成（セグメント化しない）─────────────────────
+#
+# 対象が少数（目安15名以下）のときは、セグメント設計・分類のコストが対象人数に見合わない。
+# この場合はセグメント化を経由せず、対象者ごとに1回ずつフル生成する（1人1LLM呼び出し）。
+# 出力は run_assembly と同じ Deliverable/MarketingRun 形状で保存し、既存の
+# GET /runs/{run_id}/export をそのまま流用する。
+
+
+def _generate_one_individual(
+    space: SpaceContext,
+    person: dict,
+    account_name: str,
+    relevant_contents: list[dict],
+    purpose: str,
+    context: str,
+    output_format: str = "EMAIL",
+) -> _PatternSchema:
+    """1人ぶんの成果物（件名＋本文ブロック）を実名で生成する（プレースホルダは使わない）。"""
+    contents_text = (
+        json.dumps(relevant_contents, ensure_ascii=False, indent=2)
+        if relevant_contents
+        else "（なし）"
+    )
+    format_label = _FORMAT_LABELS.get(output_format, "メール")
+    system_prompt = f"""\
+あなたはプロのマーケターです。以下の1名に向けた、個別最適化された{format_label}を作成してください。
+セグメント共通のひな型ではなく、この人物専用の内容にします。
+
+【施策の目的】
+{purpose}
+
+【対象人物】
+氏名: {person.get("name", "")}
+会社名: {account_name or "（不明）"}
+部署: {person.get("department", "") or "（不明）"}
+役職: {person.get("job_title", "") or "（不明）"}
+関心・状況の要約: {person.get("appeal_summary", "") or "（情報なし）"}
+
+【追加の背景・指示】
+{context if context else "（なし）"}
+
+【この人物に意味的に近いコンテンツ資産（近接候補）】
+{contents_text}
+
+【必須ルール】
+- 宛名・会社名など個人差分は実名でそのまま書く（プレースホルダは使わない）。
+- 各ブロックに reason_for_inclusion（そのブロックをこの人に含めた理由）を必ず記述する。
+- 件名は20〜40文字程度、具体的で開封したくなるもの。
+- 本文はビジネス敬語（〜です・ます調）。1ブロック100〜200文字程度。
+- associated_asset_ids: 参照したコンテンツ資産の content_id を設定する。
+
+【ブランドの一貫性（必ず守る）】
+- 1機能フォーカス: この{format_label}では相手の課題に直結する「1つの機能（解決策）」のみを提示し、
+  複数機能やプラットフォーム全体像を詰め込まない。
+- 捏造禁止: 提示する機能・効果は上記【この人物に意味的に近いコンテンツ資産】に実在するものに
+  限定する。資産に無い機能・誇張・本来と異なる用途を創作しない（解決策はマスターに帰結させる）。
+- ブランド資産の維持: トーン＆マナー・用語・言い回しは他の対象者と一貫させる。
+"""
+    _model = get_settings().model_content
+    client = new_client()
+    response = client.models.generate_content(
+        model=_model,
+        contents=f"{person.get('name', '')}様向けの{format_label}を作成してください。",
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            response_mime_type="application/json",
+            response_schema=_PatternSchema,
+        ),
+    )
+    record_llm_response(space, _model, response)
+    return _PatternSchema.model_validate_json(response.text)
+
+
+def _individual_run(
+    db: Any,
+    space: SpaceContext,
+    person_ids: list[str],
+    purpose: str,
+    context: str,
+    output_format: str,
+    run_id: str,
+) -> int:
+    """対象者ごとに1通ずつ生成し、Deliverable として保存する（個別方式・セグメント化なし）。"""
+    run = MarketingRun(
+        run_id=run_id,
+        status="running",
+        segment_id="",
+        snapshot_id="",
+        purpose=purpose,
+        total=len(person_ids),
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    db.collection("marketing_runs").document(run_id).set(run.model_dump())
+
+    done = 0
+    for person_id in person_ids:
+        person_doc = db.collection("persons").document(person_id).get()
+        if not person_doc.exists:
+            logger.warning("individual run: person not found: %s", person_id)
+            continue
+        person = person_doc.to_dict() or {}
+
+        account_name = ""
+        account_id = person.get("account_id")
+        if account_id:
+            acc_doc = db.collection("accounts").document(account_id).get()
+            if acc_doc.exists:
+                account_name = (acc_doc.to_dict() or {}).get("account_name", "")
+
+        relevant_contents: list[dict] = []
+        pvec = person.get("appeal_vector") or []
+        if pvec:
+            candidates = [
+                (d.to_dict(), (d.to_dict() or {}).get("appeal_vector") or [])
+                for d in db.collection("contents").get()
+            ]
+            ranked = find_similar(pvec, candidates, top_k=3)
+            relevant_contents = [item for item, _score in ranked]
+
+        pattern = _generate_one_individual(
+            space, person, account_name, relevant_contents, purpose, context, output_format
+        )
+
+        deliverable_id = f"dlv_{uuid.uuid4().hex[:12]}"
+        deliverable = Deliverable(
+            deliverable_id=deliverable_id,
+            space_id=person.get("space_id", ""),
+            run_id=run_id,
+            person_id=person_id,
+            snapshot_id=None,
+            pattern_id=None,
+            format=output_format,
+            bucket="個別",
+            subject=pattern.subject,
+            blocks=[DeliverableBlock(**b.model_dump()) for b in pattern.blocks],
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        db.collection(f"marketing_runs/{run_id}/deliverables").document(deliverable_id).set(
+            deliverable.model_dump()
+        )
+        done += 1
+
+    db.collection("marketing_runs").document(run_id).update(
+        {"status": "done", "done": done, "deliverable_count": done}
+    )
+    logger.info("individual run completed: run_id=%s done=%d", run_id, done)
     return done

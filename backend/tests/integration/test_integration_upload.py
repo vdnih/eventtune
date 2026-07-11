@@ -113,6 +113,8 @@ def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, f
     assert thread.exists
     thread_data = thread.to_dict()
     assert thread_data["uid"] == "uid_member"
+    # タイトルはファイル名でなく、承認済みプランの既定イベント名になる
+    assert thread_data["title"] == "展示会X"
     messages = {
         m.to_dict().get("content_type"): m.to_dict()
         for m in db.collection(f"spaces/{seeded_space}/threads/thread_1/messages").stream()
@@ -122,6 +124,42 @@ def test_upload_executes_approved_plan_verbatim(make_client, seeded_space, db, f
     assert messages["ingestion_plan"]["plan"]["default_event"]["name"] == "展示会X"
     assert messages["ingestion_result"]["batch_id"] == batch_id
     assert messages["ingestion_result"]["created_entities"] == {"persons": 2, "events": 1}
+
+
+def test_thread_title_uses_dataset_kind_when_no_default_event(
+    make_client, seeded_space, db, fake_process_batch
+):
+    """イベントに紐づかない取り込み（コンテンツリスト等）はスレッドタイトルが種別名になる。"""
+    plan = {
+        "default_event": None,
+        "files": [
+            {
+                "filename": "contents.csv",
+                "business_context": "配布資料一覧",
+                "targets": [
+                    {
+                        "entity_type": "contents",
+                        "column_map": {"content_name": "content_name"},
+                        "column_modes": {},
+                        "link_columns": {},
+                    }
+                ],
+                "unmapped_notes": "",
+            }
+        ],
+    }
+    client = make_client(uid="uid_member")
+    res = client.post(
+        "/api/integration/batches",
+        headers={"X-Space-Id": seeded_space},
+        files=[("files", ("contents.csv", b"content_name\nContentA\n", "text/csv"))],
+        data={"plan": json.dumps(plan), "thread_id": "thread_contents"},
+    )
+    assert res.status_code == 202
+
+    thread = db.document(f"spaces/{seeded_space}/threads/thread_contents").get()
+    assert thread.exists
+    assert thread.to_dict()["title"] == "コンテンツリストの取り込み"
 
 
 def test_plan_omitted_runs_understand_once(make_client, seeded_space, monkeypatch):

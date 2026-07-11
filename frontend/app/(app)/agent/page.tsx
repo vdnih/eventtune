@@ -17,6 +17,7 @@ import { Check, FileText, Loader2, Send, Upload, Wrench, X } from "lucide-react"
 interface ToolCallEvent {
   tool_name: string;
   args: Record<string, unknown>;
+  intent?: string;
 }
 
 interface DeliverableData {
@@ -44,6 +45,7 @@ interface CodeBlock {
   code: string;
   output?: string;
   outcome?: string;
+  intent?: string;
 }
 
 // チャット timeline のメッセージ型
@@ -61,8 +63,16 @@ type ChatMessage =
       toolCalls?: ToolCallEvent[];
       codeBlocks?: CodeBlock[];
       deliverables?: DeliverableData[];
+      // run_assembly（セグメント方式の最終組み立て）由来なら true。個別方式
+      // （generate_individual_deliverables）はそれ自体が確認対象のため常に全件表示する。
+      deliverablesFull?: boolean;
       runId?: string;
+      // セグメント方式ゲートCの文面チェック用パターン一覧（generate_patterns が生成済みの
+      // バケット別パターンを別途フェッチしたもの。ツールの戻り値には本文が含まれないため）。
+      patternPreview?: DeliverableData[];
       loading?: boolean;
+      // ツール/コード実行中の「今何をしているか」一言（直近の intent）。次のツール呼び出しまで保持する。
+      currentStatus?: string;
       pendingConfirm?: {
         files: File[];
         hint: string;
@@ -92,6 +102,10 @@ const INITIAL_MESSAGE: ChatMessage = {
   content:
     "こんにちは。AIエージェントです。\n\nファイルを添付してデータを取り込むか、チャットで指示をお送りください。\n\n例: 「2025秋の展示会の振り返りをして」「顧客ごとのフォローアップ案を作って」「プロダクトAへの関心が高いリストを分析して」",
 };
+
+// run_assembly（セグメント方式の最終組み立て）後の成果物一覧をチャット内にカードで表示する
+// 件数。生成後は基本的にCSVで確認するため代表数件のみに留め、残りはCSVダウンロード導線に誘導する。
+const DELIVERABLES_PREVIEW_COUNT = 3;
 
 function extractRunId(text: string): string | null {
   const m = text.match(/run_[a-f0-9]{12}/);
@@ -426,6 +440,9 @@ export default function DashboardPage() {
       let toolCalls: ToolCallEvent[] = [];
       let codeBlocks: CodeBlock[] = [];
       let toolRunId: string | null = null;
+      let toolRunSource: string | null = null;
+      let toolPatternSegmentId: string | null = null;
+      let toolPatternFormat: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -448,12 +465,21 @@ export default function DashboardPage() {
           }
 
           if (event.type === "tool_call") {
+            const intent = event.intent as string | undefined;
             toolCalls = [
               ...toolCalls,
-              { tool_name: event.tool_name as string, args: (event.args ?? {}) as Record<string, unknown> },
+              {
+                tool_name: event.tool_name as string,
+                args: (event.args ?? {}) as Record<string, unknown>,
+                intent,
+              },
             ];
             setMessages((prev) =>
-              prev.map((m) => (m.id === asstMsgId ? { ...m, toolCalls, loading: true } : m))
+              prev.map((m) =>
+                m.id === asstMsgId && m.role === "assistant"
+                  ? { ...m, toolCalls, loading: true, currentStatus: intent || m.currentStatus }
+                  : m
+              )
             );
           } else if (event.type === "tool_result") {
             const result = (event.result ?? {}) as Record<string, unknown>;
@@ -466,13 +492,26 @@ export default function DashboardPage() {
                 parsed = {};
               }
             }
-            if (event.tool_name === "run_assembly" && typeof parsed.run_id === "string") {
+            if (
+              (event.tool_name === "run_assembly" || event.tool_name === "generate_individual_deliverables") &&
+              typeof parsed.run_id === "string"
+            ) {
               toolRunId = parsed.run_id as string;
+              toolRunSource = event.tool_name as string;
+            }
+            if (event.tool_name === "generate_patterns" && typeof parsed.segment_id === "string") {
+              toolPatternSegmentId = parsed.segment_id as string;
+              toolPatternFormat = typeof parsed.format === "string" ? (parsed.format as string) : "EMAIL";
             }
           } else if (event.type === "code") {
-            codeBlocks = [...codeBlocks, { code: event.code as string }];
+            const intent = event.intent as string | undefined;
+            codeBlocks = [...codeBlocks, { code: event.code as string, intent }];
             setMessages((prev) =>
-              prev.map((m) => (m.id === asstMsgId ? { ...m, codeBlocks, toolCalls, loading: true } : m))
+              prev.map((m) =>
+                m.id === asstMsgId && m.role === "assistant"
+                  ? { ...m, codeBlocks, toolCalls, loading: true, currentStatus: intent || m.currentStatus }
+                  : m
+              )
             );
           } else if (event.type === "code_result") {
             const lastIdx = codeBlocks.map((b) => b.output === undefined).lastIndexOf(true);
@@ -495,14 +534,25 @@ export default function DashboardPage() {
             );
           } else if (event.type === "done") {
             const detectedRunId = toolRunId ?? extractRunId(accText);
+            const deliverablesFull = toolRunSource === "generate_individual_deliverables";
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === asstMsgId
-                  ? { ...m, content: accText, toolCalls, loading: false, runId: detectedRunId ?? undefined }
+                  ? {
+                      ...m,
+                      content: accText,
+                      toolCalls,
+                      loading: false,
+                      runId: detectedRunId ?? undefined,
+                      deliverablesFull,
+                    }
                   : m
               )
             );
             if (detectedRunId) startRunPolling(asstMsgId, detectedRunId);
+            if (toolPatternSegmentId) {
+              loadSegmentPatterns(asstMsgId, toolPatternSegmentId, toolPatternFormat ?? "EMAIL");
+            }
           } else if (event.type === "error") {
             setMessages((prev) =>
               prev.map((m) =>
@@ -569,6 +619,7 @@ export default function DashboardPage() {
     // batch_id フィールドを持たないため thread_id にフォールバックする）。
     const restored: ChatMessage[] = [];
     const batchBubbles = new Map<string, AssistantChatMessage>();
+    const patternLoads: { id: string; segmentId: string; format: string }[] = [];
 
     for (const m of stored) {
       if (m.content_type === "ingestion_plan") {
@@ -608,15 +659,20 @@ export default function DashboardPage() {
           files: m.files?.map((name) => ({ name })),
         });
       } else {
+        const id = crypto.randomUUID();
         restored.push({
-          id: crypto.randomUUID(),
+          id,
           role: "assistant",
           content: m.content,
           toolCalls: m.tool_calls,
           codeBlocks: m.code_blocks,
           runId: m.run_id ?? undefined,
+          deliverablesFull: m.run_source === "generate_individual_deliverables",
           loading: false,
         });
+        if (m.pattern_segment_id) {
+          patternLoads.push({ id, segmentId: m.pattern_segment_id, format: m.pattern_format ?? "EMAIL" });
+        }
       }
     }
 
@@ -630,6 +686,7 @@ export default function DashboardPage() {
         pollBatch(m.batchId, m.id);
       }
     });
+    patternLoads.forEach(({ id, segmentId, format }) => loadSegmentPatterns(id, segmentId, format));
   }
 
   // ── 成果物ポーリング ─────────────────────────────────────────────────────
@@ -663,6 +720,20 @@ export default function DashboardPage() {
       const data = await res.json();
       const deliverables: DeliverableData[] = data.emails ?? data.deliverables ?? [];
       setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, deliverables } : m)));
+    } catch {
+      // ignore
+    }
+  }
+
+  async function loadSegmentPatterns(msgId: string, segmentId: string, format: string) {
+    try {
+      const res = await authFetch(
+        `/api/marketing/segments/${segmentId}/patterns?output_format=${encodeURIComponent(format)}`
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      const patternPreview: DeliverableData[] = data.patterns ?? [];
+      setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, patternPreview } : m)));
     } catch {
       // ignore
     }
@@ -750,7 +821,10 @@ export default function DashboardPage() {
                     <CodeExecutionPanel blocks={msg.codeBlocks} />
                   )}
                   {msg.loading && !msg.content && !msg.ingestionProgress && (
-                    <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <Loader2 className="w-4 h-4 animate-spin text-gray-400 shrink-0" />
+                      {msg.currentStatus && <span className="text-xs">{msg.currentStatus}</span>}
+                    </div>
                   )}
                   {msg.ingestionPlan && (
                     <div className="mt-1">
@@ -855,6 +929,16 @@ export default function DashboardPage() {
                       <p className="text-[11px] text-gray-400">データの確認は「データ」タブから行えます。</p>
                     </div>
                   )}
+                  {msg.patternPreview && msg.patternPreview.length > 0 && (
+                    <div className="mt-4 space-y-3">
+                      <span className="text-xs font-semibold text-gray-500">
+                        送信文面パターン（全{msg.patternPreview.length}種）
+                      </span>
+                      {msg.patternPreview.map((d, j) => (
+                        <DeliverableCard key={j} deliverable={d} index={j} />
+                      ))}
+                    </div>
+                  )}
                   {msg.deliverables && msg.deliverables.length > 0 && (
                     <div className="mt-4 space-y-3">
                       <div className="flex items-center justify-between">
@@ -870,9 +954,17 @@ export default function DashboardPage() {
                           </button>
                         )}
                       </div>
-                      {msg.deliverables.map((d, j) => (
+                      {(msg.deliverablesFull
+                        ? msg.deliverables
+                        : msg.deliverables.slice(0, DELIVERABLES_PREVIEW_COUNT)
+                      ).map((d, j) => (
                         <DeliverableCard key={j} deliverable={d} index={j} />
                       ))}
+                      {!msg.deliverablesFull && msg.deliverables.length > DELIVERABLES_PREVIEW_COUNT && (
+                        <p className="text-xs text-gray-400">
+                          他{msg.deliverables.length - DELIVERABLES_PREVIEW_COUNT}件はCSVでご確認いただけます。
+                        </p>
+                      )}
                     </div>
                   )}
                   {msg.runId && !msg.deliverables && !msg.loading && (

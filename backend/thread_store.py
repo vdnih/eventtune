@@ -163,13 +163,14 @@ def pop_unconsumed_ingestion_context(space: SpaceContext, thread_id: str) -> str
     return "\n".join(lines)
 
 
-# ── run_id 抽出（assistant メッセージのスナップショット用）─────────────────────
+# ── run_id / パターン抽出（assistant メッセージのスナップショット用）───────────
+
+# run_id を発行するツール。個別方式（generate_individual_deliverables）はそれ自体が確定処理
+# なので run_assembly と同様に run_id を持つ（両方式とも成果物は marketing_runs/{run_id} 配下）。
+_RUN_ID_TOOL_NAMES = ("run_assembly", "generate_individual_deliverables")
 
 
-def extract_run_id_from_result(event: dict[str, Any]) -> str | None:
-    """run_assembly ツールの tool_result から run_id を取り出す（フロントの解釈に合わせる）。"""
-    if event.get("tool_name") != "run_assembly":
-        return None
+def _parse_tool_result(event: dict[str, Any]) -> dict[str, Any] | None:
     result = event.get("result") or {}
     inner = result.get("result", result) if isinstance(result, dict) else result
     if isinstance(inner, str):
@@ -177,16 +178,50 @@ def extract_run_id_from_result(event: dict[str, Any]) -> str | None:
             inner = json.loads(inner)
         except json.JSONDecodeError:
             return None
-    if isinstance(inner, dict):
-        rid = inner.get("run_id")
-        return rid if isinstance(rid, str) else None
-    return None
+    return inner if isinstance(inner, dict) else None
+
+
+def extract_run_id_from_result(event: dict[str, Any]) -> tuple[str, str] | None:
+    """run_assembly / generate_individual_deliverables の tool_result から
+    (run_id, tool_name) を取り出す（フロントの解釈に合わせる）。
+
+    tool_name をあわせて返すのは、フロント側でセグメント方式（run_assembly、成果物は
+    代表数件+CSV誘導に簡略表示）と個別方式（generate_individual_deliverables、成果物は
+    元々少人数なので全件表示）を出し分けるため。
+    """
+    tool_name = event.get("tool_name")
+    if tool_name not in _RUN_ID_TOOL_NAMES:
+        return None
+    inner = _parse_tool_result(event)
+    if inner is None:
+        return None
+    rid = inner.get("run_id")
+    return (rid, tool_name) if isinstance(rid, str) else None
 
 
 def extract_run_id_from_text(text: str) -> str | None:
     """応答テキストから run_id を拾う（tool_result で取れなかった場合のフォールバック）。"""
     m = _RUN_ID_RE.search(text or "")
     return m.group(0) if m else None
+
+
+def extract_pattern_segment_from_result(event: dict[str, Any]) -> tuple[str, str] | None:
+    """generate_patterns の tool_result から (segment_id, format) を取り出す。
+
+    generate_patterns は本文（blocks）を返さず件名のみを返すため、フロントは segment_id/format
+    をもとに GET /api/marketing/segments/{segment_id}/patterns で生成済みパターン本文を
+    別途取得してカード表示する。
+    """
+    if event.get("tool_name") != "generate_patterns":
+        return None
+    inner = _parse_tool_result(event)
+    if inner is None:
+        return None
+    segment_id = inner.get("segment_id")
+    fmt = inner.get("format")
+    if isinstance(segment_id, str) and isinstance(fmt, str):
+        return (segment_id, fmt)
+    return None
 
 
 # ── 一覧・取得・リネーム・削除（threads ルーターから呼ばれる）──────────────────

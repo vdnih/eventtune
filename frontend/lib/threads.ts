@@ -20,9 +20,12 @@ export interface StoredMessage {
   seq: number;
   role: "user" | "assistant";
   content: string;
-  tool_calls?: { tool_name: string; args: Record<string, unknown> }[];
-  code_blocks?: { code: string; output?: string; outcome?: string }[];
+  tool_calls?: { tool_name: string; args: Record<string, unknown>; intent?: string }[];
+  code_blocks?: { code: string; output?: string; outcome?: string; intent?: string }[];
   run_id?: string | null;
+  run_source?: string | null; // run_id を発行したツール名（"run_assembly" | "generate_individual_deliverables"）
+  pattern_segment_id?: string | null;
+  pattern_format?: string | null;
   files?: string[]; // ingestion のユーザー添付メッセージのみで使う
   // ingestion 関連メッセージのみで使うフィールド
   content_type?: "ingestion_plan" | "ingestion_result" | "ingestion_error";
