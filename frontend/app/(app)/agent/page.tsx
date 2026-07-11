@@ -191,11 +191,33 @@ function stageLabel(stage: string): string {
   return STAGE_LABEL[stage] ?? "取り込みを準備中";
 }
 
+// ── 取り込み対応ファイル形式 ────────────────────────────────────────────────────
+// ファイル入力の accept 属性と、ドラッグ&ドロップ時の自前判定の両方から参照する
+// （D&D では accept 属性が効かないため、拡張子判定を一元化して二重管理を避ける）。
+
+const ACCEPTED_EXTENSIONS = [".csv", ".xlsx", ".xls", ".txt", ".docx", ".pdf", ".pptx"];
+const ACCEPT_ATTR = ACCEPTED_EXTENSIONS.join(",");
+
+function isAcceptedFile(f: File): boolean {
+  return ACCEPTED_EXTENSIONS.some((ext) => f.name.toLowerCase().endsWith(ext));
+}
+
+/** ドラッグ中のペイロードにファイルが含まれるか（テキスト選択等のドラッグを無視するため）。 */
+function dragHasFiles(dt: DataTransfer): boolean {
+  return Array.from(dt.types).includes("Files");
+}
+
 // ── メインコンポーネント ──────────────────────────────────────────────────────
 
 export default function DashboardPage() {
   const { activeSpace } = useSpace();
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  // ドラッグ&ドロップ表示状態。dragDepth は子要素をまたぐたびに発火する
+  // dragenter/dragleave でオーバーレイがチラつくのを防ぐカウンタ。
+  const [isDragging, setIsDragging] = useState(false);
+  const dragDepth = useRef(0);
+  // 未対応形式で弾いたファイルの通知（トースト基盤が無いためインラインで代替）。
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   // 表示スレッドID。Agent Engine のセッションIDとは別物で、会話開始時にフロントが採番する
@@ -220,6 +242,29 @@ export default function DashboardPage() {
       Object.values(pollingRefs.current).forEach(clearInterval);
     };
   }, []);
+
+  // 未対応ファイルの通知は数秒で自動的に消す。
+  useEffect(() => {
+    if (!attachNotice) return;
+    const t = setTimeout(() => setAttachNotice(null), 6000);
+    return () => clearTimeout(t);
+  }, [attachNotice]);
+
+  // ── ファイル添付（ファイル入力・ドラッグ&ドロップ共通）─────────────────────
+  // 対応拡張子だけ pendingFiles に積み、未対応分は通知する。ファイル入力の
+  // onChange とドロップハンドラの両方から呼ぶ。
+  function addFiles(incoming: File[]) {
+    const accepted = incoming.filter(isAcceptedFile);
+    const rejected = incoming.filter((f) => !isAcceptedFile(f));
+    if (accepted.length) setPendingFiles((prev) => [...prev, ...accepted]);
+    if (rejected.length) {
+      setAttachNotice(
+        `${rejected.map((f) => f.name).join("、")} は未対応の形式のため除外しました（対応: CSV / Excel / テキスト / Word / PDF / PowerPoint）`
+      );
+    } else {
+      setAttachNotice(null);
+    }
+  }
 
   // ── 取り込みフロー（ファイル添付あり時のルート）─────────────────────────────
 
@@ -865,7 +910,42 @@ export default function DashboardPage() {
           if (id === activeThreadId) handleNewChat();
         }}
       />
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div
+        className="flex-1 flex flex-col overflow-hidden relative"
+        onDragEnter={(e) => {
+          if (isIngesting || !dragHasFiles(e.dataTransfer)) return;
+          e.preventDefault();
+          dragDepth.current += 1;
+          setIsDragging(true);
+        }}
+        onDragOver={(e) => {
+          if (isIngesting || !dragHasFiles(e.dataTransfer)) return;
+          e.preventDefault(); // これが無いと drop が発火しない
+        }}
+        onDragLeave={() => {
+          dragDepth.current -= 1;
+          if (dragDepth.current <= 0) {
+            dragDepth.current = 0;
+            setIsDragging(false);
+          }
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          dragDepth.current = 0;
+          setIsDragging(false);
+          if (isIngesting) return;
+          addFiles(Array.from(e.dataTransfer.files));
+        }}
+      >
+        {/* ドラッグ中のドロップ案内オーバーレイ */}
+        {isDragging && !isIngesting && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center bg-brand-50/80 border-2 border-dashed border-brand-400 rounded-lg pointer-events-none">
+            <div className="flex flex-col items-center gap-2 text-brand-700">
+              <Upload className="w-8 h-8" />
+              <p className="text-sm font-medium">ここにファイルをドロップして取り込み</p>
+            </div>
+          </div>
+        )}
 
         {/* メッセージ履歴 */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
@@ -1087,15 +1167,27 @@ export default function DashboardPage() {
             </div>
           )}
 
+          {/* 未対応ファイルの通知 */}
+          {attachNotice && (
+            <div className="flex items-start gap-2 text-xs mb-2 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-800">
+              <span className="flex-1">{attachNotice}</span>
+              <button
+                onClick={() => setAttachNotice(null)}
+                className="text-amber-400 hover:text-amber-600 shrink-0"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+
           <input
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".csv,.xlsx,.xls,.txt,.docx,.pdf,.pptx"
+            accept={ACCEPT_ATTR}
             className="hidden"
             onChange={(e) => {
-              const files = Array.from(e.target.files ?? []);
-              if (files.length) setPendingFiles((prev) => [...prev, ...files]);
+              addFiles(Array.from(e.target.files ?? []));
               e.target.value = "";
             }}
           />
