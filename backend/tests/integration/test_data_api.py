@@ -48,17 +48,3 @@ def test_unknown_view_returns_404(make_client, seeded_space):
     client = make_client(uid="uid_member")
     res = client.get("/api/data/nonexistent", headers={"X-Space-Id": seeded_space})
     assert res.status_code == 404
-
-
-def test_lineage_by_entity(make_client, seeded_space, db):
-    _seed_persons(db, seeded_space)
-    db.document(f"spaces/{seeded_space}/integration_jobs/job_abc").set(
-        {"job_id": "job_abc", "filename": "list.csv"}
-    )
-    client = make_client(uid="uid_member")
-    res = client.get("/api/data/lineage/by-entity/p2", headers={"X-Space-Id": seeded_space})
-    assert res.status_code == 200
-    assert res.json()["job"]["filename"] == "list.csv"
-
-    res = client.get("/api/data/lineage/by-entity/p1", headers={"X-Space-Id": seeded_space})
-    assert res.json()["job"] is None

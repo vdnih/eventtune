@@ -9,7 +9,6 @@ Data Router — /api/data
   オントロジー追加時は、本ファイルの VIEWS にエントリを1つ足すだけで済む。
 - 編集はチャットの AI エージェントに委ねるため、本ルーターは読み取り専用。
 - ADR-008: contacts → persons, content_assets → contents に変更。
-  lineage 逆引きは persons.source_job_id → integration_jobs への直接参照。
 """
 
 import json
@@ -155,30 +154,6 @@ async def list_collections(space: SpaceContext = Depends(get_space_context)):
             {"key": key, "label": label, "group": group} for key, (label, group, _) in VIEWS.items()
         ]
     }
-
-
-@router.get("/lineage/by-entity/{entity_id}")
-async def lineage_by_entity(
-    entity_id: str,
-    space: SpaceContext = Depends(get_space_context),
-):
-    """entity_id（person_id 等）の由来を integration_jobs から直接参照して返す。
-
-    ADR-008: persons.source_job_id → integration_jobs への直接参照で O(1) ルックアップ。
-    """
-    # persons / accounts / event_attendances / product_interests を検索
-    for collection in ("persons", "accounts", "event_attendances", "product_interests"):
-        doc = space.doc(f"{collection}/{entity_id}").get()
-        if doc.exists:
-            data = doc.to_dict() or {}
-            job_id = data.get("source_job_id")
-            if job_id:
-                job_doc = space.doc(f"integration_jobs/{job_id}").get()
-                if job_doc.exists:
-                    return {"entity_id": entity_id, "job": job_doc.to_dict()}
-            return {"entity_id": entity_id, "job": None}
-
-    return {"entity_id": entity_id, "job": None}
 
 
 def _strip_vectors(row: dict[str, Any]) -> dict[str, Any]:

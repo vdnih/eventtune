@@ -418,13 +418,6 @@ class TransformDecision(BaseModel):
     source_signals: dict[str, str] = {}
 
 
-class EntityTransformation(BaseModel):
-    entity_type: str
-    entity_id: str
-    source_label: str
-    decisions: list[TransformDecision] = []
-
-
 class SkippedRecord(BaseModel):
     entity_type: str
     reason: str
@@ -453,7 +446,6 @@ class IntegrationJob(BaseModel):
     report_markdown: str = ""  # バッチ報告（P1 集計を AI が整形。チャットに表示）
     # このジョブで解決・生成したリンク先マスタの要約 [{kind, name, id, resolved_by}]。
     resolved_links: list[dict] = []
-    transformations: list[EntityTransformation] = []
     skipped_records: list[SkippedRecord] = []
     error: str | None = None
     created_at: str = ""

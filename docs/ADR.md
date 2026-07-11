@@ -731,3 +731,57 @@ ADR-011 の依存順の骨格（観測→確定→結合→導出）と ADR-013 
   （架電の可否判定はスコープ外のまま）。将来的に架電・個別資料の出力形式を本格対応する際は、
   対象フィールドの追加とゲートAの可否判定拡張が必要になる。
 - サーバー側の承認強制（P1、`CURRENT_ISSUES.md` §2）は本 ADR でも導入しない。
+
+## ADR-017: `/data` 画面「由来を追う」機能を撤去 — 断片化した3経路を統合せず廃止
+
+**ステータス**: 採用（実装済み — 2026-07-11）
+
+**背景**:
+`/data` 画面（データ担当者向け3ペインエクスプローラ）の「由来を追う」ボタンが機能していない、
+という報告を受けて調べたところ、当初「どのファイル/行からこの値が確定したか」までフィールド単位
+で追える監査機能として設計されていたが、実装が統合されないまま3つの経路に分断されていた。
+
+1. `source_job_id`（persons/accounts/event_attendances/product_interests 等に直付け）→
+   `integration_jobs` を引く経路のみが実際に配線されていた。だが `GET /api/data/lineage/by-entity/
+   {entity_id}` が検索するコレクションが ADR-008 導入時の4種に固定されたままで、後から
+   `source_job_id` を持つようになった `cost_items` 等が漏れ、`events`/`products`/`segments`/
+   `marketing_runs` など元々対応外のビューでは常に「見つかりません」になっていた。取れても
+   「どのジョブ（ファイル群・日時）が触ったか」という粗い情報のみ。
+2. `EntityTransformation`（フィールド単位の変換理由 `TransformDecision` を保持する想定）は
+   `entity_id` が常に空文字列で書き込まれるバグがあった。解釈(interpret)段階ではまだエンティティ
+   が確定していない（bind段階で確定）ため構造的に埋めようがなく、フロントも一切表示していなかった。
+3. `source_records.refs`（元データ行→生成エンティティの逆参照）も書き込みはされるが、
+   どこからも読み返されていなかった。
+
+**決定**:
+壊れた3経路を統合・修復するのではなく、機能自体を撤去する。撤去したのは「ボタンとそれを裏で
+支える、由来機能のためだけに存在し完全に死んでいたコード」に限定する。
+
+- フロント: 「由来を追う」ボタン・`handleTraceLineage`・`pickEntityId`・専用の `Drawer` コンポー
+  ネント（他に利用箇所なし）を削除。
+- バックエンド: `GET /api/data/lineage/by-entity/{entity_id}` エンドポイント、`EntityTransformation`
+  モデルと `IntegrationJob.transformations` フィールド、それらを構築していた
+  `data_integration_agent.py` のループを削除。
+
+一方で以下は**撤回・削除しない**:
+- `source_job_id` を各 master/fact レコードに inline 保持する設計（ADR-008「来歴の単純化」）。
+  API/UI からの逆引きは提供しなくなるが、フィールド自体は安価に維持でき、将来の監査UI再構築の
+  足がかりとして残す。
+- `TransformDecision`（`backend/ingestion/engine.py` の `InterpretedRow.decisions`）。取り込み
+  解釈エンジン本体の判断ログとして独立に使われており、`EntityTransformation` とは無関係。
+- `SourceRecord.refs` / `_Source.bound_refs`。`status()`（pending/bound/skipped 判定、ADR-015の
+  コア動作）に使われている内部状態であり、Firestore への `refs` 書き込み自体も残す
+  （表示に使わないだけで、算出済みの値を書くコストはゼロ）。
+
+**理由**:
+壊れたまま作り直すより、まず撤去して要望が具体化した時点で再設計する方が、中途半端な監査UIを
+残すより誠実。特に (2)(3) は「エンティティがまだ存在しない解釈段階でエンティティ単位の記録を
+試みる」という順序の誤りが根本原因であり、再構築するなら bind/derive 段階で確定したエンティティ
+IDに対して事後的に紐付ける設計が必要（[[project_ingestion_redesign_adr011]] の多段パイプライン
+方針と整合させる）。
+
+**結果**:
+`frontend/app/(app)/data/page.tsx`・`frontend/components/ui/format.ts`・
+`frontend/components/ui/Drawer.tsx`（削除）・`backend/routers/data.py`・`backend/ontology.py`・
+`backend/agents/data_integration_agent.py` を修正。関連テスト
+（`test_data_api.py::test_lineage_by_entity`、`format.test.ts` の `pickEntityId` ブロック）を削除。
