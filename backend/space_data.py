@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from ontology import (
     Account,
     Content,
+    CostItem,
     Event,
     EventAttendance,
     Person,
@@ -32,6 +33,7 @@ class SpaceData:
     products: list[Product] = field(default_factory=list)
     contents: list[Content] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
+    cost_items: list[CostItem] = field(default_factory=list)
 
 
 def load_space_data(space: SpaceContext) -> SpaceData:
@@ -65,4 +67,5 @@ def load_space_data(space: SpaceContext) -> SpaceData:
         products=_stream("products", Product),
         contents=_stream("contents", Content),
         segments=_stream("segments", Segment),
+        cost_items=_stream("cost_items", CostItem),
     )
