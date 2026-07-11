@@ -45,6 +45,8 @@ test("ログイン → 同意 → スペース作成 → データ閲覧", async
 
   // データ画面が開き、ビュー一覧（バックエンドの /api/data/collections）が出る
   await page.goto("/data");
-  await expect(page.getByText("ハウスリスト")).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText("イベント", { exact: true }).first()).toBeVisible();
+  // ヘッダ直下のハッカソン注意バナーに「ハウスリスト」を含む文言があるため、
+  // 素の getByText だと strict mode violation になる。左ナビのボタンを名指しする。
+  await expect(page.getByRole("button", { name: "ハウスリスト" })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("button", { name: "イベント", exact: true })).toBeVisible();
 });
