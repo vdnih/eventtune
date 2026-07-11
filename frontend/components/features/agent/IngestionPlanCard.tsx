@@ -77,16 +77,6 @@ export function IngestionPlanCard({ plan }: { plan: BatchPlan }) {
         </table>
       </div>
 
-      {warnings.length > 0 && (
-        <div className="mt-1.5 space-y-0.5">
-          {warnings.map((w, i) => (
-            <div key={i} className="text-amber-700">
-              ⚠️ {w.filename}: {w.note}
-            </div>
-          ))}
-        </div>
-      )}
-
       <button
         onClick={() => setDetailOpen((v) => !v)}
         className="mt-2 flex items-center gap-1 text-gray-400 hover:text-gray-600 transition"
@@ -97,6 +87,15 @@ export function IngestionPlanCard({ plan }: { plan: BatchPlan }) {
 
       {detailOpen && (
         <div className="mt-1.5 space-y-3 rounded-lg bg-gray-100/60 p-2.5">
+          {warnings.length > 0 && (
+            <div className="space-y-0.5">
+              {warnings.map((w, i) => (
+                <div key={i} className="text-amber-700">
+                  ⚠️ {w.filename}: {w.note}
+                </div>
+              ))}
+            </div>
+          )}
           {plan.files.map((fp) => (
             <div key={fp.filename} className="space-y-1">
               <div className="font-semibold text-gray-600">{fp.filename}</div>
