@@ -38,7 +38,45 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _ingestion_title(filenames: list[str]) -> str:
+# 取り込み種別 → スレッドタイトル用の日本語ラベル。
+# routers/data.py の COLLECTIONS 表示名とは用途が異なる（一覧UI vs スレッドタイトル）ため
+# 独立して持つ。
+_KIND_LABELS: dict[str, str] = {
+    "accounts": "企業リスト",
+    "products": "プロダクトリスト",
+    "contents": "コンテンツリスト",
+    "events": "イベント",
+    "event_attendances": "接客記録",
+    "cost_items": "費用実績",
+    "event_kpi": "イベントKPI",
+    "survey_summary": "アンケート結果",
+}
+
+
+def _ingestion_title(filenames: list[str], plan: BatchPlan | None = None) -> str:
+    """スレッドタイトルを生成する。
+
+    イベントに関する取り込みなら既定イベント名、イベントに紐づかないデータ
+    （コンテンツリスト等）ならその種別名にし、スレッド一覧を見ただけで何の
+    取り込みだったか分かるようにする。plan が無い（API 直叩きで Understand 未実行）
+    場合はファイル名にフォールバックする。
+    """
+    if plan is not None:
+        if plan.default_event and plan.default_event.name:
+            return plan.default_event.name
+        labels: list[str] = []
+        for f in plan.files:
+            for t in f.targets:
+                label = _KIND_LABELS.get(t.entity_type)
+                if label and label not in labels:
+                    labels.append(label)
+        if len(labels) == 1:
+            return f"{labels[0]}の取り込み"
+        if len(labels) == 2:
+            return f"{labels[0]}・{labels[1]}の取り込み"
+        if len(labels) > 2:
+            return f"{labels[0]}他{len(labels) - 1}種の取り込み"
+
     if not filenames:
         return "データ取り込み"
     title = f"取り込み: {filenames[0]}"
@@ -239,7 +277,7 @@ async def start_integration(
 
     # thread_id はクライアント採番の UUID で信用境界にならないため、所有者チェックを
     # 必ず通す（marketing.py の /chat と同じ規約）。integration_jobs 作成前に行う。
-    if not thread_store.touch_thread(space, thread_id, _ingestion_title(filenames)):
+    if not thread_store.touch_thread(space, thread_id, _ingestion_title(filenames, batch_plan)):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
