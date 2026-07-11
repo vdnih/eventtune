@@ -78,6 +78,9 @@ async def chat(
         tool_calls: list[dict] = []
         code_blocks: list[dict] = []
         run_id: str | None = None
+        run_source: str | None = None
+        pattern_segment_id: str | None = None
+        pattern_format: str | None = None
         try:
             async for event in chat_stream(
                 message=body.message,
@@ -91,14 +94,23 @@ async def chat(
                     acc_text += event.get("text", "")
                 elif etype == "tool_call":
                     tool_calls.append(
-                        {"tool_name": event.get("tool_name"), "args": event.get("args", {})}
+                        {
+                            "tool_name": event.get("tool_name"),
+                            "args": event.get("args", {}),
+                            "intent": event.get("intent", ""),
+                        }
                     )
                 elif etype == "tool_result":
-                    rid = thread_store.extract_run_id_from_result(event)
-                    if rid:
-                        run_id = rid
+                    run_result = thread_store.extract_run_id_from_result(event)
+                    if run_result:
+                        run_id, run_source = run_result
+                    pattern_result = thread_store.extract_pattern_segment_from_result(event)
+                    if pattern_result:
+                        pattern_segment_id, pattern_format = pattern_result
                 elif etype == "code":
-                    code_blocks.append({"code": event.get("code", "")})
+                    code_blocks.append(
+                        {"code": event.get("code", ""), "intent": event.get("intent", "")}
+                    )
                 elif etype == "code_result":
                     # 直近の未完了コードブロックに実行結果を紐づける
                     for b in reversed(code_blocks):
@@ -124,6 +136,9 @@ async def chat(
                         "tool_calls": tool_calls,
                         "code_blocks": code_blocks,
                         "run_id": run_id,
+                        "run_source": run_source,
+                        "pattern_segment_id": pattern_segment_id,
+                        "pattern_format": pattern_format,
                     },
                 )
             except Exception:
@@ -175,6 +190,23 @@ async def get_run_results(
     """生成された成果物（Deliverable）一覧を返す。"""
     deliverables = [s.to_dict() for s in space.col(f"marketing_runs/{run_id}/deliverables").get()]
     return {"deliverables": deliverables, "count": len(deliverables)}
+
+
+@router.get("/segments/{segment_id}/patterns")
+async def get_segment_patterns(
+    segment_id: str,
+    output_format: str | None = None,
+    space: SpaceContext = Depends(get_space_context),
+):
+    """generate_patterns が生成済みのバケット別パターン（件名＋本文）一覧を返す。
+
+    generate_patterns のツール戻り値には本文が含まれない（件名のみ）ため、文面チェックUIは
+    このエンドポイントで実体を取得してカード表示する。
+    """
+    patterns = [s.to_dict() for s in space.col(f"segments/{segment_id}/patterns").get()]
+    if output_format:
+        patterns = [p for p in patterns if p.get("format") == output_format]
+    return {"segment_id": segment_id, "patterns": patterns, "count": len(patterns)}
 
 
 @router.get("/runs/{run_id}/export")
