@@ -159,7 +159,7 @@ ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / ap
    run_python_code(code="persons = pd.read_csv('persons.csv'); print(persons.columns.tolist())")
 
    他に events.csv / event_attendances.csv / product_interests.csv / accounts.csv / products.csv /
-   contents.csv がある。get_space_data 実行後は pandas が pd、numpy が np として import 済みで使える。
+   contents.csv / cost_items.csv がある。get_space_data 実行後は pandas が pd、numpy が np として import 済みで使える。
    scipy 等それ以外を使うときは自分で import する（pip install は不可）。
 
 【run_python_code の作法（重要）】
@@ -180,13 +180,17 @@ ROI は KPI フィールド（pipeline_value_jpy / total_contacts_collected / ap
    - 参加者の属性分布 = event_attendances → persons（→ accounts）を person_id/account_id で merge し、
      contact_stage / 業種・企業規模で集計。
    - 関心製品の分布 = product_interests を product_id・イベント別に集計。
-   - 予算・目標名刺数・定性メモ = events の total_budget / target_contact_count / description。
+   - イベントの**実費用（実績）** = cost_items を event_id で集計（例:
+     cost_items[cost_items.event_id == X].amount_jpy.sum()）。category 列で費目別内訳（出展料・
+     ブース装飾・ノベルティ等）も出せる。events の total_budget はあくまで事前予算・目安値であり、
+     実績とは限らない（実額は必ず cost_items から出す。両者を混同しない）。
+   - 目標名刺数・定性メモ = events の target_contact_count / description。
 3. **欠損は「止まる理由」ではなく「注記」**: ある数値列（KPI 等）が NaN でも分析を放棄しない。
    まず出せる要約を必ず提示し、そのうえで「○○は未入力のため算出不可。入力すれば算出可能」と添える。
    いきなり「データが無いので振り返れません／入力してください／定性ヒアリングしましょう」に切り替えない。
 4. 「イベントの振り返り」の既定アウトプット例:
-   概要（名称/種別/会場/会期/予算/目標名刺数）＋ 実参加者数（attendances）＋ 参加者の属性・関心の分布
-   ＋ description の定性要点 ＋（KPI があれば）ROI、無ければ未入力項目の注記。
+   概要（名称/種別/会場/会期/予算/目標名刺数）＋ 実参加者数（attendances）＋ 実費用（cost_items集計）
+   ＋ 参加者の属性・関心の分布 ＋ description の定性要点 ＋（KPI があれば）ROI、無ければ未入力項目の注記。
 
 【個別カスタマイズ（メール等）の進め方 — セグメント方式 + HIL】
 全コンタクトに1通ずつフル生成するのではなく、少数のセグメントに切り分け、セグメント単位で
@@ -230,6 +234,7 @@ def _build_schema_text() -> str:
     from ontology import (
         Account,
         Content,
+        CostItem,
         Event,
         EventAttendance,
         Person,
@@ -238,7 +243,17 @@ def _build_schema_text() -> str:
         Segment,
     )
 
-    models = [Person, Event, Account, EventAttendance, ProductInterest, Product, Content, Segment]
+    models = [
+        Person,
+        Event,
+        Account,
+        EventAttendance,
+        ProductInterest,
+        Product,
+        Content,
+        Segment,
+        CostItem,
+    ]
     lines = []
     for model in models:
         lines.append(f"\n{model.__name__}:")
@@ -354,6 +369,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
             "products": data.products,
             "contents": data.contents,
             "segments": data.segments,
+            "cost_items": data.cost_items,
         }
         counts: dict[str, int] = {}
         files: list[dict] = []
