@@ -13,7 +13,6 @@ import {
   formatTimestamp,
   isComplex,
   isMetadataColumn,
-  pickEntityId,
   unionColumns,
 } from "./format";
 
@@ -50,14 +49,6 @@ describe("formatDetail / isComplex", () => {
     expect(isComplex([])).toBe(true);
     expect(isComplex("str")).toBe(false);
     expect(isComplex(null)).toBe(false);
-  });
-});
-
-describe("pickEntityId", () => {
-  it("優先キー（person_id 等）を優先し、無ければ末尾 _id にフォールバックする", () => {
-    expect(pickEntityId({ custom_id: "c1", person_id: "p1" })).toBe("p1");
-    expect(pickEntityId({ custom_id: "c1" })).toBe("c1");
-    expect(pickEntityId({ name: "山田" })).toBeNull();
   });
 });
 

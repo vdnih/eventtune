@@ -39,7 +39,6 @@ from ontology import (
     BatchPlan,
     ContactStage,
     DefaultEventPlan,
-    EntityTransformation,
     EventAttendance,
     FilePlan,
     Person,
@@ -1055,18 +1054,6 @@ async def process_batch(
             elif entry.get("resolved_by") == "containment":
                 fuzzy_matches.append(entry)
 
-    transformations: list[EntityTransformation] = []
-    for src, row in interpreted:
-        if row.decisions and len(transformations) < 200:
-            transformations.append(
-                EntityTransformation(
-                    entity_type=row.kind,
-                    entity_id="",
-                    source_label=f"{src.filename}:{src.row_no}",
-                    decisions=row.decisions,
-                )
-            )
-
     aggregate = {
         "created": dict(counts),
         "pending_count": pending_count,
@@ -1087,7 +1074,6 @@ async def process_batch(
             "skipped_count": skipped_count,
             "report_markdown": report_markdown,
             "resolved_links": resolved_links,
-            "transformations": [t.model_dump() for t in transformations],
             "skipped_records": [s.model_dump() for s in skipped_records],
         },
         merge=True,

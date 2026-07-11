@@ -133,7 +133,6 @@ POST   /api/events                              # イベント作成
 # Data（汎用閲覧・読み取り専用）— data.py
 GET    /api/data/collections                    # 閲覧可能なビュー一覧（左メニュー用）
 GET    /api/data/{view_key}                     # ビューのドキュメント群（整形しない）
-GET    /api/data/lineage/by-entity/{entity_id}  # source_job_id から由来ジョブを逆引き
 
 GET    /health
 ```
@@ -167,8 +166,9 @@ spaces/{space_id}/
   integration_jobs/{job_id}         # IntegrationJob（来歴の逆引き元）
 ```
 
-各 master/fact レコードは `source_job_id`（= integration_jobs.job_id）を inline 保持し、
-そこから取り込みジョブへ O(1) で逆引きする（data.router の lineage）。
+各 master/fact レコードは `source_job_id`（= integration_jobs.job_id）を inline 保持する
+（現状 API/UI からの逆引きは提供しない。ADR-017 で「由来を追う」機能は撤去したが、
+このフィールド自体は将来の監査UI再構築の足がかりとして残す）。
 
 ---
 
@@ -184,7 +184,7 @@ marketing-mail-generator/
 │   │   ├── spaces/new/page.tsx
 │   │   └── settings/{space,members,usage}/page.tsx
 │   ├── components/
-│   │   ├── ui/{DataTable,Drawer,format}.tsx   # モデル非依存・オントロジー安全
+│   │   ├── ui/{DataTable,format}.tsx          # モデル非依存・オントロジー安全
 │   │   └── features/agent/DeliverableCard.tsx # 汎用 AI 成果物カード
 │   └── lib/{firebase,api,space-context}.ts
 │
@@ -216,8 +216,8 @@ marketing-mail-generator/
 
 ### `data/page.tsx`
 3ペインの汎用データブラウザ。左=コレクションナビ（`/api/data/collections`）、中央=`DataTable`
-（`/api/data/{key}`）、右=詳細＋「由来を追う」（`/api/data/lineage/by-entity/{id}`）。
-`DataTable` / `Drawer` / `format` はモデル非依存で、オントロジー変更に追従不要。
+（`/api/data/{key}`）、右=詳細ペイン。
+`DataTable` / `format` はモデル非依存で、オントロジー変更に追従不要。
 
 ### `DeliverableCard`
 生成成果物（メール等）を format 非依存で表示。ブロック単位の表示と
