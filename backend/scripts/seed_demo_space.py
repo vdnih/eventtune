@@ -176,7 +176,9 @@ async def _run_all_batches(space, db) -> None:
         print(f"  created_entities={result.created_entities}")
         print(f"  pending_count={result.pending_count} skipped_count={result.skipped_count}")
         if result.pending_count or result.skipped_count:
-            print("  [WARN] pending/skipped が0ではありません。report_markdown を確認してください。")
+            print(
+                "  [WARN] pending/skipped が0ではありません。report_markdown を確認してください。"
+            )
             print(f"  report_markdown:\n{result.report_markdown}")
 
 
@@ -199,7 +201,9 @@ def _print_summary(space) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--email", required=True, help="スペースオーナーにする Firebase ユーザーのメールアドレス")
+    parser.add_argument(
+        "--email", required=True, help="スペースオーナーにする Firebase ユーザーのメールアドレス"
+    )
     parser.add_argument("--space-name", default="クラウドフォージ デモ", help="作成するスペース名")
     parser.add_argument(
         "--description",
@@ -219,7 +223,9 @@ def main() -> None:
         sys.exit(1)
 
     space_id = _create_space(db, user.uid, args.email, args.space_name, args.description)
-    print(f"スペース作成: {space_id}(owner={args.email}、プロジェクト={settings.firebase_project_id})")
+    print(
+        f"スペース作成: {space_id}(owner={args.email}、プロジェクト={settings.firebase_project_id})"
+    )
 
     from space import SpaceContext
 
