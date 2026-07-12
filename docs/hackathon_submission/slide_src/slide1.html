@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<style>
+  :root{
+    --ground:#f6f8fc; --card:#ffffff;
+    --ink:#0f1e38; --ink-2:#47566d; --ink-3:#8a97ad;
+    --line:#e4e9f2; --blue:#2563eb; --blue-lt:#3b82f6; --green:#10b981;
+    --blue-wash:#eef3ff; --green-wash:#e7faf2;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{background:#d9dfe9;}
+  .slide{
+    width:880px;height:495px;position:relative;overflow:hidden;
+    background:linear-gradient(160deg,#ffffff 0%,#f3f7fd 62%,#eef4fb 100%);
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Hiragino Sans","Yu Gothic",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ambient logo-rings, scaled up + bleeding off the right edge */
+  .deco{position:absolute;top:-186px;right:-250px;width:760px;height:760px;opacity:.11;overflow:visible;}
+  .seam{position:absolute;left:0;top:0;width:6px;height:100%;
+        background:linear-gradient(180deg,var(--blue),var(--green));}
+  .content{position:absolute;left:60px;top:0;height:100%;width:690px;
+           display:flex;flex-direction:column;justify-content:center;gap:0;}
+  .brand{display:flex;align-items:center;gap:12px;margin-bottom:22px;}
+  .brand .mark{width:34px;height:34px;overflow:visible;}
+  .wordmark{font-size:27px;font-weight:700;letter-spacing:-.6px;color:var(--ink);}
+  .cat{display:inline-block;align-self:flex-start;font-size:12.5px;font-weight:600;
+       letter-spacing:.3px;color:var(--blue);background:var(--blue-wash);
+       padding:6px 13px;border-radius:999px;margin-bottom:26px;}
+  h1.tagline{font-size:47px;font-weight:800;line-height:1.3;letter-spacing:-1px;
+             white-space:nowrap;}
+  .grad{background:linear-gradient(96deg,var(--blue) 8%,var(--green) 92%);
+        -webkit-background-clip:text;background-clip:text;color:transparent;}
+  .sub{margin-top:26px;font-size:16px;line-height:1.75;color:var(--ink-2);
+       max-width:500px;font-weight:500;}
+  .dot{display:inline-block;width:6px;height:6px;border-radius:50%;
+       background:var(--green);margin:0 2px 2px 0;vertical-align:middle;}
+</style>
+</head>
+<body>
+<div class="slide">
+  <svg class="deco" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="20" cy="80" r="25" stroke="#3b82f6" stroke-width="7" fill="none"/>
+    <circle cx="20" cy="80" r="60" stroke="#3b82f6" stroke-width="7" fill="none"/>
+    <circle cx="80" cy="20" r="25" stroke="#10b981" stroke-width="7" fill="none"/>
+    <circle cx="80" cy="20" r="60" stroke="#10b981" stroke-width="7" fill="none"/>
+  </svg>
+  <div class="seam"></div>
+  <div class="content">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="20" cy="80" r="25" stroke="#3b82f6" stroke-width="12" fill="none"/>
+        <circle cx="20" cy="80" r="60" stroke="#3b82f6" stroke-width="12" fill="none"/>
+        <circle cx="80" cy="20" r="25" stroke="#10b981" stroke-width="12" fill="none"/>
+        <circle cx="80" cy="20" r="60" stroke="#10b981" stroke-width="12" fill="none"/>
+      </svg>
+      <span class="wordmark">EventTune</span>
+    </div>
+    <span class="cat">イベントマーケティング AIエージェント</span>
+    <h1 class="tagline">イベントの出会いを<br><span class="grad">成果へチューニングする。</span></h1>
+    <p class="sub">分析とフォローを素早く終わらせ、<br>マーケターが企画と改善に注力できるように。</p>
+  </div>
+</div>
+</body>
+</html>
