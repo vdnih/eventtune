@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="780" viewBox="0 0 960 780" font-family="'Hiragino Sans','Noto Sans JP','Yu Gothic',sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="495" viewBox="0 0 940 528" font-family="'Hiragino Sans','Noto Sans JP','Yu Gothic',sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#5f6b7a"/>
@@ -6,166 +6,128 @@
     <style>
       .title{font-size:22px;font-weight:700;fill:#1a2330}
       .subtitle{font-size:12px;fill:#5f6b7a}
+      .step{font-size:11px;font-weight:700;fill:#ffffff}
       .boxh{font-size:14px;font-weight:700;fill:#1a2330}
-      .agenth{font-size:12px;font-weight:700;fill:#1a2330}
       .boxt{font-size:11px;fill:#42505f}
       .tech{font-size:10px;fill:#5f6b7a}
-      .caption{font-size:11px;font-weight:700;fill:#5f6b7a}
-      .band{font-size:13px;font-weight:700;fill:#1a2330}
+      .band{font-size:12px;font-weight:700;fill:#1a2330}
       .chip{font-size:11px;fill:#1a2330}
-      .alabel{font-size:9.5px;fill:#5f6b7a}
-      .region{font-size:9px;font-weight:700;fill:#5f6b7a}
-      .note{font-size:9.5px;font-style:italic;fill:#7a8694}
+      .must{font-size:9px;font-weight:700;fill:#b45309}
     </style>
   </defs>
 
-  <rect width="960" height="780" fill="#f7f9fc"/>
+  <rect width="940" height="528" fill="#f7f9fc"/>
 
   <!-- Header -->
-  <text x="32" y="40" class="title">EventTune — システム構成図（インフラ／ソフトウェア）</text>
-  <text x="32" y="62" class="subtitle">カオスなイベントデータをオントロジーへ統合し、2種類のAIエージェントがその上で働くマルチテナントSaaS</text>
+  <text x="32" y="40" class="title">EventTune — システム構成</text>
+  <text x="32" y="60" class="subtitle">カオスなイベントデータをオントロジーに統合し、AIエージェントがその上で働くマルチテナントSaaS ／「LLMの知能はプロンプトではなく"構造"で統治する」</text>
 
-  <!-- ============ Layer 1: Client + Firebase Auth ============ -->
+  <!-- Input: user + files -->
   <g>
-    <rect x="32" y="84" width="564" height="76" rx="10" fill="#e8f0fe" stroke="#4285f4"/>
-    <text x="48" y="108" class="boxh">① クライアント（ブラウザ / BtoBマーケ担当）</text>
-    <text x="48" y="130" class="boxt">Next.js 15 App Router ・ React 19 ・ TypeScript ・ Tailwind CSS</text>
-    <text x="48" y="148" class="tech">チャット駆動UI ／ ファイルのドラッグ＆ドロップ投入 ／ SSEストリーミング受信</text>
-  </g>
-  <g>
-    <rect x="636" y="84" width="292" height="76" rx="10" fill="#f3e8fd" stroke="#a142f4"/>
-    <text x="652" y="108" class="boxh">Firebase Authentication</text>
-    <text x="652" y="130" class="boxt">Google サインイン ／ 匿名認証</text>
-    <text x="652" y="148" class="tech">IDトークンを発行 → 全APIで検証</text>
-  </g>
-  <!-- client -> auth -->
-  <line x1="596" y1="122" x2="634" y2="122" stroke="#5f6b7a" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
-  <text x="600" y="115" class="alabel">認証</text>
-
-  <!-- client -> app hosting -->
-  <line x1="110" y1="160" x2="110" y2="188" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="120" y="178" class="alabel">HTTPS ／ SSR</text>
-
-  <!-- ============ Layer 2: Firebase App Hosting ============ -->
-  <g>
-    <rect x="32" y="190" width="564" height="72" rx="10" fill="#e8f0fe" stroke="#4285f4"/>
-    <text x="48" y="214" class="boxh">② Firebase App Hosting</text>
-    <rect x="486" y="200" width="102" height="17" rx="8" fill="#ffffff" stroke="#4285f4"/>
-    <text x="537" y="213" text-anchor="middle" class="region">asia-east1</text>
-    <text x="48" y="236" class="boxt">Next.js SSR ホスティング ／ git push で自動ビルド＆デプロイ</text>
-    <text x="48" y="253" class="tech">/api/v1/* を Cloud Run へ SSR リバースプロキシ</text>
+    <rect x="32" y="86" width="150" height="150" rx="10" fill="#eef2f7" stroke="#c7d2e0"/>
+    <text x="107" y="108" text-anchor="middle" class="boxh">ユーザー（BtoBマーケ）</text>
+    <text x="107" y="128" text-anchor="middle" class="boxt">展示会・セミナー後の</text>
+    <text x="107" y="144" text-anchor="middle" class="boxt">バラバラなファイルを投入</text>
+    <g>
+      <rect x="46" y="158" width="56" height="26" rx="4" fill="#ffffff" stroke="#c7d2e0"/>
+      <text x="74" y="175" text-anchor="middle" class="tech">名簿CSV</text>
+      <rect x="112" y="158" width="56" height="26" rx="4" fill="#ffffff" stroke="#c7d2e0"/>
+      <text x="140" y="175" text-anchor="middle" class="tech">アンケート</text>
+      <rect x="46" y="190" width="56" height="26" rx="4" fill="#ffffff" stroke="#c7d2e0"/>
+      <text x="74" y="207" text-anchor="middle" class="tech">ブース記録</text>
+      <rect x="112" y="190" width="56" height="26" rx="4" fill="#ffffff" stroke="#c7d2e0"/>
+      <text x="140" y="207" text-anchor="middle" class="tech">費用Excel</text>
+    </g>
   </g>
 
-  <!-- app hosting -> cloud run -->
-  <line x1="110" y1="262" x2="110" y2="290" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="120" y="280" class="alabel">REST + SSE ／ Bearer &lt;IDトークン&gt; + X-Space-Id</text>
-
-  <!-- ============ Layer 3: Cloud Run (backend + agents) ============ -->
+  <!-- Step 1: UI -->
   <g>
-    <rect x="32" y="292" width="564" height="210" rx="10" fill="#e6f4ea" stroke="#34a853"/>
-    <text x="48" y="316" class="boxh">③ Cloud Run: eventtune-api</text>
-    <rect x="470" y="302" width="118" height="17" rx="8" fill="#ffffff" stroke="#34a853"/>
-    <text x="529" y="315" text-anchor="middle" class="region">asia-northeast1</text>
-    <text x="48" y="336" class="boxt">FastAPI ・ Python 3.12 ・ Docker</text>
-    <text x="48" y="354" class="tech">routers: integration ・ marketing ・ spaces ・ data ・ users　｜　マルチテナント: spaces/&#123;space_id&#125;/… で分離</text>
-
-    <!-- DataIntegrationAgent -->
-    <rect x="48" y="368" width="262" height="124" rx="8" fill="#ffffff" stroke="#34a853"/>
-    <text x="60" y="388" class="agenth">DataIntegrationAgent</text>
-    <text x="60" y="407" class="boxt">取り込みパイプライン（Layer 1）</text>
-    <text x="60" y="424" class="tech">google-genai 直接呼び出し（決定論）</text>
-    <text x="60" y="440" class="tech">CSV/Excel/PDF → OSIオントロジー</text>
-    <text x="60" y="456" class="tech">gemini-3.5-flash / 3.1-flash-lite</text>
-    <text x="60" y="472" class="tech">appeal_summary → appeal_vector</text>
-
-    <!-- MarketingAgent -->
-    <rect x="320" y="368" width="262" height="124" rx="8" fill="#ffffff" stroke="#34a853"/>
-    <text x="332" y="388" class="agenth">MarketingAgent</text>
-    <text x="332" y="407" class="boxt">分析・成果物生成（Layer 3）</text>
-    <text x="332" y="424" class="tech">Google ADK Agent（Runner + Session）</text>
-    <text x="332" y="440" class="tech">セグメント／成果物(メール等)を決定論組立</text>
-    <text x="332" y="456" class="tech">gemini-3.5-flash</text>
-    <text x="332" y="472" class="tech">run_python_code で Code Interpreter 実行</text>
+    <rect x="206" y="86" width="150" height="150" rx="10" fill="#e8f0fe" stroke="#4285f4"/>
+    <circle cx="226" cy="106" r="11" fill="#4285f4"/><text x="226" y="110" text-anchor="middle" class="step">1</text>
+    <text x="245" y="110" class="boxh">投入UI</text>
+    <text x="220" y="138" class="boxt">Next.js 15 チャット駆動UI</text>
+    <text x="220" y="156" class="boxt">ファイルをドラッグ投入</text>
+    <text x="220" y="174" class="boxt">React 19 / TypeScript</text>
+    <text x="220" y="192" class="boxt">SSE でストリーミング応答</text>
+    <text x="220" y="222" class="tech">FastAPI (Python 3.12) 経由</text>
   </g>
 
-  <!-- ============ Right column: AI 基盤 (Vertex AI) ============ -->
-  <text x="636" y="286" class="caption">AI基盤 — Vertex AI</text>
+  <!-- Step 2: Integration + Semantic -->
   <g>
-    <rect x="636" y="292" width="292" height="100" rx="10" fill="#fef7e0" stroke="#f9ab00"/>
-    <text x="652" y="316" class="boxh">Vertex AI ・ Gemini</text>
-    <rect x="852" y="302" width="60" height="17" rx="8" fill="#ffffff" stroke="#f9ab00"/>
-    <text x="882" y="315" text-anchor="middle" class="region">global</text>
-    <text x="652" y="337" class="boxt">生成・埋め込みの直接API呼び出し</text>
-    <text x="652" y="354" class="tech">gemini-3.5-flash / gemini-3.1-flash-lite</text>
-    <text x="652" y="370" class="tech">gemini-embedding-001（768次元）</text>
-    <text x="652" y="386" class="note">← 両エージェントが呼び出し</text>
-  </g>
-  <g>
-    <rect x="636" y="400" width="292" height="102" rx="10" fill="#fef7e0" stroke="#f9ab00"/>
-    <text x="652" y="424" class="boxh">Vertex AI Agent Engine</text>
-    <rect x="838" y="410" width="74" height="17" rx="8" fill="#ffffff" stroke="#f9ab00"/>
-    <text x="875" y="423" text-anchor="middle" class="region">us-central1</text>
-    <text x="652" y="445" class="boxt">① ADK 会話セッションストア</text>
-    <text x="652" y="462" class="boxt">② Code Interpreter サンドボックス</text>
-    <text x="652" y="478" class="tech">pandas 分析を statefully 実行</text>
-    <text x="652" y="494" class="note">← MarketingAgent 専用</text>
-  </g>
-  <!-- cloud run -> vertex gemini -->
-  <line x1="596" y1="332" x2="634" y2="332" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
-  <!-- marketing agent -> agent engine -->
-  <line x1="596" y1="452" x2="634" y2="450" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
-
-  <!-- cloud run -> data -->
-  <line x1="150" y1="502" x2="150" y2="528" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="156" y="520" class="alabel">書込／読取</text>
-  <line x1="440" y1="502" x2="440" y2="528" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="446" y="520" class="alabel">ファイル保存／取得</text>
-  <!-- artifact registry -> cloud run (deploy image) -->
-  <line x1="700" y1="530" x2="594" y2="504" stroke="#5f6b7a" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
-  <text x="612" y="520" class="alabel">イメージ</text>
-
-  <!-- ============ Layer 4: Data stores ============ -->
-  <g>
-    <rect x="32" y="530" width="272" height="94" rx="10" fill="#fce8e6" stroke="#ea4335"/>
-    <text x="48" y="554" class="boxh">Firestore</text>
-    <rect x="186" y="540" width="110" height="17" rx="8" fill="#ffffff" stroke="#ea4335"/>
-    <text x="241" y="553" text-anchor="middle" class="region">asia-northeast1</text>
-    <text x="48" y="576" class="boxt">OSI: マスタ(person/product/event/content)</text>
-    <text x="48" y="592" class="tech">＋ ファクト(attendance / interest)・スレッド／メッセージ</text>
-    <text x="48" y="608" class="tech">全コレクションを spaces/&#123;space_id&#125;/… でテナント分離</text>
-  </g>
-  <g>
-    <rect x="316" y="530" width="276" height="94" rx="10" fill="#fce8e6" stroke="#ea4335"/>
-    <text x="332" y="554" class="boxh">Cloud Storage</text>
-    <rect x="474" y="540" width="110" height="17" rx="8" fill="#ffffff" stroke="#ea4335"/>
-    <text x="529" y="553" text-anchor="middle" class="region">asia-northeast1</text>
-    <text x="332" y="576" class="boxt">アップロードファイル置き場 uploads/&#123;uid&#125;/…</text>
-    <text x="332" y="592" class="tech">ファイル投入の一次バケット</text>
-    <text x="332" y="608" class="tech">7日ライフサイクルで自動削除</text>
-  </g>
-  <g>
-    <rect x="636" y="530" width="292" height="94" rx="10" fill="#fce8e6" stroke="#ea4335"/>
-    <text x="652" y="554" class="boxh">Artifact Registry</text>
-    <rect x="810" y="540" width="110" height="17" rx="8" fill="#ffffff" stroke="#ea4335"/>
-    <text x="865" y="553" text-anchor="middle" class="region">asia-northeast1</text>
-    <text x="652" y="576" class="boxt">バックエンド Docker イメージを格納</text>
-    <text x="652" y="592" class="tech">Cloud Run デプロイ元</text>
+    <rect x="380" y="86" width="150" height="150" rx="10" fill="#e6f4ea" stroke="#34a853"/>
+    <circle cx="400" cy="106" r="11" fill="#34a853"/><text x="400" y="110" text-anchor="middle" class="step">2</text>
+    <text x="419" y="110" class="boxh">意味統合</text>
+    <text x="394" y="134" class="boxt">DataIntegrationAgent</text>
+    <text x="394" y="150" class="tech">Google ADK + Gemini</text>
+    <text x="394" y="172" class="boxt">→ OSIセマンティック層へ</text>
+    <text x="394" y="188" class="tech">星座型：5マスタ＋ファクト</text>
+    <text x="394" y="210" class="boxt">appeal_vector を付与</text>
+    <text x="394" y="226" class="tech">gemini-embedding-001 / 768d</text>
   </g>
 
-  <!-- ============ Layer 5: CI/CD + IaC ============ -->
+  <!-- Step 3: Analysis -->
   <g>
-    <rect x="32" y="646" width="896" height="82" rx="10" fill="#ffffff" stroke="#c7d2e0"/>
-    <text x="48" y="670" class="band">つくる・まわす — CI/CD ・ IaC（Infrastructure as Code）</text>
-    <rect x="48" y="682" width="214" height="30" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
-    <text x="155" y="701" text-anchor="middle" class="chip">Terraform（IaC / GCS remote state）</text>
-    <rect x="274" y="682" width="300" height="30" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
-    <text x="424" y="701" text-anchor="middle" class="chip">GitHub Actions ＋ WIF（キーレスCI/CD）</text>
-    <rect x="586" y="682" width="168" height="30" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
-    <text x="670" y="701" text-anchor="middle" class="chip">→ Cloud Run へデプロイ</text>
-    <rect x="766" y="682" width="150" height="30" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
-    <text x="841" y="701" text-anchor="middle" class="chip">App Hosting は git push 自動</text>
+    <rect x="554" y="86" width="150" height="150" rx="10" fill="#fef7e0" stroke="#f9ab00"/>
+    <circle cx="574" cy="106" r="11" fill="#f9ab00"/><text x="574" y="110" text-anchor="middle" class="step">3</text>
+    <text x="593" y="110" class="boxh">分析</text>
+    <text x="568" y="134" class="boxt">MarketingAgent</text>
+    <text x="568" y="150" class="tech">ADK + Gemini（自律実行）</text>
+    <text x="568" y="172" class="boxt">Code Interpreter</text>
+    <text x="568" y="188" class="tech">Agent Engine サンドボックス</text>
+    <text x="568" y="210" class="boxt">実データ上でPython実行</text>
+    <text x="568" y="226" class="tech">コードと結果を可視化</text>
   </g>
 
-  <!-- Region legend -->
-  <text x="32" y="752" class="tech">リージョン:　asia-northeast1（Cloud Run / Firestore / Storage / Artifact Registry）　｜　asia-east1（App Hosting）　｜　global（Gemini）　｜　us-central1（Agent Engine）</text>
+  <!-- Step 4: Output -->
+  <g>
+    <rect x="728" y="86" width="120" height="150" rx="10" fill="#fce8e6" stroke="#ea4335"/>
+    <circle cx="748" cy="106" r="11" fill="#ea4335"/><text x="748" y="110" text-anchor="middle" class="step">4</text>
+    <text x="767" y="110" class="boxh">成果</text>
+    <text x="742" y="134" class="boxt">振り返り／ROI分析</text>
+    <text x="742" y="158" class="boxt">個別フォロー生成</text>
+    <text x="742" y="174" class="tech">セグメント方式＋HIL</text>
+    <text x="742" y="190" class="tech">O(N)→O(K) 決定論組立</text>
+    <text x="742" y="212" class="boxt">全ブロックに根拠</text>
+    <text x="742" y="228" class="tech">reason_for_inclusion</text>
+  </g>
+
+  <!-- Flow arrows -->
+  <line x1="182" y1="161" x2="204" y2="161" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="356" y1="161" x2="378" y2="161" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="530" y1="161" x2="552" y2="161" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="704" y1="161" x2="726" y2="161" stroke="#5f6b7a" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Infra band (Google Cloud) -->
+  <rect x="32" y="256" width="816" height="90" rx="10" fill="#ffffff" stroke="#c7d2e0"/>
+  <text x="48" y="280" class="band">Google Cloud（実行基盤・AI）</text>
+  <text x="220" y="280" class="must">★ ハッカソン必須要件を充足</text>
+  <g>
+    <rect x="48" y="296" width="150" height="34" rx="6" fill="#e8f0fe" stroke="#4285f4"/>
+    <text x="123" y="317" text-anchor="middle" class="chip">Cloud Run（asia-northeast1）</text>
+    <rect x="210" y="296" width="180" height="34" rx="6" fill="#e8f0fe" stroke="#4285f4"/>
+    <text x="300" y="317" text-anchor="middle" class="chip">Vertex AI ＋ Gemini ＋ Google ADK</text>
+    <rect x="402" y="296" width="150" height="34" rx="6" fill="#e6f4ea" stroke="#34a853"/>
+    <text x="477" y="317" text-anchor="middle" class="chip">Agent Engine（Sandbox）</text>
+    <rect x="564" y="296" width="120" height="34" rx="6" fill="#fef7e0" stroke="#f9ab00"/>
+    <text x="624" y="317" text-anchor="middle" class="chip">Firestore</text>
+    <rect x="696" y="296" width="136" height="34" rx="6" fill="#fce8e6" stroke="#ea4335"/>
+    <text x="764" y="317" text-anchor="middle" class="chip">Firebase Auth/Storage</text>
+  </g>
+
+  <!-- DevOps band -->
+  <rect x="32" y="358" width="816" height="86" rx="10" fill="#ffffff" stroke="#c7d2e0"/>
+  <text x="48" y="382" class="band">つくる・まわす・とどける（DevOps / CI・CD）</text>
+  <g>
+    <rect x="48" y="398" width="180" height="32" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
+    <text x="138" y="418" text-anchor="middle" class="chip">Terraform（IaC・責務分割）</text>
+    <rect x="240" y="398" width="240" height="32" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
+    <text x="360" y="418" text-anchor="middle" class="chip">GitHub Actions ＋ WIF（キーレスCI/CD）</text>
+    <rect x="492" y="398" width="180" height="32" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
+    <text x="582" y="418" text-anchor="middle" class="chip">App Hosting 自動デプロイ</text>
+    <rect x="684" y="398" width="148" height="32" rx="6" fill="#eef2f7" stroke="#c7d2e0"/>
+    <text x="758" y="418" text-anchor="middle" class="chip">13本のADR（撤回まで記録）</text>
+  </g>
+
+  <!-- vertical connector from flow to infra -->
+  <line x1="440" y1="236" x2="440" y2="255" stroke="#c7d2e0" stroke-width="2" stroke-dasharray="4 3"/>
 </svg>
