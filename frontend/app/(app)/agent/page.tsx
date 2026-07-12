@@ -229,13 +229,24 @@ export default function DashboardPage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const pollingRefs = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+  const downloadedRuns = useRef<Set<string>>(new Set());
   const [isIngesting, setIsIngesting] = useState(false);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // textarea の高さを内容に追従させる。プログラム的な setInput（送信で空に／取り消しで復元）
+  // でも onChange は発火しないため、input の変化を監視してここで高さを調整する。
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
 
   useEffect(() => {
     return () => {
@@ -830,7 +841,12 @@ export default function DashboardPage() {
         if (data.status === "done") {
           clearInterval(timer);
           delete pollingRefs.current[runId];
-          await loadRunDeliverables(msgId, runId);
+          const count = await loadRunDeliverables(msgId, runId);
+          // 新規完了時のみ自動ダウンロード（履歴再訪の loadRunDeliverables はこの経路を通らない）
+          if (count > 0 && !downloadedRuns.current.has(runId)) {
+            downloadedRuns.current.add(runId);
+            handleDownloadCsv(runId);
+          }
         } else if (data.status === "error") {
           clearInterval(timer);
           delete pollingRefs.current[runId];
@@ -842,15 +858,16 @@ export default function DashboardPage() {
     pollingRefs.current[runId] = timer;
   }
 
-  async function loadRunDeliverables(msgId: string, runId: string) {
+  async function loadRunDeliverables(msgId: string, runId: string): Promise<number> {
     try {
       const res = await authFetch(`/api/marketing/runs/${runId}/results`);
-      if (!res.ok) return;
+      if (!res.ok) return 0;
       const data = await res.json();
       const deliverables: DeliverableData[] = data.emails ?? data.deliverables ?? [];
       setMessages((prev) => prev.map((m) => (m.id === msgId ? { ...m, deliverables } : m)));
+      return deliverables.length;
     } catch {
-      // ignore
+      return 0;
     }
   }
 
@@ -1196,27 +1213,38 @@ export default function DashboardPage() {
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={isIngesting}
-              className="flex items-center justify-center w-10 h-10 rounded-xl border border-gray-200 text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition disabled:opacity-40 shrink-0"
+              className="flex items-center justify-center w-10 h-10 self-end rounded-xl border border-gray-200 text-gray-400 hover:text-gray-600 hover:bg-gray-50 transition disabled:opacity-40 shrink-0"
               title="ファイルを添付"
             >
               <Upload className="w-4 h-4" />
             </button>
-            <input
-              type="text"
+            <textarea
+              ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                // IME変換確定のEnterは送信/改行判定に巻き込まない（日本語入力対策）。
+                if (e.nativeEvent.isComposing) return;
+                if (e.shiftKey) {
+                  // Shift+Enter = 送信。Enter単体は textarea 既定の改行に任せる。
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
+              rows={1}
               placeholder={
                 pendingFiles.length > 0
-                  ? "ヒントを入力（任意）"
-                  : "指示を入力してください（例: 顧客ごとのフォローアップ案を作って）"
+                  ? "ヒントを入力（任意） / Shift+Enterで送信"
+                  : "指示を入力してください（例: 顧客ごとのフォローアップ案を作って） / Enter改行・Shift+Enter送信"
               }
               disabled={sending || isIngesting}
-              className="flex-1 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400 disabled:bg-gray-50 disabled:text-gray-400"
+              className="flex-1 resize-none max-h-40 overflow-y-auto rounded-xl border border-gray-200 px-4 py-2.5 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-brand-400 disabled:bg-gray-50 disabled:text-gray-400"
             />
             <button
               type="submit"
               disabled={(!input.trim() && pendingFiles.length === 0) || sending || isIngesting}
-              className="flex items-center justify-center w-10 h-10 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              className="flex items-center justify-center w-10 h-10 self-end bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
             >
               {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
             </button>
