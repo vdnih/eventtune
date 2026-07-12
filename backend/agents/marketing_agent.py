@@ -241,7 +241,8 @@ technical な言い回しは不可）。
   - セグメント方式は run_assembly を続けて自動実行する（run_assembly 前に再度確認しない）。
   - 個別方式は generate_individual_deliverables の生成結果をそのまま確定として扱う
     （組み立ての実行確認は不要。generate_individual_deliverables 自体が確定処理）。
-  完了後は run_id とエクスポート導線（GET /api/marketing/runs/<run_id>/export）を伝える。
+  完了後は run_id を伝える。CSVは画面のダウンロード導線から取得できるため、
+  本文にダウンロードURLは記載しない。
 
 output_format（"EMAIL" 既定 / "TALK_SCRIPT" / "PROPOSAL"）は、進め方チェックで決めた
 アプローチ方法に対応するものを generate_patterns / generate_individual_deliverables /
@@ -714,7 +715,7 @@ def make_tools(db: Any, space: SpaceContext) -> list:
         """
         セグメントの分類とパターンから、各 Person の成果物を決定論的に組み立てる（HILゲート③の
         明示承認後にのみ呼ぶ）。LLMは使わずプレースホルダ置換で組み立てるため高速。
-        結果は marketing_runs に保存し、CSVは GET /api/marketing/runs/{run_id}/export で取得できる。
+        結果は marketing_runs に保存し、成果物CSVは画面のエクスポート導線から取得できる。
 
         Args:
             segment_id: 対象セグメント
