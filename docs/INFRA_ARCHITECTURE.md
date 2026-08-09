@@ -107,8 +107,8 @@ service firebase.storage {
 リージョン:   asia-northeast1
 CPU:          1 vCPU (always-allocated)  ← ADK ストリーミングのため常時割り当て
 メモリ:       2Gi                          ← ADK エージェントコンテキストが大きい
-最小インスタンス: 0 (ハッカソン) / 1 (本番)
-最大インスタンス: 10
+最小インスタンス: 0                          ← 平常時ゼロ・アクセスで起動（ADR-018）
+最大インスタンス: 3
 タイムアウト:  3600秒                      ← エージェント生成は数分かかる場合がある
 同時リクエスト: 80
 サービスアカウント: eventtune-api-sa@{project-id}.iam.gserviceaccount.com
@@ -140,7 +140,7 @@ EXPOSE 8080
 CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 ```
 
-> ビルド&デプロイは GitHub Actions（`.github/workflows/deploy-backend.yml`）が WIF 認証で
+> ビルド&デプロイは GitHub Actions（`.github/workflows/deploy.yml`）が WIF 認証で
 > Artifact Registry へ push → `gcloud run deploy eventtune-api`。詳細は ADR-012。
 
 ## Vertex AI / Agent Engine 連携
@@ -158,10 +158,16 @@ Vertex AI の Online Prediction Endpoint（推論エンドポイント）は使�
 
 ### モデル選択
 
-全用途で **`gemini-3.1-flash-lite`** を使用する（分析・補完・メール生成・セグメント分類・
-appeal_summary 生成）。埋め込みのみ **`gemini-embedding-001`**（768 次元）。
+既定は全用途 **`gemini-3.1-flash-lite`**（分析・補完・メール生成・セグメント分類・
+appeal_summary 生成）。埋め込みのみ **`gemini-embedding-001`**（768 次元、上書き不可）。
 利用箇所: `marketing_agent.py` / `segmentation.py` / `semantic_search.py` /
 `data_integration_agent.py` / `routers/integration.py` / `plans.py`。
+
+役割ごとのモデルは `backend/config.py` の `model_ingestion` / `model_batch` / `model_agent` /
+`model_content`（いずれも env 上書き可）で分離しており、本番の実効値は
+`infra/terraform/variables.tf` の同名変数（既定 `gemini-3.1-flash-lite`）が Cloud Run の env
+として注入したものになる。品質を優先したい役割だけ `terraform.tfvars` で
+`gemini-3.5-flash` 等に上書きできる（ADR-018）。
 
 ### Agent Engine（ReasoningEngine）
 

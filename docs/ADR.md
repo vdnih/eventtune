@@ -785,3 +785,61 @@ IDに対して事後的に紐付ける設計が必要（[[project_ingestion_rede
 `frontend/components/ui/Drawer.tsx`（削除）・`backend/routers/data.py`・`backend/ontology.py`・
 `backend/agents/data_integration_agent.py` を修正。関連テスト
 （`test_data_api.py::test_lineage_by_entity`、`format.test.ts` の `pickEntityId` ブロック）を削除。
+
+---
+
+## ADR-018: 平常時ゼロ・アクセスで起動するコスト姿勢
+
+**ステータス**: 採用（実装済み — 2026-08-09）
+
+**背景**:
+ハッカソン（DevOps × AI Agent Hackathon）は予選敗退した。ハッカソン向け GCP クレジットは有効期限が
+あるため、失効後に定常課金が発生しない状態にしたい。一方でプロダクト自体は残し、思い立ったときに
+多少のコストをかけてでも動かせる状態は維持したい。実査の結果、標準的な課金源は存在しなかった
+（Cloud SQL・Memorystore・ロードバランサ・固定IP・Cloud Scheduler・Pub/Sub は未使用）。唯一の
+実質的な固定費は Cloud Run `eventtune-api` の `min_instance_count = 1`（`cloud_run.tf`）で、
+1vCPU/2GiB を24時間課金していた（月 $20-30 相当）。加えて `backend/config.py` のモデル設定は
+4役割中3つが `gemini-3.5-flash`（`gemini-3.1-flash-lite` の約3.3倍単価）でありながら、
+Terraform の Cloud Run env には一切出ておらず、本番でも高単価モデルがデフォルトのまま動いていた。
+
+**決定**:
+1. **Cloud Run を `min_instance_count = 0` にする**（`max_instance_count` も 10 → 3 に絞り、
+   想定外のスケールアウトによる課金暴走の上限を下げる）。無アクセス時はインスタンスが落ち
+   課金がゼロになり、アクセスがあれば自動的に起動する。
+2. **`cpu_idle = false`（CPU 常時割当）は維持する**。`POST /integration/batches`
+   （`backend/routers/integration.py`）は 202 を返した後、取り込み本体を FastAPI の
+   `BackgroundTasks` でリクエスト外に実行する。`cpu_idle = true` にするとこの処理が
+   絞られたCPUで停滞・失敗しうるため、min=0 化とは独立に false のままにする。
+   `cpu_idle` はインスタンスが存在する間の課金であり、min=0 と両立する。
+3. **Gemini モデルの既定値を Terraform 側で `gemini-3.1-flash-lite` に統一する**。
+   `backend/config.py` のデフォルト（ローカル開発用）自体は変更せず、`infra/terraform/
+   variables.tf` に `model_ingestion` / `model_batch` / `model_agent` / `model_content`
+   の4変数（既定 `gemini-3.1-flash-lite`）を追加し、Cloud Run の env として注入する。
+   品質を戻したいときは `terraform.tfvars` で該当変数だけ `gemini-3.5-flash` に上書きして
+   `apply` すればよく、コード変更・再ビルドは不要。
+4. **Artifact Registry にクリーンアップポリシーを追加する**。push のたびにイメージが増え
+   続けストレージ課金が積み上がるため、直近3件を保持しつつ30日超の古いイメージを削除する
+   （まず `cleanup_policy_dry_run = true` で確認してから無効化して本適用する運用）。
+5. **コールドスタートは受容する**。`startup_cpu_boost = true` は既存のまま追加対処しない。
+   無アクセス後の最初のリクエストは Python + ADK の import を含む起動時間（数秒〜十数秒）を
+   要するが、常時起動のコストとのトレードオフとして許容する。
+6. **Agent Engine・予算アラートは Terraform 管理外のまま手作業で対応する**（ADR-012 の
+   責務分割を踏襲）。未参照の孤児 ReasoningEngine の削除、請求先アカウントへの月次予算
+   しきい値通知の設定は、Console/`gcloud` の手順として別途実施する。
+
+**理由**:
+- Cloud Run の min-instances は唯一の実質的な固定費であり、ここを縮退するだけで定常課金の
+  大半を消せる。他のリソース（Firestore/GCS/App Hosting）は元々 free tier またはスケール
+  ゼロ済みで手を入れる必要がない。
+- `cpu_idle` と `min_instance_count` は独立した設定であり、「バックグラウンド処理の保護」と
+  「無アクセス時の課金ゼロ」を両立できる。両方を落とすと非同期の取り込み処理が壊れるリスクを
+  背負うため、min のみ縮退する。
+- モデル選択をコードでなく Terraform env で切り替え可能にすることで、「普段は安く、必要な
+  ときだけ品質を戻す」をデプロイ操作だけで実現できる。
+
+**結果 / 将来課題**:
+- `infra/terraform/cloud_run.tf`（scaling・MODEL_* env）、`infra/terraform/variables.tf`
+  （model_* 変数）、`infra/terraform/artifact_registry.tf`（cleanup_policy）を変更。
+- `docs/INFRA_ARCHITECTURE.md` の Cloud Run 構成表・モデル選択の記述を実態に合わせて修正。
+- 残課題: 孤児 Agent Engine（us-central1、`3998719830814359552` とは別の未参照インスタンス）
+  の削除、請求先アカウントへの予算アラート設定は、この ADR の適用後に手作業で実施する。
