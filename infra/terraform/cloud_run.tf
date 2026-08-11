@@ -12,8 +12,8 @@ resource "google_cloud_run_v2_service" "mmg_api" {
     max_instance_request_concurrency = 80
 
     scaling {
-      min_instance_count = 1
-      max_instance_count = 10
+      min_instance_count = 0
+      max_instance_count = 3
     }
 
     containers {
@@ -76,6 +76,22 @@ resource "google_cloud_run_v2_service" "mmg_api" {
       env {
         name  = "FRONTEND_ORIGIN"
         value = var.frontend_origin
+      }
+      env {
+        name  = "MODEL_INGESTION"
+        value = var.model_ingestion
+      }
+      env {
+        name  = "MODEL_BATCH"
+        value = var.model_batch
+      }
+      env {
+        name  = "MODEL_AGENT"
+        value = var.model_agent
+      }
+      env {
+        name  = "MODEL_CONTENT"
+        value = var.model_content
       }
     }
   }

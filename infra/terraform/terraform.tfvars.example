@@ -12,3 +12,10 @@ frontend_origin = "https://REPLACE_ME--marketing-mail-generator.asia-east1.hoste
 # project_id     = "marketing-mail-generator"
 # project_number = "974233950009"
 # region         = "asia-northeast1"
+
+# コスト縮退方針（ADR-018）: 既定は variables.tf で全役割 gemini-3.1-flash-lite。
+# 品質を優先したい役割だけここで上書きする（コード変更・再ビルド不要）。
+# model_ingestion = "gemini-3.5-flash"
+# model_batch     = "gemini-3.5-flash"
+# model_agent     = "gemini-3.5-flash"
+# model_content   = "gemini-3.5-flash"

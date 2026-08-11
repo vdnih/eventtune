@@ -70,3 +70,29 @@ variable "cloud_run_image" {
   type        = string
   default     = "us-docker.pkg.dev/cloudrun/container/hello"
 }
+
+# コスト縮退方針（ADR-018）: 既定は全役割 flash-lite。品質を優先したい役割だけ
+# terraform.tfvars で上書きする（例: model_content = "gemini-3.5-flash"）。
+variable "model_ingestion" {
+  description = "スキーマ理解・ドキュメント解析・要約に使う Gemini モデル"
+  type        = string
+  default     = "gemini-3.1-flash-lite"
+}
+
+variable "model_batch" {
+  description = "行単位軽量抽出（高ボリューム・並列）に使う Gemini モデル"
+  type        = string
+  default     = "gemini-3.1-flash-lite"
+}
+
+variable "model_agent" {
+  description = "エージェント推論・分類判定に使う Gemini モデル"
+  type        = string
+  default     = "gemini-3.1-flash-lite"
+}
+
+variable "model_content" {
+  description = "コンテンツ・メール生成に使う Gemini モデル"
+  type        = string
+  default     = "gemini-3.1-flash-lite"
+}

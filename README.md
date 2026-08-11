@@ -165,7 +165,7 @@ IaC は責務で分割する（詳細は [docs/ADR.md](docs/ADR.md) ADR-012 / [d
 | GCP インフラ（Cloud Run, SA/IAM, Artifact Registry, Firestore DB, Storage, Firebase, WIF） | **Terraform**（[infra/terraform/](infra/terraform/)） |
 | Firestore ルール/インデックス・Storage ルール | `firebase deploy --only firestore,storage` |
 | フロント（Next.js SSR） | **Firebase App Hosting**（`frontend/apphosting.yaml`・git push 自動） |
-| バックエンド（Cloud Run） | **GitHub Actions**（`.github/workflows/deploy-backend.yml`・WIF キーレス） |
+| バックエンド（Cloud Run） | **GitHub Actions**（`.github/workflows/deploy.yml`・WIF キーレス） |
 | Agent Engine | `backend/scripts/provision_agent_engine.py`（出力を tfvars に注入） |
 
 ```bash
